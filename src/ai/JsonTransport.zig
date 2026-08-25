@@ -1,6 +1,7 @@
 const std = @import("std");
 const Provider = @import("Provider.zig");
 const Retry = @import("Retry.zig");
+const SecureAllocator = @import("SecureAllocator.zig");
 const StreamingTransport = @import("Transport.zig");
 
 pub const Header = StreamingTransport.Header;
@@ -45,14 +46,18 @@ pub const Request = struct {
 };
 
 /// Owned HTTP response. The body allocation transfers to the caller and is
-/// released by `deinit`. Non-success HTTP statuses are ordinary responses.
+/// wiped and released by `deinit`. Non-success HTTP statuses are ordinary responses.
 pub const Response = struct {
     status: u16,
     body: []u8,
     retry_after_ms: ?u64 = null,
 
     pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
-        allocator.free(self.body);
+        if (self.body.len == 0) {
+            allocator.free(self.body);
+        } else {
+            SecureAllocator.wipeFree(allocator, self.body);
+        }
         self.* = undefined;
     }
 };
@@ -351,6 +356,50 @@ test "invalid owned response is cleaned up" {
         std.testing.io,
         testRequest(),
     ));
+}
+
+test "normal invalid and oversized response bodies are wiped" {
+    const Fake = struct {
+        const Self = @This();
+        status: u16 = 99,
+        body: []const u8 = "invalid-secret",
+
+        fn request(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: Request,
+        ) Error!Response {
+            return .{ .status = self.status, .body = try allocator.dupe(u8, self.body) };
+        }
+    };
+
+    var observer = SecureAllocator.FreeObserver.init(std.testing.allocator);
+    var normal: Response = .{
+        .status = 200,
+        .body = try observer.allocator().dupe(u8, "normal-secret"),
+    };
+    normal.deinit(observer.allocator());
+    try std.testing.expectEqual(@as(usize, 1), observer.zero_frees);
+
+    var fake: Fake = .{};
+    try std.testing.expectError(error.InvalidResponse, Transport.from(&fake).request(
+        observer.allocator(),
+        std.testing.io,
+        testRequest(),
+    ));
+    try std.testing.expectEqual(@as(usize, 2), observer.zero_frees);
+
+    fake.status = 200;
+    fake.body = "oversized-secret";
+    var request_value = testRequest();
+    request_value.limits.max_response_body_bytes = 4;
+    try std.testing.expectError(error.InvalidResponse, Transport.from(&fake).request(
+        observer.allocator(),
+        std.testing.io,
+        request_value,
+    ));
+    try std.testing.expectEqual(@as(usize, 3), observer.zero_frees);
 }
 
 test "cancellation wins over a later transport error and owned response" {
