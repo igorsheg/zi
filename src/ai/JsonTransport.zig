@@ -19,7 +19,8 @@ pub const Method = enum {
 
 /// Limits are checked before an implementation is called. Byte bounds, the
 /// connect timeout, and the total timeout are non-zero. `idle_timeout_ms = 0`
-/// disables idle timeout enforcement. Non-zero timeouts may not exceed the cap.
+/// disables idle timeout enforcement. The cap applies only to connect and total;
+/// idle timeout accepts the full `u64` domain and is enforced with saturation.
 pub const Limits = struct {
     max_request_body_bytes: usize = 1024 * 1024,
     max_response_body_bytes: usize = maximum_response_body_bytes,
@@ -163,7 +164,6 @@ fn validateLimits(limits: Limits) Error!void {
         limits.header_buffer_bytes > maximum_header_bytes or
         limits.connect_timeout_ms == 0 or
         limits.connect_timeout_ms > maximum_timeout_ms or
-        limits.idle_timeout_ms > maximum_timeout_ms or
         limits.total_timeout_ms == 0 or
         limits.total_timeout_ms > maximum_timeout_ms)
     {
@@ -229,9 +229,11 @@ fn testRequest() Request {
     };
 }
 
-test "zero idle timeout is disabled while connect timeout remains required" {
+test "idle timeout accepts full domain while connect timeout remains required" {
     var value = testRequest();
     value.limits.idle_timeout_ms = 0;
+    try validateRequest(value);
+    value.limits.idle_timeout_ms = std.math.maxInt(u64);
     try validateRequest(value);
 
     value.limits.connect_timeout_ms = 0;

@@ -387,6 +387,10 @@ test "backoff is deterministic jittered saturated and capped" {
     try std.testing.expectEqual(@as(u64, 750), delayMs(policy, 0, 0));
     try std.testing.expectEqual(@as(u64, 1_250), delayMs(policy, 0, 50));
     try std.testing.expectEqual(@as(u64, 30_000), delayMs(policy, 50, 50));
+    try std.testing.expectEqual(
+        @as(u64, 30_000),
+        delayMs(.{ .base_delay_ms = std.math.maxInt(u64) }, 0, 50),
+    );
     try std.testing.expectEqual(@as(u64, 0), delayMs(.{ .base_delay_ms = 0 }, 1, 1));
     try std.testing.expectEqual(
         std.math.maxInt(u64),

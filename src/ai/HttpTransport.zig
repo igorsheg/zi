@@ -420,7 +420,8 @@ fn nowNs(io: std.Io) i96 {
 
 fn elapsedMs(start: i96, finish: i96) u64 {
     if (finish <= start) return 0;
-    const value = @divFloor(finish - start, std.time.ns_per_ms);
+    const elapsed_ns = std.math.sub(i96, finish, start) catch std.math.maxInt(i96);
+    const value = @divFloor(elapsed_ns, std.time.ns_per_ms);
     return @intCast(@min(value, std.math.maxInt(u64)));
 }
 
@@ -879,6 +880,14 @@ fn isOpenSslCaEntry(name: []const u8) bool {
         if (!std.ascii.isHex(byte)) return false;
     }
     return true;
+}
+
+test "duration conversions saturate across native integer domains" {
+    const long_max: u64 = @intCast(std.math.maxInt(c_long));
+    try std.testing.expectEqual(std.math.maxInt(c_long), toLong(long_max));
+    try std.testing.expectEqual(std.math.maxInt(c_long), toLong(std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(u64, 0), elapsedMs(1, 0));
+    try std.testing.expectEqual(std.math.maxInt(u64), elapsedMs(std.math.minInt(i96), std.math.maxInt(i96)));
 }
 
 test "process curl coordinator reference-counts multiple Runtime owners" {

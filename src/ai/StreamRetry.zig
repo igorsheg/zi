@@ -206,7 +206,6 @@ pub fn run(
     options: Options,
 ) Error!void {
     if (options.policy.max_attempts == 0 or options.policy.max_attempts > maximum_attempts or
-        options.policy.base_delay_ms > maximum_delay_ms or
         options.policy.max_delay_ms > maximum_delay_ms or
         options.max_incomplete_recoveries > maximum_incomplete_recoveries or
         request.limits.max_error_body_bytes > ApiError.maximum_body_bytes)
@@ -1121,6 +1120,24 @@ test "retry policy rejects zero and more than 101 attempts" {
         ));
         try std.testing.expectEqual(@as(usize, 0), transport.calls);
     }
+}
+
+test "retry policy accepts arbitrary base delay" {
+    const steps = [_]TestStep{.{ .status = 200, .data = "done" }};
+    var transport: TestTransport = .{ .steps = &steps };
+    var factory: TestFactory = .{};
+    var collector: TestCollector = .{};
+
+    try testRun(
+        std.testing.allocator,
+        &transport,
+        &factory,
+        &collector,
+        .{ .policy = .{ .max_attempts = 1, .base_delay_ms = std.math.maxInt(u64) } },
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), transport.calls);
+    try std.testing.expectEqual(@as(usize, 1), collector.done);
 }
 
 test "one maximum attempt dispatches exactly once" {

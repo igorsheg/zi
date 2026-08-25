@@ -328,8 +328,7 @@ fn validateConfig(config: Config) error{InvalidRequest}!void {
         config.limits.header_buffer_bytes == 0 or
         config.limits.header_buffer_bytes > maximum_header_buffer_bytes or
         config.limits.connect_timeout_ms == 0 or
-        config.limits.connect_timeout_ms > maximum_timeout_ms or
-        config.limits.idle_timeout_ms > maximum_timeout_ms)
+        config.limits.connect_timeout_ms > maximum_timeout_ms)
     {
         return error.InvalidRequest;
     }
@@ -827,6 +826,8 @@ test "configuration permits disabled idle timeout but requires connect timeout" 
         .session_id = "12345678-1234-4234-8234-123456789abc",
     };
     config.limits.idle_timeout_ms = 0;
+    try validateConfig(config);
+    config.limits.idle_timeout_ms = std.math.maxInt(u64);
     try validateConfig(config);
 
     config.limits.connect_timeout_ms = 0;
