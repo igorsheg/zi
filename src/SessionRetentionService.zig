@@ -86,6 +86,7 @@ pub const Owner = struct {
     ) CreateError!*Owner {
         if (options.days > persistence.SessionRetention.maximum_days) return error.InvalidDays;
         try validatePath(options.state_root, false);
+        try validateDerivedSessionsRootLength(options.state_root);
         if (options.exclude_path) |path| try validatePath(path, true);
 
         const self = allocator.create(Owner) catch return error.OutOfMemory;
@@ -258,10 +259,16 @@ pub const Owner = struct {
     }
 };
 
+fn validateDerivedSessionsRootLength(state_root: []const u8) CreateError!void {
+    const size = std.math.add(usize, state_root.len, "/sessions".len) catch return error.PathTooLong;
+    if (size > persistence.Paths.default_max_path_bytes or size >= std.fs.max_path_bytes) {
+        return error.PathTooLong;
+    }
+}
+
 fn deriveSessionsRoot(allocator: std.mem.Allocator, state_root: []const u8) CreateError![]u8 {
     const suffix = "/sessions";
-    const size = std.math.add(usize, state_root.len, suffix.len) catch return error.PathTooLong;
-    if (size > persistence.Paths.default_max_path_bytes) return error.PathTooLong;
+    const size = state_root.len + suffix.len;
     const result = allocator.alloc(u8, size) catch return error.OutOfMemory;
     @memcpy(result[0..state_root.len], state_root);
     @memcpy(result[state_root.len..], suffix);
@@ -491,13 +498,38 @@ test "create requires one canonical bounded state root before deriving sessions"
         .now_epoch_seconds = 0,
         .days = 0,
     }));
-    const root = try allocator.alloc(u8, persistence.Paths.default_max_path_bytes);
-    defer allocator.free(root);
-    root[0] = '/';
-    @memset(root[1..], 'a');
+    const accepted_root_len = std.fs.max_path_bytes - 1 - "/sessions".len;
+    const accepted_root = try allocator.alloc(u8, accepted_root_len);
+    defer allocator.free(accepted_root);
+    @memset(accepted_root, 'a');
+    accepted_root[0] = '/';
+    const accepted = try Owner.create(allocator, io, .{
+        .state_root = accepted_root,
+        .now_epoch_seconds = 0,
+        .days = 0,
+    });
+    try std.testing.expectEqual(std.fs.max_path_bytes - 1, accepted.sessions_root.len);
+    accepted.deinit();
+
+    const rejected_root = try allocator.alloc(u8, accepted_root_len + 1);
+    defer allocator.free(rejected_root);
+    @memset(rejected_root, 'a');
+    rejected_root[0] = '/';
     try std.testing.expectError(error.PathTooLong, Owner.create(allocator, io, .{
-        .state_root = root,
+        .state_root = rejected_root,
         .now_epoch_seconds = 0,
         .days = 0,
     }));
+
+    const logical_exclusion = try allocator.alloc(u8, persistence.Paths.default_max_path_bytes);
+    defer allocator.free(logical_exclusion);
+    @memset(logical_exclusion, 'a');
+    logical_exclusion[0] = '/';
+    const with_exclusion = try Owner.create(allocator, io, .{
+        .state_root = "/tmp/state",
+        .now_epoch_seconds = 0,
+        .days = 0,
+        .exclude_path = logical_exclusion,
+    });
+    with_exclusion.deinit();
 }

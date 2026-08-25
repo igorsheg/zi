@@ -73,7 +73,7 @@ pub const Election = struct {
         pruner: Pruner,
     ) Error!Outcome {
         defer self.deinit(io);
-        if (exclude_path) |path| try validatePath(path);
+        if (exclude_path) |path| try validateLogicalPath(path);
         pruner.run(allocator, io, self.cutoff_epoch_seconds, exclude_path) catch |err|
             return .{ .incomplete = err };
         self.stamp_ops.stamp(io, self.sessions, self.marker) catch |err| {
@@ -113,7 +113,7 @@ fn prepareWithStampOps(
 ) Error!Prepared {
     if (days == 0) return .disabled;
     if (days > maximum_days) return error.InvalidDays;
-    try validatePath(sessions_root);
+    try validateIoPath(sessions_root);
     if (sessions_root.len == 1 or sessions_root[sessions_root.len - 1] == '/') return error.InvalidPath;
 
     const retained_seconds = std.math.mul(i64, @as(i64, @intCast(days)), election_interval_seconds) catch
@@ -197,9 +197,9 @@ fn runWithStampOps(
 ) Error!Outcome {
     if (days != 0) {
         if (days > maximum_days) return error.InvalidDays;
-        try validatePath(sessions_root);
+        try validateIoPath(sessions_root);
         if (sessions_root.len == 1 or sessions_root[sessions_root.len - 1] == '/') return error.InvalidPath;
-        if (exclude_path) |path| try validatePath(path);
+        if (exclude_path) |path| try validateLogicalPath(path);
     }
     var prepared = try prepareWithStampOps(io, sessions_root, now_epoch_seconds, days, stamp_ops);
     return switch (prepared) {
@@ -280,13 +280,18 @@ const StampOps = struct {
     }
 };
 
-fn validatePath(path: []const u8) Error!void {
+fn validateLogicalPath(path: []const u8) Error!void {
     if (path.len > Paths.default_max_path_bytes) return error.PathTooLong;
     if (path.len == 0 or path[0] != '/' or std.mem.findScalar(u8, path, 0) != null or
         !std.unicode.utf8ValidateSlice(path))
     {
         return error.InvalidPath;
     }
+}
+
+fn validateIoPath(path: []const u8) Error!void {
+    try validateLogicalPath(path);
+    if (path.len >= std.fs.max_path_bytes) return error.PathTooLong;
 }
 
 /// Adapter context for the production SessionIndex pruner. `state_root` and
@@ -384,6 +389,30 @@ fn setMarkerMtime(io: std.Io, root: []const u8, seconds: i64) !void {
     try file.setTimestamps(io, .{
         .modify_timestamp = .{ .new = .fromNanoseconds(@as(i96, seconds) * std.time.ns_per_s) },
     });
+}
+
+test "retention keeps logical exclusions but bounds syscall roots" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const accepted_root = try allocator.alloc(u8, std.fs.max_path_bytes - 1);
+    defer allocator.free(accepted_root);
+    @memset(accepted_root, 'a');
+    accepted_root[0] = '/';
+    const accepted = try prepare(io, accepted_root, 0, 1);
+    try std.testing.expectEqual(@as(std.meta.Tag(Prepared), .incomplete), std.meta.activeTag(accepted));
+
+    const rejected_root = try allocator.alloc(u8, std.fs.max_path_bytes);
+    defer allocator.free(rejected_root);
+    @memset(rejected_root, 'a');
+    rejected_root[0] = '/';
+    try std.testing.expectError(error.PathTooLong, prepare(io, rejected_root, 0, 1));
+
+    try validateLogicalPath(rejected_root);
+    const oversized_exclusion = try allocator.alloc(u8, Paths.default_max_path_bytes + 1);
+    defer allocator.free(oversized_exclusion);
+    @memset(oversized_exclusion, 'a');
+    oversized_exclusion[0] = '/';
+    try std.testing.expectError(error.PathTooLong, validateLogicalPath(oversized_exclusion));
 }
 
 test "retention marker due table and exact boundary" {

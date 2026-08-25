@@ -109,6 +109,7 @@ pub fn list(
         if (!std.mem.endsWith(u8, directory_entry.name, ".jsonl")) continue;
         const standard = isHaxStandardName(directory_entry.name);
         if (!standard) result.recovery.noncanonical += 1;
+        try validateJoinedPathLength(directory_path, directory_entry.name, limits.max_path_bytes);
         const stat = directory.statFile(io, directory_entry.name, .{ .follow_symlinks = false }) catch {
             result.recovery.unreadable += 1;
             continue;
@@ -248,6 +249,7 @@ pub fn pruneBeforeWithTick(
         try checkPruneTick(tick);
         report.buckets += 1;
         if (report.buckets > limits.max_buckets) return error.TooManyBuckets;
+        try validateJoinedPathLength(sessions_path, bucket_entry.name, limits.max_path_bytes);
         const bucket_stat = sessions.statFile(io, bucket_entry.name, .{ .follow_symlinks = false }) catch {
             report.recovery.unreadable += 1;
             continue;
@@ -274,6 +276,12 @@ pub fn pruneBeforeWithTick(
                     report.recovery.noncanonical += 1;
                     continue;
                 }
+                try validateJoinedPathLengthParts(
+                    sessions_path,
+                    bucket_entry.name,
+                    entry.name,
+                    limits.max_path_bytes,
+                );
                 const observed = bucket.statFile(io, entry.name, .{ .follow_symlinks = false }) catch {
                     report.recovery.unreadable += 1;
                     continue;
@@ -370,7 +378,7 @@ fn sessionsDirectory(
     const separator_len: usize = if (root_len == 1) 0 else 1;
     const size = std.math.add(usize, root_len, separator_len + "sessions".len) catch
         return error.PathTooLong;
-    if (size > max_path_bytes) return error.PathTooLong;
+    if (size > max_path_bytes or size >= std.fs.max_path_bytes) return error.PathTooLong;
     const result = allocator.alloc(u8, size) catch return error.OutOfMemory;
     var cursor = root_len;
     @memcpy(result[0..root_len], state_root[0..root_len]);
@@ -437,14 +445,30 @@ fn openBucket(io: std.Io, path: []const u8) std.Io.Dir.OpenError!std.Io.Dir {
     });
 }
 
+fn validateJoinedPathLength(directory: []const u8, name: []const u8, max_path_bytes: usize) Error!void {
+    const size = std.math.add(usize, directory.len, name.len + 1) catch return error.PathTooLong;
+    if (size > max_path_bytes or size >= std.fs.max_path_bytes) return error.PathTooLong;
+}
+
+fn validateJoinedPathLengthParts(
+    directory: []const u8,
+    first: []const u8,
+    second: []const u8,
+    max_path_bytes: usize,
+) Error!void {
+    const first_size = std.math.add(usize, directory.len, first.len + 1) catch return error.PathTooLong;
+    const size = std.math.add(usize, first_size, second.len + 1) catch return error.PathTooLong;
+    if (size > max_path_bytes or size >= std.fs.max_path_bytes) return error.PathTooLong;
+}
+
 fn joinPath(
     allocator: std.mem.Allocator,
     directory: []const u8,
     name: []const u8,
     max_path_bytes: usize,
 ) Error![]u8 {
-    const size = std.math.add(usize, directory.len, name.len + 1) catch return error.PathTooLong;
-    if (size > max_path_bytes) return error.PathTooLong;
+    try validateJoinedPathLength(directory, name, max_path_bytes);
+    const size = directory.len + name.len + 1;
     const path = allocator.alloc(u8, size) catch return error.OutOfMemory;
     @memcpy(path[0..directory.len], directory);
     path[directory.len] = '/';
@@ -522,6 +546,51 @@ fn makeTestDirectory(
     errdefer allocator.free(directory);
     try std.Io.Dir.createDirPath(.cwd(), io, directory);
     return directory;
+}
+
+test "index builders and direct scans enforce the syscall path boundary" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const sessions_root_len = std.fs.max_path_bytes - 1 - "/sessions".len;
+    const accepted_prune_root = try allocator.alloc(u8, sessions_root_len);
+    defer allocator.free(accepted_prune_root);
+    @memset(accepted_prune_root, 'a');
+    accepted_prune_root[0] = '/';
+    const sessions = try sessionsDirectory(allocator, accepted_prune_root, Paths.default_max_path_bytes);
+    defer allocator.free(sessions);
+    try std.testing.expectEqual(std.fs.max_path_bytes - 1, sessions.len);
+    try std.testing.expectError(
+        error.IoFailure,
+        pruneBefore(allocator, io, accepted_prune_root, 0, null, .{}),
+    );
+
+    const rejected_prune_root = try allocator.alloc(u8, sessions_root_len + 1);
+    defer allocator.free(rejected_prune_root);
+    @memset(rejected_prune_root, 'a');
+    rejected_prune_root[0] = '/';
+    try std.testing.expectError(
+        error.PathTooLong,
+        pruneBefore(allocator, io, rejected_prune_root, 0, null, .{}),
+    );
+
+    const bucket_suffix_bytes = "/sessions/".len + "root.44bd54d473cd3d44".len;
+    const list_root_len = std.fs.max_path_bytes - 1 - bucket_suffix_bytes;
+    const accepted_list_root = try allocator.alloc(u8, list_root_len);
+    defer allocator.free(accepted_list_root);
+    @memset(accepted_list_root, 'a');
+    accepted_list_root[0] = '/';
+    try std.testing.expectError(error.IoFailure, list(allocator, io, accepted_list_root, "/", 0, .{}));
+
+    const rejected_list_root = try allocator.alloc(u8, list_root_len + 1);
+    defer allocator.free(rejected_list_root);
+    @memset(rejected_list_root, 'a');
+    rejected_list_root[0] = '/';
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.PathTooLong,
+        list(failing.allocator(), io, rejected_list_root, "/", 0, .{}),
+    );
 }
 
 test "list uses mtime order, retains nonstandard jsonl, and filters expired standard sessions" {

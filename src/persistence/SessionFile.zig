@@ -170,6 +170,7 @@ pub const TouchError = error{
     Canceled,
     Busy,
     InvalidPath,
+    PathTooLong,
     NotRegular,
     Removed,
     IoFailure,
@@ -179,6 +180,7 @@ pub const Error = error{
     OutOfMemory,
     InvalidLimits,
     InvalidPath,
+    PathTooLong,
     InvalidSelection,
     InvalidHeader,
     UnsupportedVersion,
@@ -293,6 +295,24 @@ pub const Log = struct {
             return error.InvalidHeader;
         }
         if (!safeAbsolutePath(options.state_root)) return error.InvalidPath;
+        validateSelection(options.selection) catch return error.InvalidSelection;
+        const directory_length = Paths.sessionDirectoryLength(
+            options.state_root,
+            options.cwd,
+            options.limits.paths,
+        ) catch |err| return mapPath(err);
+        const name = Paths.canonicalName(options.timestamp, options.uuid) catch |err| return mapPath(err);
+        const session_path_length = std.math.add(
+            usize,
+            directory_length,
+            1 + Paths.canonical_name_bytes,
+        ) catch return error.PathTooLong;
+        if (session_path_length > options.limits.paths.max_path_bytes or
+            session_path_length >= std.fs.max_path_bytes)
+        {
+            return error.PathTooLong;
+        }
+
         var selection = OwnedSelection.init(allocator, options.selection) catch |err| return mapAlloc(err);
         errdefer selection.deinit(allocator);
         const directory = Paths.sessionDirectory(
@@ -302,7 +322,7 @@ pub const Log = struct {
             options.limits.paths,
         ) catch |err| return mapPath(err);
         defer allocator.free(directory);
-        const name = Paths.canonicalName(options.timestamp, options.uuid) catch |err| return mapPath(err);
+        std.debug.assert(directory.len == directory_length);
         const session_path = try joinPath(
             allocator,
             directory,
@@ -310,7 +330,8 @@ pub const Log = struct {
             options.limits.paths.max_path_bytes,
         );
         errdefer allocator.free(session_path);
-        const id = uuidString(allocator, options.uuid) catch return error.OutOfMemory;
+        std.debug.assert(session_path.len == session_path_length);
+        const id = allocator.dupe(u8, name[21..57]) catch return error.OutOfMemory;
         errdefer allocator.free(id);
         const timestamp_array = Paths.headerTimestamp(options.timestamp) catch |err| return mapPath(err);
         const timestamp = allocator.dupe(u8, &timestamp_array) catch return error.OutOfMemory;
@@ -343,6 +364,7 @@ pub const Log = struct {
         try validateLimits(options.limits);
         if (options.loaded_item_count > options.limits.max_items) return error.TooManyItems;
         if (!safeAbsolutePath(options.path)) return error.InvalidPath;
+        try validateIoPathLength(options.path, options.limits.paths.max_path_bytes);
         var selection = OwnedSelection.init(allocator, options.selection) catch |err| return mapAlloc(err);
         errdefer selection.deinit(allocator);
         const session_path = allocator.dupe(u8, options.path) catch return error.OutOfMemory;
@@ -978,6 +1000,7 @@ fn failEffectiveSelection(
 /// and resource failures abort before changing timestamps.
 pub fn touch(io: std.Io, path: []const u8) TouchError!void {
     if (!safeAbsolutePath(path)) return error.InvalidPath;
+    if (path.len >= std.fs.max_path_bytes) return error.PathTooLong;
     const named_stat = std.Io.Dir.statFile(.cwd(), io, path, .{ .follow_symlinks = false }) catch
         return error.IoFailure;
     if (named_stat.kind != .file) return error.NotRegular;
@@ -1098,6 +1121,7 @@ pub fn readMeta(
 ) Error!Meta {
     try validateLimits(limits);
     if (!safeAbsolutePath(path)) return error.InvalidPath;
+    try validateIoPathLength(path, limits.paths.max_path_bytes);
     const named_stat = std.Io.Dir.statFile(.cwd(), io, path, .{ .follow_symlinks = false }) catch
         return error.IoFailure;
     if (named_stat.kind != .file) return error.NotRegular;
@@ -1206,6 +1230,7 @@ pub fn load(
 ) Error!Loaded {
     try validateLimits(limits);
     if (!safeAbsolutePath(path)) return error.InvalidPath;
+    try validateIoPathLength(path, limits.paths.max_path_bytes);
     const file = std.Io.Dir.openFile(.cwd(), io, path, .{
         .mode = .read_only,
         .follow_symlinks = false,
@@ -1385,6 +1410,7 @@ pub fn loadForResume(
 ) Error!ResumeLoaded {
     try validateLimits(limits);
     if (!safeAbsolutePath(path)) return error.InvalidPath;
+    try validateIoPathLength(path, limits.paths.max_path_bytes);
     const file = std.Io.Dir.openFile(.cwd(), io, path, .{
         .mode = .read_write,
         .follow_symlinks = false,
@@ -1769,9 +1795,13 @@ fn safeAbsolutePath(path: []const u8) bool {
     return true;
 }
 
+fn validateIoPathLength(path: []const u8, max: usize) Error!void {
+    if (path.len > max or path.len >= std.fs.max_path_bytes) return error.PathTooLong;
+}
+
 fn joinPath(allocator: std.mem.Allocator, directory: []const u8, name: []const u8, max: usize) Error![]u8 {
-    const length = std.math.add(usize, directory.len, name.len + 1) catch return error.InvalidPath;
-    if (length > max) return error.InvalidPath;
+    const length = std.math.add(usize, directory.len, name.len + 1) catch return error.PathTooLong;
+    if (length > max or length >= std.fs.max_path_bytes) return error.PathTooLong;
     const result = allocator.alloc(u8, length) catch return error.OutOfMemory;
     @memcpy(result[0..directory.len], directory);
     result[directory.len] = '/';
@@ -1801,6 +1831,7 @@ fn mapAlloc(err: anyerror) Error {
 fn mapPath(err: anyerror) Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.PathTooLong, error.CwdTooLong => error.PathTooLong,
         else => error.InvalidPath,
     };
 }
@@ -1826,6 +1857,75 @@ fn mapSession(err: anyerror) Error {
 fn loadAllocationExercise(allocator: std.mem.Allocator, path: []const u8) !void {
     var loaded = try load(allocator, std.testing.io, path, .{});
     loaded.deinit();
+}
+
+test "lazy builder and direct APIs enforce the syscall path boundary" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const uuid = [_]u8{
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+        0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+    };
+    const suffix_bytes = "/sessions/".len + "root.44bd54d473cd3d44".len +
+        1 + Paths.canonical_name_bytes;
+    const accepted_root_len = std.fs.max_path_bytes - 1 - suffix_bytes;
+    const accepted_root = try allocator.alloc(u8, accepted_root_len);
+    defer allocator.free(accepted_root);
+    @memset(accepted_root, 'a');
+    accepted_root[0] = '/';
+    var log = try Log.prepare(allocator, io, .{
+        .state_root = accepted_root,
+        .cwd = "/",
+        .selection = .{},
+        .timestamp = .{ .epoch_seconds = 0 },
+        .uuid = uuid,
+        .writer_version = "test",
+    });
+    defer log.deinit();
+    try std.testing.expectEqual(std.fs.max_path_bytes - 1, log.path().len);
+
+    const rejected_root = try allocator.alloc(u8, accepted_root_len + 1);
+    defer allocator.free(rejected_root);
+    @memset(rejected_root, 'a');
+    rejected_root[0] = '/';
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.PathTooLong, Log.prepare(failing.allocator(), io, .{
+        .state_root = rejected_root,
+        .cwd = "/",
+        .selection = .{},
+        .timestamp = .{ .epoch_seconds = 0 },
+        .uuid = uuid,
+        .writer_version = "test",
+    }));
+
+    const accepted_path = try allocator.alloc(u8, std.fs.max_path_bytes - 1);
+    defer allocator.free(accepted_path);
+    @memset(accepted_path, 'a');
+    accepted_path[0] = '/';
+    const rejected_path = try allocator.alloc(u8, std.fs.max_path_bytes);
+    defer allocator.free(rejected_path);
+    @memset(rejected_path, 'a');
+    rejected_path[0] = '/';
+
+    try std.testing.expectError(error.IoFailure, readMeta(allocator, io, accepted_path, .{}));
+    try std.testing.expectError(error.IoFailure, load(allocator, io, accepted_path, .{}));
+    try std.testing.expectError(error.IoFailure, loadForResume(allocator, io, accepted_path, .{}));
+    try std.testing.expectError(error.IoFailure, Log.resumeExisting(allocator, io, .{
+        .path = accepted_path,
+        .selection = .{},
+        .loaded_item_count = 0,
+    }));
+    try std.testing.expectError(error.IoFailure, touch(io, accepted_path));
+
+    try std.testing.expectError(error.PathTooLong, readMeta(allocator, io, rejected_path, .{}));
+    try std.testing.expectError(error.PathTooLong, load(allocator, io, rejected_path, .{}));
+    try std.testing.expectError(error.PathTooLong, loadForResume(allocator, io, rejected_path, .{}));
+    try std.testing.expectError(error.PathTooLong, Log.resumeExisting(allocator, io, .{
+        .path = rejected_path,
+        .selection = .{},
+        .loaded_item_count = 0,
+    }));
+    try std.testing.expectError(error.PathTooLong, touch(io, rejected_path));
 }
 
 test "touch advances session timestamps and rejects unsafe paths" {

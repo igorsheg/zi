@@ -50,8 +50,7 @@ pub fn bucketWithLimits(
     cwd: []const u8,
     limits: Limits,
 ) Error![]u8 {
-    try validateLimits(limits);
-    try validateCwd(cwd, limits);
+    const encoded_length = try bucketEncodedLength(cwd, limits);
 
     var hash: u64 = 1469598103934665603;
     for (cwd) |byte| {
@@ -63,7 +62,8 @@ pub fn bucketWithLimits(
     while (relative_start < cwd.len and cwd[relative_start] == '/') relative_start += 1;
     const relative = if (relative_start == cwd.len) "root" else cwd[relative_start..];
     const slug_length = @min(relative.len, slug_max_bytes);
-    const result = try allocator.alloc(u8, slug_length + 17);
+    std.debug.assert(encoded_length == slug_length + 17);
+    const result = try allocator.alloc(u8, encoded_length);
     errdefer allocator.free(result);
     for (relative[0..slug_length], result[0..slug_length]) |byte, *output| {
         output.* = if (byte == '/') '-' else byte;
@@ -71,6 +71,37 @@ pub fn bucketWithLimits(
     result[slug_length] = '.';
     writeHex64(result[slug_length + 1 ..], hash);
     return result;
+}
+
+/// Validates `limits` and `cwd`, then returns the exact encoded bucket length.
+fn bucketEncodedLength(cwd: []const u8, limits: Limits) Error!usize {
+    try validateLimits(limits);
+    try validateCwd(cwd, limits);
+    return bucketEncodedLengthValid(cwd);
+}
+
+/// Validates `limits`, `state_root`, and `cwd` in that order, then returns the
+/// exact directory length. Both the configured and syscall path limits apply.
+pub fn sessionDirectoryLength(
+    state_root: []const u8,
+    cwd: []const u8,
+    limits: Limits,
+) Error!usize {
+    try validateLimits(limits);
+    try validateRoot(state_root, limits);
+    try validateCwd(cwd, limits);
+
+    var root_length = state_root.len;
+    while (root_length > 1 and state_root[root_length - 1] == '/') root_length -= 1;
+    const separator_length: usize = if (root_length == 1) 0 else 1;
+    const prefix_length = std.math.add(usize, root_length, separator_length + "sessions/".len) catch
+        return error.PathTooLong;
+    const path_length = std.math.add(usize, prefix_length, bucketEncodedLengthValid(cwd)) catch
+        return error.PathTooLong;
+    if (path_length > limits.max_path_bytes or path_length >= std.fs.max_path_bytes) {
+        return error.PathTooLong;
+    }
+    return path_length;
 }
 
 /// Builds `<state_root>/sessions/<bucket>` without consulting process state.
@@ -81,18 +112,13 @@ pub fn sessionDirectory(
     cwd: []const u8,
     limits: Limits,
 ) Error![]u8 {
-    try validateLimits(limits);
-    try validateRoot(state_root, limits);
+    const path_length = try sessionDirectoryLength(state_root, cwd, limits);
     const encoded = try bucketWithLimits(allocator, cwd, limits);
     defer allocator.free(encoded);
 
     var root_length = state_root.len;
     while (root_length > 1 and state_root[root_length - 1] == '/') root_length -= 1;
     const separator_length: usize = if (root_length == 1) 0 else 1;
-    const prefix_length = std.math.add(usize, root_length, separator_length + "sessions/".len) catch
-        return error.PathTooLong;
-    const path_length = std.math.add(usize, prefix_length, encoded.len) catch return error.PathTooLong;
-    if (path_length > limits.max_path_bytes) return error.PathTooLong;
 
     const result = try allocator.alloc(u8, path_length);
     errdefer allocator.free(result);
@@ -147,6 +173,13 @@ pub fn isCanonicalName(name: []const u8) bool {
 
 pub fn validUuid(uuid: [16]u8) bool {
     return uuid[6] & 0xf0 == 0x40 and uuid[8] & 0xc0 == 0x80;
+}
+
+fn bucketEncodedLengthValid(cwd: []const u8) usize {
+    var relative_start: usize = 0;
+    while (relative_start < cwd.len and cwd[relative_start] == '/') relative_start += 1;
+    const relative_length = if (relative_start == cwd.len) "root".len else cwd.len - relative_start;
+    return @min(relative_length, slug_max_bytes) + 17;
 }
 
 fn validateLimits(limits: Limits) Error!void {
@@ -385,6 +418,29 @@ test "path rules and exact state-root join are bounded" {
     try std.testing.expectError(
         error.PathTooLong,
         sessionDirectory(allocator, "/state", "/tmp", .{ .max_path_bytes = 20 }),
+    );
+}
+
+test "session directory enforces the syscall path boundary" {
+    const allocator = std.testing.allocator;
+    const suffix_bytes = "/sessions/".len + "root.44bd54d473cd3d44".len;
+    const accepted_root_len = std.fs.max_path_bytes - 1 - suffix_bytes;
+    const accepted_root = try allocator.alloc(u8, accepted_root_len);
+    defer allocator.free(accepted_root);
+    @memset(accepted_root, 'a');
+    accepted_root[0] = '/';
+    const accepted = try sessionDirectory(allocator, accepted_root, "/", .{});
+    defer allocator.free(accepted);
+    try std.testing.expectEqual(std.fs.max_path_bytes - 1, accepted.len);
+
+    const rejected_root = try allocator.alloc(u8, accepted_root_len + 1);
+    defer allocator.free(rejected_root);
+    @memset(rejected_root, 'a');
+    rejected_root[0] = '/';
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.PathTooLong,
+        sessionDirectory(failing.allocator(), rejected_root, "/", .{}),
     );
 }
 
