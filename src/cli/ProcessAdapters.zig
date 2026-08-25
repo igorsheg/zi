@@ -172,6 +172,34 @@ pub fn readFile(
     return .{ .bytes = bytes };
 }
 
+/// Creates the final cache directory below its trusted parent and rejects a final symlink.
+pub fn ensurePrivateCacheRoot(io: std.Io, cache_root: []const u8) !void {
+    if (cache_root.len == 0 or cache_root.len > std.fs.max_path_bytes or
+        !std.fs.path.isAbsolute(cache_root) or std.mem.findScalar(u8, cache_root, 0) != null or
+        !std.unicode.utf8ValidateSlice(cache_root) or std.mem.eql(u8, cache_root, "/"))
+    {
+        return error.InvalidPath;
+    }
+    const parent_path = std.fs.path.dirname(cache_root) orelse return error.InvalidPath;
+    const name = std.fs.path.basename(cache_root);
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
+        return error.InvalidPath;
+    }
+    try std.Io.Dir.cwd().createDirPath(io, parent_path);
+    const parent = try std.Io.Dir.cwd().openDir(io, parent_path, .{});
+    defer parent.close(io);
+    parent.createDir(io, name, .fromMode(0o700)) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    const directory = try parent.openDir(io, name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer directory.close(io);
+    try directory.setPermissions(io, .fromMode(0o700));
+}
+
 pub const CwdError = error{ OutOfMemory, CwdTooLong, InvalidCwd, CurrentDirUnlinked, Canceled, Unexpected };
 
 /// Returns an allocator-owned canonical current directory using only `io`.
@@ -491,4 +519,42 @@ test "secure random UUIDs set RFC 4122 version and variant bits and differ" {
     var nonce: [32]u8 = undefined;
     try random.nonceSource().fill(&nonce);
     try std.testing.expect(!std.mem.allEqual(u8, &nonce, 0));
+}
+
+test "private cache root creates mode 0700 and rejects file and symlink finals" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try acquireCwd(std.testing.allocator, std.testing.io);
+    defer std.testing.allocator.free(cwd);
+    const base = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path },
+    );
+    defer std.testing.allocator.free(base);
+    const cache = try std.fs.path.join(std.testing.allocator, &.{ base, "nested", "zi" });
+    defer std.testing.allocator.free(cache);
+
+    try ensurePrivateCacheRoot(std.testing.io, cache);
+    try ensurePrivateCacheRoot(std.testing.io, cache);
+    const directory = try std.Io.Dir.cwd().openDir(std.testing.io, cache, .{ .iterate = true });
+    defer directory.close(std.testing.io);
+    const stat = try directory.stat(std.testing.io);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
+
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ base, "file" });
+    defer std.testing.allocator.free(file_path);
+    var file = try std.Io.Dir.cwd().createFile(std.testing.io, file_path, .{});
+    file.close(std.testing.io);
+    try std.testing.expectError(error.NotDir, ensurePrivateCacheRoot(std.testing.io, file_path));
+
+    const target_path = try std.fs.path.join(std.testing.allocator, &.{ base, "target" });
+    defer std.testing.allocator.free(target_path);
+    try std.Io.Dir.cwd().createDir(std.testing.io, target_path, .fromMode(0o700));
+    const link_path = try std.fs.path.join(std.testing.allocator, &.{ base, "link" });
+    defer std.testing.allocator.free(link_path);
+    try std.Io.Dir.cwd().symLink(std.testing.io, target_path, link_path, .{ .is_directory = true });
+    try std.testing.expectError(error.NotDir, ensurePrivateCacheRoot(std.testing.io, link_path));
+    try std.testing.expectError(error.InvalidPath, ensurePrivateCacheRoot(std.testing.io, "relative"));
+    try std.testing.expectError(error.InvalidPath, ensurePrivateCacheRoot(std.testing.io, "/"));
+    try std.testing.expectError(error.InvalidPath, ensurePrivateCacheRoot(std.testing.io, "/tmp/zi\x00bad"));
 }

@@ -4,6 +4,7 @@
 //! already-materialized session, provider, lifecycle seams, and borrowed writers.
 
 const std = @import("std");
+const DiagnosticText = @import("DiagnosticText.zig");
 const agent = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const tool = @import("../tool/root.zig");
@@ -18,6 +19,7 @@ pub const CallbackError = error{
     OutOfMemory,
     Failed,
     Indeterminate,
+    InvalidPlan,
 };
 
 pub const RenderError = CallbackError || std.Io.Writer.Error;
@@ -79,6 +81,7 @@ pub const CatalogHook = struct {
     context: *anyopaque,
     prefetch_fn: *const fn (*anyopaque) CallbackError!PrefetchOutcome,
     drain_fn: *const fn (*anyopaque, u64) CallbackError!?ai.ModelMeta.Metadata,
+    current_metadata_fn: *const fn (*anyopaque) ?ai.ModelMeta.Metadata,
 
     pub fn prefetch(self: CatalogHook) CallbackError!PrefetchOutcome {
         return self.prefetch_fn(self.context);
@@ -86,6 +89,10 @@ pub const CatalogHook = struct {
 
     pub fn drain(self: CatalogHook, maximum_wait_ms: u64) CallbackError!?ai.ModelMeta.Metadata {
         return self.drain_fn(self.context, maximum_wait_ms);
+    }
+
+    pub fn currentMetadata(self: CatalogHook) ?ai.ModelMeta.Metadata {
+        return self.current_metadata_fn(self.context);
     }
 
     pub fn from(implementation: anytype) CatalogHook {
@@ -108,11 +115,18 @@ pub const CatalogHook = struct {
                 const self: *Implementation = @ptrCast(@alignCast(context));
                 return self.drain(maximum_wait_ms);
             }
+
+            fn currentMetadata(context: *anyopaque) ?ai.ModelMeta.Metadata {
+                if (!@hasDecl(Implementation, "currentMetadata")) return null;
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.currentMetadata();
+            }
         };
         return .{
             .context = implementation,
             .prefetch_fn = Adapter.prefetch,
             .drain_fn = Adapter.drain,
+            .current_metadata_fn = Adapter.currentMetadata,
         };
     }
 };
@@ -214,10 +228,12 @@ pub const Inputs = struct {
     provider: ai.Provider.Provider,
     model: []const u8,
     model_metadata: ai.ModelMeta.Metadata = .{},
+    model_metadata_source: ?agent.ModelMetadataSource.ModelMetadataSource = null,
     system_prompt: []const u8,
     tools: []const tool.Tool.Tool = &.{},
     effort: ?[]const u8 = null,
     image_input: ai.Provider.ImageInput = .unknown,
+    image_input_source: ?agent.ImageInputSource.ImageInputSource = null,
     prompt: []const u8,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
@@ -250,14 +266,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) Error!u8 {
 
     // Catalog completion is advisory. It may improve pricing, but cannot erase
     // an already completed answer or a provider diagnostic.
-    if (inputs.usage_stats.has_unpriced) {
-        if (inputs.catalog_hook) |catalog| {
-            const refreshed = catalog.drain(catalog_drain_ms) catch |err| refresh: {
-                ignoreCatalogError(err);
-                break :refresh null;
-            };
-            if (refreshed) |metadata| inputs.usage_stats.reprice(&metadata);
-        }
+    if (inputs.catalog_hook) |catalog| {
+        const catalog_wait_ms: u64 = if (inputs.usage_stats.has_unpriced) catalog_drain_ms else 0;
+        const refreshed = catalog.drain(catalog_wait_ms) catch |err| refresh: {
+            ignoreCatalogError(err);
+            break :refresh null;
+        };
+        if (refreshed) |metadata| inputs.usage_stats.reprice(&metadata);
     }
 
     // Keep answers ahead of diagnostics when both writers share a destination.
@@ -293,6 +308,9 @@ const BeforeFinish = struct {
 };
 
 fn runBeforeFinish(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) Error!BeforeFinish {
+    const stable_effort = if (inputs.effort) |effort| try allocator.dupe(u8, effort) else null;
+    defer if (stable_effort) |effort| allocator.free(effort);
+
     // addUser reserves and commits both items together. If it fails, no partial
     // prompt is visible. A seam error after it remains intentionally ambiguous.
     try inputs.session.addUser(inputs.prompt);
@@ -302,22 +320,36 @@ fn runBeforeFinish(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) Err
     try printBanner(inputs, info);
 
     const started_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    var model_metadata = inputs.model_metadata;
     if (inputs.catalog_hook) |catalog| {
-        if (catalog.prefetch() catch null) |outcome| switch (outcome) {
-            .started, .unavailable => {},
-            .warning => |warning| try inputs.stderr.print("zi: warning: {s}\n", .{warning}),
+        const prefetch = catalog.prefetch() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Indeterminate => return error.Indeterminate,
+            error.Failed => null,
+            error.InvalidPlan => return error.InvalidPlan,
         };
+        if (prefetch) |outcome| switch (outcome) {
+            .started, .unavailable => {},
+            .warning => |warning| {
+                try inputs.stderr.writeAll("zi: warning: ");
+                try DiagnosticText.write(inputs.stderr, warning);
+                try inputs.stderr.writeByte('\n');
+            },
+        };
+        if (catalog.currentMetadata()) |metadata| model_metadata = metadata;
     }
 
     var loop_result = try agent.Loop.run(allocator, io, .{
         .session = inputs.session,
         .provider = inputs.provider,
         .model = inputs.model,
-        .model_metadata = inputs.model_metadata,
+        .model_metadata = model_metadata,
+        .model_metadata_source = inputs.model_metadata_source,
         .system_prompt = inputs.system_prompt,
         .tools = inputs.tools,
-        .effort = inputs.effort,
+        .effort = stable_effort,
         .image_input = inputs.image_input,
+        .image_input_source = inputs.image_input_source,
         .max_turns = max_turns,
         .seam_hook = inputs.seam_hook,
         .usage_observer = agent.Loop.UsageObserver.from(inputs.usage_stats),
@@ -332,9 +364,9 @@ fn runBeforeFinish(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) Err
             break :complete 0;
         },
         .provider_error => failure: {
-            try inputs.stderr.print("zi: provider error: {s}\n", .{
-                loop_result.diagnostic orelse "(no message)",
-            });
+            try inputs.stderr.writeAll("zi: provider error: ");
+            try DiagnosticText.write(inputs.stderr, loop_result.diagnostic orelse "(no message)");
+            try inputs.stderr.writeByte('\n');
             break :failure 1;
         },
         .max_turns => failure: {
@@ -348,7 +380,7 @@ fn runBeforeFinish(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) Err
 
 fn ignoreCatalogError(err: CallbackError) void {
     switch (err) {
-        error.OutOfMemory, error.Failed, error.Indeterminate => {},
+        error.OutOfMemory, error.Failed, error.Indeterminate, error.InvalidPlan => {},
     }
 }
 
@@ -376,21 +408,36 @@ fn printBanner(inputs: Inputs, info: SessionInfo) std.Io.Writer.Error!void {
     errdefer if (style_open) resetBestEffort(inputs.stderr);
     if (preset) |value| {
         if (value.len > 0) {
-            try inputs.stderr.print("zi [{s}]: {s} · {s}", .{ value, provider_name, model_label });
+            try inputs.stderr.writeAll("zi [");
+            try DiagnosticText.write(inputs.stderr, value);
+            try inputs.stderr.writeAll("]: ");
+            try DiagnosticText.write(inputs.stderr, provider_name);
+            try inputs.stderr.writeAll(" · ");
+            try DiagnosticText.write(inputs.stderr, model_label);
         } else {
-            try inputs.stderr.print("zi: {s} · {s}", .{ provider_name, model_label });
+            try inputs.stderr.writeAll("zi: ");
+            try DiagnosticText.write(inputs.stderr, provider_name);
+            try inputs.stderr.writeAll(" · ");
+            try DiagnosticText.write(inputs.stderr, model_label);
         }
     } else {
-        try inputs.stderr.print("zi: {s} · {s}", .{ provider_name, model_label });
+        try inputs.stderr.writeAll("zi: ");
+        try DiagnosticText.write(inputs.stderr, provider_name);
+        try inputs.stderr.writeAll(" · ");
+        try DiagnosticText.write(inputs.stderr, model_label);
     }
-    if (effort) |value| if (value.len > 0) try inputs.stderr.print(" · {s}", .{value});
+    if (effort) |value| if (value.len > 0) {
+        try inputs.stderr.writeAll(" · ");
+        try DiagnosticText.write(inputs.stderr, value);
+    };
     if (info.provider_autoselected) {
         try inputs.stderr.writeAll(" (auto-selected)");
     } else if (info.resumed) {
         try inputs.stderr.writeAll(" (resumed)");
     }
     if (info.materialized_session) |session_id| {
-        try inputs.stderr.print(" · session {s}", .{session_id});
+        try inputs.stderr.writeAll(" · session ");
+        try DiagnosticText.write(inputs.stderr, session_id);
     }
     if (style_open) {
         try inputs.stderr.writeAll(ansi_reset);
@@ -410,7 +457,8 @@ fn printResumeHint(
         style_open = true;
     }
     errdefer if (style_open) resetBestEffort(writer);
-    try writer.print("resume with: zi --resume={s}", .{hint});
+    try writer.writeAll("resume with: zi --resume=");
+    try DiagnosticText.write(writer, hint);
     if (style_open) {
         try writer.writeAll(ansi_reset);
         style_open = false;
@@ -719,7 +767,7 @@ test "provider failure is diagnostic and exits one" {
             _: ai.Provider.Request,
             sink: ai.Provider.EventSink,
         ) ai.Provider.StreamError!void {
-            try sink.emit(.{ .failure = .{ .message = "quota" } });
+            try sink.emit(.{ .failure = .{ .message = "quota\n\x1b\u{9b}\u{202e}" } });
         }
     };
 
@@ -744,23 +792,41 @@ test "provider failure is diagnostic and exits one" {
     }));
     try std.testing.expectEqualStrings("", stdout_allocating.written());
     try std.testing.expectEqualStrings(
-        "zi: fake · model\n\nzi: provider error: quota\n",
+        "zi: fake · model\n\nzi: provider error: quota\\n\\x1b\\u{9b}\\u{202e}\n",
         stderr_allocating.written(),
     );
 }
 
 test "catalog advisory outcomes and errors never erase completion" {
-    const Mode = enum { warning, unavailable, prefetch_error, drain_error, priced };
+    const Mode = enum {
+        warning,
+        unavailable,
+        prefetch_error,
+        prefetch_oom,
+        prefetch_indeterminate,
+        prefetch_invalid_plan,
+        drain_error,
+        priced,
+        already_priced,
+        preflight_priced,
+    };
     const Provider = struct {
         const Self = @This();
+        expected_effort: ?[]const u8 = null,
+        calls: usize = 0,
 
         pub fn stream(
             _: std.mem.Allocator,
             _: std.Io,
-            _: *Self,
-            _: ai.Provider.Request,
+            self: *Self,
+            request: ai.Provider.Request,
             sink: ai.Provider.EventSink,
         ) ai.Provider.StreamError!void {
+            self.calls += 1;
+            if (self.expected_effort) |expected| {
+                const actual = request.context.effort orelse return error.InvalidRequest;
+                if (!std.mem.eql(u8, expected, actual)) return error.InvalidRequest;
+            }
             try sink.emit(.{ .text_delta = "ok" });
             try sink.emit(.{ .done = .{ .usage = .{ .input_tokens = 1, .output_tokens = 1 } } });
         }
@@ -775,13 +841,26 @@ test "catalog advisory outcomes and errors never erase completion" {
             self.prefetch_calls += 1;
             return switch (self.mode) {
                 .warning => .{ .warning = "stale catalog" },
-                .unavailable, .drain_error, .priced => .unavailable,
+                .unavailable, .drain_error, .priced, .already_priced => .unavailable,
+                .preflight_priced => .started,
                 .prefetch_error => error.Failed,
+                .prefetch_oom => error.OutOfMemory,
+                .prefetch_indeterminate => error.Indeterminate,
+                .prefetch_invalid_plan => error.InvalidPlan,
             };
         }
 
+        pub fn currentMetadata(self: *Self) ?ai.ModelMeta.Metadata {
+            if (self.mode != .preflight_priced) return null;
+            return .{ .rates = .{ .input = 1_000_000, .output = 1_000_000 } };
+        }
+
         pub fn drain(self: *Self, wait_ms: u64) CallbackError!?ai.ModelMeta.Metadata {
-            if (wait_ms != catalog_drain_ms) return error.Failed;
+            const expected_wait: u64 = if (self.mode == .already_priced or self.mode == .preflight_priced)
+                0
+            else
+                catalog_drain_ms;
+            if (wait_ms != expected_wait) return error.Failed;
             self.drain_calls += 1;
             if (self.mode == .drain_error) return error.Failed;
             if (self.mode == .priced) return .{ .rates = .{
@@ -792,8 +871,20 @@ test "catalog advisory outcomes and errors never erase completion" {
         }
     };
 
-    for ([_]Mode{ .warning, .unavailable, .prefetch_error, .drain_error, .priced }) |mode| {
-        var provider: Provider = .{};
+    for ([_]Mode{
+        .warning,
+        .unavailable,
+        .prefetch_error,
+        .prefetch_oom,
+        .prefetch_indeterminate,
+        .drain_error,
+        .priced,
+        .already_priced,
+        .preflight_priced,
+    }) |mode| {
+        var provider: Provider = .{
+            .expected_effort = if (mode == .preflight_priced) "high" else null,
+        };
         var catalog: Catalog = .{ .mode = mode };
         var stats = try agent.UsageStats.UsageStats.init(std.testing.allocator, 16);
         defer stats.deinit();
@@ -804,21 +895,39 @@ test "catalog advisory outcomes and errors never erase completion" {
         var stderr_allocating: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer stderr_allocating.deinit();
 
-        try std.testing.expectEqual(@as(u8, 0), try run(std.testing.allocator, std.testing.io, .{
+        const inputs: Inputs = .{
             .session = &session,
             .provider = ai.Provider.Provider.from(&provider, "fake"),
             .model = "model",
+            .model_metadata = if (mode == .already_priced) .{ .rates = .{
+                .input = 1,
+                .output = 1,
+            } } else .{},
+            .effort = if (mode == .preflight_priced) "high" else null,
             .system_prompt = "",
             .prompt = "x",
             .stdout = &stdout_allocating.writer,
             .stderr = &stderr_allocating.writer,
             .usage_stats = &stats,
             .catalog_hook = CatalogHook.from(&catalog),
-        }));
+        };
+        const expected_error: ?CallbackError = switch (mode) {
+            .prefetch_oom => error.OutOfMemory,
+            .prefetch_indeterminate => error.Indeterminate,
+            .prefetch_invalid_plan => error.InvalidPlan,
+            else => null,
+        };
+        if (expected_error) |expected| {
+            try std.testing.expectError(expected, run(std.testing.allocator, std.testing.io, inputs));
+            try std.testing.expectEqual(@as(usize, 0), provider.calls);
+            try std.testing.expectEqual(@as(usize, 0), catalog.drain_calls);
+            continue;
+        }
+        try std.testing.expectEqual(@as(u8, 0), try run(std.testing.allocator, std.testing.io, inputs));
         try std.testing.expectEqualStrings("ok\n", stdout_allocating.written());
         try std.testing.expectEqual(@as(usize, 1), catalog.prefetch_calls);
         try std.testing.expectEqual(@as(usize, 1), catalog.drain_calls);
-        if (mode == .priced) {
+        if (mode == .priced or mode == .preflight_priced) {
             try std.testing.expect(!stats.has_unpriced);
             try std.testing.expectApproxEqAbs(@as(f64, 2), stats.spend_usd, 1e-15);
         }
@@ -979,4 +1088,49 @@ test "terminal finish is exact once with documented error precedence" {
         }
         try std.testing.expectEqual(@as(usize, 1), terminal.calls);
     }
+}
+
+test "banner and resume hint sanitize untrusted fields inside style wrappers" {
+    const Provider = struct {
+        const Self = @This();
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            _: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {}
+    };
+    var provider: Provider = .{};
+    var session = try agent.Session.Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var usage = try agent.UsageStats.UsageStats.init(std.testing.allocator, 1);
+    defer usage.deinit();
+    const inputs: Inputs = .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fallback"),
+        .model = "fallback",
+        .system_prompt = "",
+        .prompt = "",
+        .stdout = &output.writer,
+        .stderr = &output.writer,
+        .usage_stats = &usage,
+        .style_diagnostics = true,
+    };
+    try printBanner(inputs, .{
+        .preset = "p\n",
+        .provider_name = "provider\x1b",
+        .model_label = "model\u{9b}",
+        .effort = "high\u{202e}",
+        .materialized_session = "id\u{2067}",
+    });
+    try printResumeHint(&output.writer, "id\n\x1b", true);
+    try std.testing.expectEqualStrings(
+        "\x1b[2mzi [p\\n]: provider\\x1b · model\\u{9b} · high\\u{202e} · session id\\u{2067}\x1b[0m\n\n" ++
+            "\x1b[2mresume with: zi --resume=id\\n\\x1b\x1b[0m\n",
+        output.written(),
+    );
 }

@@ -6,8 +6,11 @@ Zi follows the architecture and observable behavior of hax v0.4.0, revision
 `189816fb8b02956a6913d7638e6d2cc90a91d61a`, by Oleksandr Chekhovskyi and contributors.
 Provider-independent item, turn, session, abort-repair, tool, read/image, output-cap,
 UTF-8 sanitation, unified-diff, atomic-write, write, edit, synchronous bash, background task registry/wait,
-agent-context discovery and rendering, prompt-file expansion, Codex CLI credential behavior,
-and libcurl HTTP, CA discovery, SSE, and retry behavior is adapted from hax sources at that revision.
+task lifecycle and environment propagation, agent-context discovery and rendering, one-shot startup,
+execution, and output ordering, session resume and retention matching, catalog refresh and routing,
+compaction cadence, usage pricing and statistics, prompt-file expansion, configuration registry and typed
+parsing, Codex CLI credential behavior, and libcurl HTTP, CA discovery, SSE, and retry behavior are adapted
+from hax sources at that revision.
 
 hax is licensed under the MIT License. Its license text is reproduced below.
 

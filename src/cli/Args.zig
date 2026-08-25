@@ -1,4 +1,5 @@
 const std = @import("std");
+const DiagnosticText = @import("DiagnosticText.zig");
 
 pub const max_arguments: usize = 256;
 pub const max_argument_bytes: usize = 1024 * 1024;
@@ -66,22 +67,24 @@ pub const ParseError = struct {
                 "arguments exceed the {d}-byte limit",
                 .{max_argument_bytes},
             ),
-            .unknown_option => try writer.print(
-                "unknown option '{s}'\nTry 'zi --help' for usage.",
-                .{problem.option},
-            ),
-            .option_does_not_take_value => try writer.print(
-                "{s} does not take a value\nTry 'zi --help' for usage.",
-                .{problem.option},
-            ),
-            .missing_value => try writer.print(
-                "{s} requires a value\nTry 'zi --help' for usage.",
-                .{problem.option},
-            ),
+            .unknown_option => {
+                try writer.writeAll("unknown option '");
+                try DiagnosticText.write(writer, problem.option);
+                try writer.writeAll("'\nTry 'zi --help' for usage.");
+            },
+            .option_does_not_take_value => {
+                try DiagnosticText.write(writer, problem.option);
+                try writer.writeAll(" does not take a value\nTry 'zi --help' for usage.");
+            },
+            .missing_value => {
+                try DiagnosticText.write(writer, problem.option);
+                try writer.writeAll(" requires a value\nTry 'zi --help' for usage.");
+            },
             .empty_value => if (std.mem.eql(u8, problem.option, "--resume=")) {
                 try writer.writeAll("--resume= requires a session id");
             } else {
-                try writer.print("{s} requires a value", .{problem.option});
+                try DiagnosticText.write(writer, problem.option);
+                try writer.writeAll(" requires a value");
             },
             .conflicting_resume => try writer.writeAll("use only one of --continue / --resume"),
             .print_resume_needs_id => try writer.writeAll(
@@ -604,4 +607,15 @@ test "positional prompt join propagates allocation failure" {
     try std.testing.expectError(error.OutOfMemory, choosePrompt(fixed.allocator(), &options, .{
         .stdin_is_tty = true,
     }));
+}
+
+test "parse diagnostics visibly escape untrusted argv controls" {
+    const result = parse(&.{"--bad\n\r\t\x1b\x00"});
+    var storage: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    try result.err.render(&writer);
+    try std.testing.expectEqualStrings(
+        "unknown option '--bad\\n\\r\\t\\x1b\\x00'\nTry 'zi --help' for usage.",
+        writer.buffered(),
+    );
 }

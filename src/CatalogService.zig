@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const ai = @import("ai/root.zig");
+const SecureAllocator = @import("ai/SecureAllocator.zig");
 const persistence = @import("persistence/root.zig");
 const CatalogManager = @import("CatalogManager.zig");
 
@@ -168,7 +169,7 @@ pub const Owner = struct {
         const self = try allocator.create(Owner);
         errdefer allocator.destroy(self);
         const url = allocator.dupe(u8, options.url) catch return error.OutOfMemory;
-        errdefer allocator.free(url);
+        errdefer wipeUrl(allocator, url);
         var cache = try persistence.CatalogCache.CatalogCache.init(
             allocator,
             io,
@@ -318,7 +319,7 @@ pub const Owner = struct {
         const allocator = self.allocator;
         self.worker_cache.deinit();
         self.cache.deinit();
-        allocator.free(self.url);
+        wipeUrl(allocator, self.url);
         self.* = undefined;
         allocator.destroy(self);
     }
@@ -379,6 +380,14 @@ fn startFailure(err: std.Thread.SpawnError) StartFailure {
         error.LockedMemoryLimitExceeded => .locked_memory_limit_exceeded,
         error.Unexpected => .unexpected,
     };
+}
+
+fn wipeUrl(allocator: std.mem.Allocator, url: []u8) void {
+    if (url.len == 0) {
+        allocator.free(url);
+    } else {
+        SecureAllocator.wipeFree(allocator, url);
+    }
 }
 
 fn testNonce() persistence.PrivateFileStore.NonceSource {
@@ -682,4 +691,111 @@ test "drain reports stale warning without retaining catalog bytes" {
 
     const contribution = try owner.lookup(allocator, "", "p", "m");
     try std.testing.expectEqual(@as(u64, 41), contribution.metadata.context_window);
+}
+
+const UrlWipeAllocator = struct {
+    backing: std.mem.Allocator,
+    target_len: usize,
+    target_ptr: ?[*]u8 = null,
+    saw_zeroed_target: bool = false,
+
+    fn allocator(self: *UrlWipeAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *UrlWipeAllocator = @ptrCast(@alignCast(context));
+        const result = self.backing.rawAlloc(len, alignment, ret_addr);
+        if (len == self.target_len and self.target_ptr == null) self.target_ptr = result;
+        return result;
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *UrlWipeAllocator = @ptrCast(@alignCast(context));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *UrlWipeAllocator = @ptrCast(@alignCast(context));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        const self: *UrlWipeAllocator = @ptrCast(@alignCast(context));
+        if (self.target_ptr != null and memory.ptr == self.target_ptr.?) {
+            var all_zero = true;
+            for (memory) |byte| all_zero = all_zero and byte == 0;
+            if (all_zero) self.saw_zeroed_target = true;
+        }
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "catalog owner wipes its retained URL before free" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cache_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cache_root);
+    const url = "https://user:secret@catalog.test/models-unique.json";
+    var observing: UrlWipeAllocator = .{
+        .backing = std.testing.allocator,
+        .target_len = url.len,
+    };
+    var transport: ImmediateTransport = .{};
+    const owner = try Owner.create(observing.allocator(), std.testing.io, .from(&transport), .{
+        .cache_root = cache_root,
+        .url = url,
+        .refresh_ms = 0,
+        .now_seconds = 0,
+        .nonce_source = testNonce(),
+    });
+    observing.target_ptr = owner.url.ptr;
+    owner.deinit();
+    try std.testing.expect(observing.saw_zeroed_target);
+}
+
+test "catalog create failure wipes its retained URL" {
+    const url = "https://user:secret@catalog.test/failure-unique.json";
+    var observing: UrlWipeAllocator = .{
+        .backing = std.testing.allocator,
+        .target_len = url.len,
+    };
+    var transport: ImmediateTransport = .{};
+    try std.testing.expectError(error.InvalidRoot, Owner.create(
+        observing.allocator(),
+        std.testing.io,
+        .from(&transport),
+        .{
+            .cache_root = "relative-root",
+            .url = url,
+            .refresh_ms = 0,
+            .now_seconds = 0,
+            .nonce_source = testNonce(),
+        },
+    ));
+    try std.testing.expect(observing.saw_zeroed_target);
 }
