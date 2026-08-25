@@ -1355,7 +1355,7 @@ test "background fast finish stays synchronous and slow command is adopted" {
 
     const detached_command = try std.fmt.allocPrint(
         std.testing.allocator,
-        "printf one; while [ ! -e {s} ]; do :; done; printf two",
+        "while [ ! -e {s} ]; do :; done; printf one; printf two",
         .{quoted_slow_marker},
     );
     defer std.testing.allocator.free(detached_command);
@@ -1378,19 +1378,19 @@ test "background fast finish stays synchronous and slow command is adopted" {
         .{},
     );
     defer detached.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, detached.output, "one") != null);
     try std.testing.expect(std.mem.indexOf(u8, detached.output, "two") == null);
     try std.testing.expect(std.mem.endsWith(u8, detached.output, "[detached as task slow]"));
     try std.testing.expectEqual(@as(usize, 1), try registry.runningCount());
     try touchTestMarker(&tmp, slow_marker_name);
     const waited = try registry.wait(std.testing.allocator, "slow", .{ .timeout_ms = 2000 });
     defer std.testing.allocator.free(waited);
+    try std.testing.expect(std.mem.indexOf(u8, waited, "one") != null);
     try std.testing.expect(std.mem.indexOf(u8, waited, "two") != null);
     try std.testing.expect(std.mem.indexOf(u8, waited, "finished (exit 0)") != null);
 
     const timed_command = try std.fmt.allocPrint(
         std.testing.allocator,
-        "printf timeout-start; while [ ! -e {s} ]; do :; done; printf timeout-end",
+        "while [ ! -e {s} ]; do :; done; printf timeout-start; printf timeout-end",
         .{quoted_timed_marker},
     );
     defer std.testing.allocator.free(timed_command);
@@ -1413,12 +1413,12 @@ test "background fast finish stays synchronous and slow command is adopted" {
         .{},
     );
     defer timed.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, timed.output, "timeout-start") != null);
     try std.testing.expect(std.mem.indexOf(u8, timed.output, "timeout-end") == null);
     try std.testing.expect(std.mem.endsWith(u8, timed.output, "[detached as task t2 after 0s timeout]"));
     try std.testing.expectEqual(@as(usize, 1), try registry.runningCount());
     try touchTestMarker(&tmp, timed_marker_name);
     const timed_wait = try registry.wait(std.testing.allocator, "t2", .{ .timeout_ms = 2000 });
     defer std.testing.allocator.free(timed_wait);
+    try std.testing.expect(std.mem.indexOf(u8, timed_wait, "timeout-start") != null);
     try std.testing.expect(std.mem.indexOf(u8, timed_wait, "timeout-end") != null);
 }

@@ -70,9 +70,41 @@ pub const OutputSink = struct {
     }
 };
 
+/// Borrowed synchronous clock seam. Injected context must outlive `run` and
+/// return monotonic nanoseconds. The default reads `std.Io.Clock.awake` from
+/// the explicit `std.Io` passed to `run`.
+pub const Clock = struct {
+    context: ?*anyopaque = null,
+    now_fn: *const fn (std.Io, ?*anyopaque) i128 = awakeNow,
+
+    pub fn now(self: Clock, io: std.Io) i128 {
+        return self.now_fn(io, self.context);
+    }
+
+    pub fn from(implementation: anytype) Clock {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("Clock.from expects a single-item pointer");
+        }
+        const Adapter = struct {
+            fn now(_: std.Io, context: ?*anyopaque) i128 {
+                const self: Pointer = @ptrCast(@alignCast(context.?));
+                return self.nowNs();
+            }
+        };
+        return .{ .context = implementation, .now_fn = Adapter.now };
+    }
+
+    fn awakeNow(io: std.Io, _: ?*anyopaque) i128 {
+        return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    }
+};
+
 pub const Options = struct {
     /// Zero disables the timeout.
     timeout_ms: u64 = 0,
+    clock: Clock = .{},
     termination_grace_ms: u64 = 100,
     cancellation: ?Cancellation = null,
     /// When set, retained chunks are delivered serially and `Result.output` is
@@ -178,7 +210,7 @@ pub fn run(
     errdefer output.deinit(allocator);
     var produced_bytes: usize = 0;
 
-    const started_ns = monotonicNow(io);
+    const started_ns = options.clock.now(io);
     const timeout_deadline = if (options.timeout_ms == 0)
         null
     else
@@ -191,7 +223,7 @@ pub fn run(
     var runtime_error: ?RunError = null;
 
     while (!pipe_eof or !leader_exited) {
-        const now_ns = monotonicNow(io);
+        const now_ns = options.clock.now(io);
 
         // Observe completion before applying a signal sampled in this turn.
         // A command that has already exited keeps its actual status.
@@ -587,14 +619,72 @@ test "new session has no controlling tty" {
     try std.testing.expectEqual(@as(Status, .{ .exited = 0 }), result.status);
 }
 
+const TestClock = struct {
+    now_ns: std.atomic.Value(i64) = .init(0),
+
+    fn nowNs(self: *const TestClock) i128 {
+        return self.now_ns.load(.acquire);
+    }
+
+    fn advanceTo(self: *TestClock, now_ns: i64) void {
+        std.debug.assert(now_ns >= self.now_ns.load(.acquire));
+        self.now_ns.store(now_ns, .release);
+    }
+};
+
+const TimeoutReadySink = struct {
+    allocator: std.mem.Allocator,
+    clock: *TestClock,
+    bytes: std.ArrayList(u8) = .empty,
+    ready_seen: bool = false,
+    term_seen: bool = false,
+
+    fn emit(self: *TimeoutReadySink, bytes: []const u8) error{OutOfMemory}!void {
+        try self.bytes.appendSlice(self.allocator, bytes);
+        if (!self.ready_seen and std.mem.indexOf(u8, self.bytes.items, "ready") != null) {
+            self.ready_seen = true;
+            self.clock.advanceTo(101 * std.time.ns_per_ms);
+        }
+        if (!self.term_seen and std.mem.indexOf(u8, self.bytes.items, "term") != null) {
+            self.term_seen = true;
+            self.clock.advanceTo(132 * std.time.ns_per_ms);
+        }
+    }
+
+    fn deinit(self: *TimeoutReadySink) void {
+        self.bytes.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
 test "timeout kills descendants and returns their final output" {
     const allocator = std.testing.allocator;
+    var clock: TestClock = .{};
+    var sink: TimeoutReadySink = .{ .allocator = allocator, .clock = &clock };
+    defer sink.deinit();
     var result = try run(allocator, std.testing.io, shellInvocation(
-        "trap 'printf term' TERM; (trap '' TERM; while :; do :; done) & wait",
-    ), .{ .timeout_ms = 30, .termination_grace_ms = 30 });
+        "trap 'printf term' TERM; (trap '' TERM; while :; do :; done) & printf ready; wait",
+    ), .{
+        .timeout_ms = 100,
+        .termination_grace_ms = 30,
+        .clock = Clock.from(&clock),
+        .output_sink = OutputSink.from(&sink),
+    });
     defer result.deinit(allocator);
     try std.testing.expectEqual(.timed_out, result.status);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "term") != null);
+    try std.testing.expectEqual(@as(usize, 0), result.output.len);
+    try std.testing.expect(sink.ready_seen);
+    try std.testing.expect(sink.term_seen);
+}
+
+test "injected clock is exact and deadlines saturate" {
+    var clock: TestClock = .{};
+    clock.advanceTo(42);
+    try std.testing.expectEqual(@as(i128, 42), Clock.from(&clock).now(std.testing.io));
+    try std.testing.expectEqual(
+        @as(i128, std.math.maxInt(i128)),
+        deadlineAfter(std.math.maxInt(i128) - 1, 1),
+    );
 }
 
 const CancelAfter = struct {
