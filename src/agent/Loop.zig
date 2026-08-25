@@ -4,6 +4,7 @@ const tool = @import("../tool/root.zig");
 const TurnModule = @import("Turn.zig");
 const SessionModule = @import("Session.zig");
 const AbortRepair = @import("AbortRepair.zig");
+const ImageInputSourceModule = @import("ImageInputSource.zig");
 
 const Item = ai.Item.Item;
 const Turn = TurnModule.Turn;
@@ -241,7 +242,9 @@ pub const Params = struct {
     system_prompt: []const u8,
     tools: []const tool.Tool.Tool = &.{},
     effort: ?[]const u8 = null,
+    /// Fixed compatibility value used when `image_input_source` is absent.
     image_input: ai.Provider.ImageInput = .unknown,
+    image_input_source: ?ImageInputSourceModule.ImageInputSource = null,
     max_turns: usize = default_max_turns,
     continued: bool = false,
     checkpoint: ?Checkpoint = null,
@@ -425,6 +428,18 @@ const Sink = struct {
     }
 };
 
+fn resolveImageInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    params: Params,
+) Error!ai.Provider.ImageInput {
+    const source = params.image_input_source orelse return params.image_input;
+    return source.resolve(allocator, io) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Failed => error.HookFailed,
+    };
+}
+
 fn mapHookError(err: HookError) Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -584,6 +599,7 @@ pub fn run(
         }
         const owes_boundary = result.turns > 0 or params.continued;
         result.turns += 1;
+        const request_image_input = try resolveImageInput(allocator, io, params);
         const started_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
         const stream_failure = params.provider.stream(allocator, io, .{
             .model = params.model,
@@ -592,7 +608,7 @@ pub fn run(
                 .items = request_items,
                 .tools = definitions,
                 .effort = params.effort,
-                .image_input = params.image_input,
+                .image_input = request_image_input,
             },
             .tick = ai.Provider.Tick.from(&signals),
         }, ai.Provider.EventSink.from(&sink));
@@ -900,6 +916,11 @@ pub fn run(
         for (turn.items.items) |*item| {
             if (item.* != .tool_call) continue;
             const call = &item.tool_call;
+            const tool_image_input = resolveImageInput(
+                params.session.allocator,
+                io,
+                params,
+            ) catch |err| return settleToolFailure(params, &turn, err);
             const tool_signal = signals.sample();
             var tool_result = (if (definitions.len == 0)
                 dispatch.refused(params.session.allocator, call)
@@ -907,7 +928,7 @@ pub fn run(
                 abort_skipped = true;
                 break :skipped dispatch.skipped(params.session.allocator, call);
             } else dispatch.run(params.session.allocator, io, call, .{
-                .image_input = params.image_input,
+                .image_input = tool_image_input,
                 .cancel = tool.Tool.Cancellation.from(&cancellation),
             })) catch |err| return settleToolFailure(params, &turn, err);
             var result_owned = true;
@@ -2801,4 +2822,552 @@ test "pre-request hook runs before first and next snapshots and between loop run
     second.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), notes.calls);
     try std.testing.expectEqual(@as(usize, 3), provider.round);
+}
+
+test "dynamic image input is resolved for each provider and tool operation" {
+    const Source = struct {
+        const Self = @This();
+        values: []const ai.Provider.ImageInput,
+        calls: usize = 0,
+        callback_active: bool = false,
+
+        pub fn resolve(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ImageInputSourceModule.CallbackError!ai.Provider.ImageInput {
+            self.callback_active = true;
+            defer self.callback_active = false;
+            const scratch = try allocator.alloc(u8, 1);
+            defer allocator.free(scratch);
+            const value = self.values[self.calls];
+            self.calls += 1;
+            return value;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+        source: *Source,
+        rounds: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            if (self.source.callback_active) return error.InvalidProviderResponse;
+            self.rounds += 1;
+            if (self.rounds == 1) {
+                if (request.context.image_input != .unknown) return error.InvalidProviderResponse;
+                try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "image" } });
+                try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+                try sink.emit(.{ .tool_call_end = "one" });
+                try sink.emit(.{ .tool_call_start = .{ .id = "two", .name = "image" } });
+                try sink.emit(.{ .tool_call_delta = .{ .id = "two", .arguments_delta = "{}" } });
+                try sink.emit(.{ .tool_call_end = "two" });
+            } else {
+                if (request.context.image_input != .supported) return error.InvalidProviderResponse;
+                var image_count: usize = 0;
+                for (request.context.items) |item| {
+                    if (item == .tool_result) image_count += item.tool_result.images.len;
+                }
+                if (image_count != 1) return error.InvalidProviderResponse;
+                try sink.emit(.{ .text_delta = "done" });
+            }
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const ImageTool = struct {
+        const Self = @This();
+        source: *Source,
+        accepted: usize = 0,
+        refused: usize = 0,
+
+        pub fn run(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ?[]const u8,
+            context: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            if (self.source.callback_active) return error.InvalidResult;
+            if (context.image_input != .supported) {
+                self.refused += 1;
+                return .{ .output = try allocator.dupe(u8, "refused") };
+            }
+            self.accepted += 1;
+            const output = try allocator.dupe(u8, "accepted");
+            errdefer allocator.free(output);
+            const images = try allocator.alloc(ai.Item.Image, 1);
+            errdefer allocator.free(images);
+            const mime = try allocator.dupe(u8, "image/png");
+            errdefer allocator.free(mime);
+            const data_base64 = try allocator.dupe(u8, "AAAA");
+            images[0] = .{ .mime = mime, .data_base64 = data_base64 };
+            return .{ .output = output, .images = images };
+        }
+    };
+
+    const values = [_]ai.Provider.ImageInput{ .unknown, .supported, .unsupported, .supported };
+    var source: Source = .{ .values = &values };
+    var provider: Provider = .{ .source = &source };
+    var image_tool: ImageTool = .{ .source = &source };
+    const definition: tool.Tool.Definition = .{
+        .name = "image",
+        .description = "returns an image when accepted",
+        .parameters = &.{},
+    };
+    var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&image_tool, definition, .{})};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .tools = &tools,
+        .image_input_source = ImageInputSourceModule.ImageInputSource.from(&source),
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.complete, result.outcome);
+    try std.testing.expectEqual(@as(usize, 4), source.calls);
+    try std.testing.expectEqual(@as(usize, 1), image_tool.accepted);
+    try std.testing.expectEqual(@as(usize, 1), image_tool.refused);
+}
+
+test "fixed image input remains the fallback without a source" {
+    const Provider = struct {
+        const Self = @This();
+        rounds: usize = 0,
+        fixed_each_request: bool = true,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.rounds += 1;
+            self.fixed_each_request = self.fixed_each_request and request.context.image_input == .unsupported;
+            if (self.rounds == 1) {
+                try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "echo" } });
+                try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+                try sink.emit(.{ .tool_call_end = "one" });
+            }
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const FixedTool = struct {
+        const Self = @This();
+        seen: ai.Provider.ImageInput = .unknown,
+
+        pub fn run(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ?[]const u8,
+            context: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            self.seen = context.image_input;
+            return .{ .output = try allocator.dupe(u8, "fixed") };
+        }
+    };
+    var provider: Provider = .{};
+    var fixed_tool: FixedTool = .{};
+    var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&fixed_tool, test_definition, .{})};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .tools = &tools,
+        .image_input = .unsupported,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(provider.fixed_each_request);
+    try std.testing.expectEqual(ai.Provider.ImageInput.unsupported, fixed_tool.seen);
+}
+
+test "image input source errors precede provider side effects" {
+    const Source = struct {
+        const Self = @This();
+        failure: ImageInputSourceModule.CallbackError,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ImageInputSourceModule.CallbackError!ai.Provider.ImageInput {
+            return self.failure;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+        called: bool = false,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ai.Provider.Request,
+            _: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.called = true;
+        }
+    };
+
+    for ([_]ImageInputSourceModule.CallbackError{ error.OutOfMemory, error.Failed }) |failure| {
+        var source: Source = .{ .failure = failure };
+        var provider: Provider = .{};
+        var session = try Session.init(std.testing.allocator, .{});
+        defer session.deinit();
+        const expected: Error = if (failure == error.OutOfMemory) error.OutOfMemory else error.HookFailed;
+        try std.testing.expectError(expected, run(std.testing.allocator, std.testing.io, .{
+            .session = &session,
+            .provider = ai.Provider.Provider.from(&provider, "fake"),
+            .model = "model",
+            .system_prompt = "system",
+            .image_input_source = ImageInputSourceModule.ImageInputSource.from(&source),
+        }));
+        try std.testing.expect(!provider.called);
+        try std.testing.expectEqual(@as(usize, 0), session.items().len);
+    }
+}
+
+test "image input source failure settles a tool placeholder before returning" {
+    const Source = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ImageInputSourceModule.CallbackError!ai.Provider.ImageInput {
+            self.calls += 1;
+            if (self.calls == 1) return .unknown;
+            return error.Failed;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "echo" } });
+            try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+            try sink.emit(.{ .tool_call_end = "one" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const SideEffectTool = struct {
+        const Self = @This();
+        calls: usize = 0,
+        pub fn run(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ?[]const u8,
+            _: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            self.calls += 1;
+            return .{ .output = try allocator.dupe(u8, "ran") };
+        }
+    };
+
+    var source: Source = .{};
+    var provider: Provider = .{};
+    var side_effect_tool: SideEffectTool = .{};
+    var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&side_effect_tool, test_definition, .{})};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try std.testing.expectError(error.HookFailed, run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .tools = &tools,
+        .image_input_source = ImageInputSourceModule.ImageInputSource.from(&source),
+    }));
+    try std.testing.expectEqual(@as(usize, 0), side_effect_tool.calls);
+    try std.testing.expectEqual(@as(usize, 3), session.items().len);
+    try std.testing.expect(session.items()[1] == .tool_result);
+    try std.testing.expectEqualStrings(
+        "error: tool execution did not complete",
+        session.items()[1].tool_result.output,
+    );
+}
+
+test "image input is resolved for refused and abort-skipped tool actions" {
+    const Mode = enum { refused, skipped };
+    const Source = struct {
+        const Self = @This();
+        values: []const ai.Provider.ImageInput,
+        calls: usize = 0,
+        action_value: ?ai.Provider.ImageInput = null,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ImageInputSourceModule.CallbackError!ai.Provider.ImageInput {
+            const value = self.values[self.calls];
+            self.calls += 1;
+            if (self.calls == 2) self.action_value = value;
+            return value;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+        mode: Mode,
+        rounds: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.rounds += 1;
+            if (self.rounds == 1) {
+                if (request.context.image_input != .supported) return error.InvalidProviderResponse;
+                try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "echo" } });
+                try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+                try sink.emit(.{ .tool_call_end = "one" });
+            } else if (self.mode != .refused or request.context.image_input != .unknown) {
+                return error.InvalidProviderResponse;
+            }
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const SideEffectTool = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn run(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ?[]const u8,
+            _: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            self.calls += 1;
+            return .{ .output = try allocator.dupe(u8, "ran") };
+        }
+    };
+    const Abort = struct {
+        const Self = @This();
+        samples: usize = 0,
+
+        pub fn sample(self: *Self) Signal {
+            self.samples += 1;
+            return if (self.samples == 1) .none else .abort;
+        }
+    };
+
+    for ([_]Mode{ .refused, .skipped }) |mode| {
+        const values = [_]ai.Provider.ImageInput{ .supported, .unsupported, .unknown };
+        var source: Source = .{ .values = &values };
+        var provider: Provider = .{ .mode = mode };
+        var side_effect_tool: SideEffectTool = .{};
+        var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&side_effect_tool, test_definition, .{})};
+        const selected_tools: []const tool.Tool.Tool = if (mode == .skipped) &tools else &.{};
+        var abort: Abort = .{};
+        var session = try Session.init(std.testing.allocator, .{});
+        defer session.deinit();
+        var loop_result = try run(std.testing.allocator, std.testing.io, .{
+            .session = &session,
+            .provider = ai.Provider.Provider.from(&provider, "fake"),
+            .model = "model",
+            .system_prompt = "system",
+            .tools = selected_tools,
+            .checkpoint = if (mode == .skipped) Checkpoint.from(&abort) else null,
+            .image_input_source = ImageInputSourceModule.ImageInputSource.from(&source),
+        });
+        defer loop_result.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(
+            if (mode == .refused) Outcome.complete else Outcome.interrupted,
+            loop_result.outcome,
+        );
+        try std.testing.expectEqual(if (mode == .refused) @as(usize, 3) else 2, source.calls);
+        try std.testing.expectEqual(ai.Provider.ImageInput.unsupported, source.action_value.?);
+        try std.testing.expectEqual(@as(usize, 0), side_effect_tool.calls);
+        try std.testing.expect(session.items()[1] == .tool_result);
+        try std.testing.expectEqual(
+            if (mode == .refused) ai.Item.ToolResultOrigin.refused else ai.Item.ToolResultOrigin.skipped,
+            session.items()[1].tool_result.origin,
+        );
+    }
+}
+
+test "image input failure settles refused and abort-skipped placeholders" {
+    const Mode = enum { refused, skipped };
+    const Source = struct {
+        const Self = @This();
+        failure: ImageInputSourceModule.CallbackError,
+        calls: usize = 0,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ImageInputSourceModule.CallbackError!ai.Provider.ImageInput {
+            self.calls += 1;
+            if (self.calls == 1) return .supported;
+            return self.failure;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            if (request.context.image_input != .supported) return error.InvalidProviderResponse;
+            try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "echo" } });
+            try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+            try sink.emit(.{ .tool_call_end = "one" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const SideEffectTool = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn run(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ?[]const u8,
+            _: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            self.calls += 1;
+            return .{ .output = try allocator.dupe(u8, "ran") };
+        }
+    };
+    const Abort = struct {
+        const Self = @This();
+        samples: usize = 0,
+
+        pub fn sample(self: *Self) Signal {
+            self.samples += 1;
+            return if (self.samples == 1) .none else .abort;
+        }
+    };
+    const Seam = struct {
+        const Self = @This();
+        calls: usize = 0,
+        kind: ?SeamKind = null,
+        next_action: bool = true,
+        item_count: usize = 0,
+
+        pub fn call(self: *Self, session: *const Session, kind: SeamKind, next_action: bool) HookError!void {
+            self.calls += 1;
+            self.kind = kind;
+            self.next_action = next_action;
+            self.item_count = session.items().len;
+        }
+    };
+
+    for ([_]Mode{ .refused, .skipped }) |mode| {
+        for ([_]ImageInputSourceModule.CallbackError{ error.OutOfMemory, error.Failed }) |failure| {
+            var source: Source = .{ .failure = failure };
+            var provider: Provider = .{};
+            var side_effect_tool: SideEffectTool = .{};
+            var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&side_effect_tool, test_definition, .{})};
+            const selected_tools: []const tool.Tool.Tool = if (mode == .skipped) &tools else &.{};
+            var abort: Abort = .{};
+            var seam: Seam = .{};
+            var session = try Session.init(std.testing.allocator, .{});
+            defer session.deinit();
+            const expected: Error = if (failure == error.OutOfMemory) error.OutOfMemory else error.HookFailed;
+            try std.testing.expectError(expected, run(std.testing.allocator, std.testing.io, .{
+                .session = &session,
+                .provider = ai.Provider.Provider.from(&provider, "fake"),
+                .model = "model",
+                .system_prompt = "system",
+                .tools = selected_tools,
+                .checkpoint = if (mode == .skipped) Checkpoint.from(&abort) else null,
+                .image_input_source = ImageInputSourceModule.ImageInputSource.from(&source),
+                .seam_hook = SeamHook.from(&seam),
+            }));
+
+            try std.testing.expectEqual(@as(usize, 2), source.calls);
+            try std.testing.expectEqual(@as(usize, 0), side_effect_tool.calls);
+            try std.testing.expectEqual(@as(usize, 1), seam.calls);
+            try std.testing.expectEqual(SeamKind.tool_batch, seam.kind.?);
+            try std.testing.expect(!seam.next_action);
+            try std.testing.expectEqual(@as(usize, 3), seam.item_count);
+            try std.testing.expectEqual(@as(usize, 3), session.items().len);
+            try std.testing.expect(session.items()[0] == .tool_call);
+            try std.testing.expect(session.items()[1] == .tool_result);
+            try std.testing.expectEqual(ai.Item.ToolResultOrigin.skipped, session.items()[1].tool_result.origin);
+            try std.testing.expectEqualStrings(
+                "error: tool execution did not complete",
+                session.items()[1].tool_result.output,
+            );
+            try std.testing.expect(session.items()[2] == .turn_usage);
+        }
+    }
+}
+
+test "image input source runs under the session lease" {
+    const Source = struct {
+        const Self = @This();
+        session: *Session,
+        mutation_busy: bool = false,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ImageInputSourceModule.CallbackError!ai.Provider.ImageInput {
+            self.session.addUser("forbidden") catch |err| {
+                self.mutation_busy = err == error.SessionBusy;
+                return .supported;
+            };
+            return error.Failed;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var source: Source = .{ .session = &session };
+    var provider: Provider = .{};
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .image_input_source = ImageInputSourceModule.ImageInputSource.from(&source),
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(source.mutation_busy);
 }

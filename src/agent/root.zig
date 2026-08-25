@@ -2,6 +2,7 @@ pub const Turn = @import("Turn.zig");
 pub const Session = @import("Session.zig");
 pub const AbortRepair = @import("AbortRepair.zig");
 pub const Loop = @import("Loop.zig");
+pub const ImageInputSource = @import("ImageInputSource.zig");
 pub const SystemPrompt = @import("SystemPrompt.zig");
 pub const Context = @import("Context.zig");
 pub const Compact = @import("Compact.zig");
@@ -17,6 +18,7 @@ test {
     _ = Session;
     _ = AbortRepair;
     _ = Loop;
+    _ = ImageInputSource;
     _ = SystemPrompt;
     _ = Context;
     _ = Compact;
