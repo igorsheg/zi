@@ -43,9 +43,46 @@ pub const Clock = struct {
     }
 };
 
+pub const maximum_selection_value_bytes: usize = 64 * 1024;
+pub const subagent_max_depth: u8 = 3;
+
+const fixed_environment_overrides = [_]struct { name: []const u8, value: []const u8 }{
+    .{ .name = "PAGER", .value = "cat" },
+    .{ .name = "GIT_PAGER", .value = "cat" },
+    .{ .name = "MANPAGER", .value = "cat" },
+    .{ .name = "SYSTEMD_PAGER", .value = "cat" },
+    .{ .name = "GH_PAGER", .value = "cat" },
+    .{ .name = "GIT_EDITOR", .value = "false" },
+    .{ .name = "GIT_SEQUENCE_EDITOR", .value = "false" },
+    .{ .name = "VISUAL", .value = "false" },
+    .{ .name = "EDITOR", .value = "false" },
+    .{ .name = "TERM", .value = "dumb" },
+    .{ .name = "COLORTERM", .value = "" },
+    .{ .name = "GIT_TERMINAL_PROMPT", .value = "0" },
+    // Documented identity for agent-aware child programs.
+    .{ .name = "AI_AGENT", .value = "zi" },
+    .{ .name = "PYTHONUNBUFFERED", .value = "1" },
+    .{ .name = "TQDM_DISABLE", .value = "1" },
+    .{ .name = "HAX_TRACE", .value = "" },
+    .{ .name = "HAX_TRANSCRIPT", .value = "" },
+    .{ .name = "ZI_TRACE", .value = "" },
+    .{ .name = "ZI_TRANSCRIPT", .value = "" },
+};
+
+/// Borrowed resolved selection for child Zi/hax processes. Provider is
+/// required once a selection is present. Null model or effort values become
+/// empty environment sentinels.
+pub const RunSelection = struct {
+    provider: []const u8,
+    model: ?[]const u8 = null,
+    effort: ?[]const u8 = null,
+};
+
 pub const Config = struct {
     environment: std.process.Environ = .empty,
     shell: ?[]const u8 = null,
+    run_selection: ?RunSelection = null,
+    parent_subagent_depth: u8 = 0,
     timeout_ms: u64 = 120 * 1000,
     maximum_timeout_ms: u64 = 30 * 60 * 1000,
     termination_grace_ms: u64 = 2 * 1000,
@@ -90,25 +127,30 @@ pub const Bash = struct {
             config.output.result_bytes == 0 or
             config.maximum_retained_spills == 0 or
             config.maximum_retained_spill_bytes < BashOutput.drain_limit or
-            config.background_yield_ms > @as(u64, std.math.maxInt(i64)))
+            config.background_yield_ms > @as(u64, std.math.maxInt(i64)) or
+            config.parent_subagent_depth >= subagent_max_depth or
+            !validRunSelection(config.run_selection))
         {
             return error.InvalidConfig;
         }
 
-        var map = config.environment.createMap(allocator) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidConfig,
-        };
-        defer map.deinit();
-        try injectEnvironment(&map);
-
-        const home = if (map.get("HOME")) |value| try allocator.dupe(u8, value) else null;
+        const home_value = std.process.Environ.getPosix(config.environment, "HOME");
+        const home = if (home_value) |value| try allocator.dupe(u8, value) else null;
         errdefer if (home) |value| allocator.free(value);
-        const shell = try resolveShell(allocator, io, config.shell, map.get("PATH"));
+        const shell = try resolveShell(
+            allocator,
+            io,
+            config.shell,
+            std.process.Environ.getPosix(config.environment, "PATH"),
+        );
         errdefer allocator.free(shell);
-        _ = map.orderedRemove("ZIG_PROGRESS");
-        const environment = try createEnvironment(allocator, &map);
-        errdefer environment.deinit(allocator);
+        const environment = try createEnvironment(
+            allocator,
+            config.environment,
+            config.run_selection,
+            config.parent_subagent_depth,
+        );
+        errdefer deinitEnvironment(allocator, environment);
 
         const temp_directory = try createPrivateTempDirectory(
             allocator,
@@ -145,7 +187,7 @@ pub const Bash = struct {
     pub fn deinit(self: *Bash) void {
         for (self.kept_outputs.items) |*output| output.deinit();
         self.kept_outputs.deinit(self.allocator);
-        self.environment.deinit(self.allocator);
+        deinitEnvironment(self.allocator, self.environment);
         self.allocator.free(self.shell);
         if (self.home) |home| self.allocator.free(home);
         self.spool_store.releaseOwner();
@@ -747,47 +789,148 @@ fn statusMarker(output: []const u8, options: BashOutput.FinishOptions, had_outpu
     return output[offset..];
 }
 
-fn createEnvironment(
-    allocator: std.mem.Allocator,
-    map: *const std.process.Environ.Map,
-) error{OutOfMemory}!std.process.Environ.PosixBlock {
-    const entries = try allocator.allocSentinel(?[*:0]u8, map.count(), null);
-    var initialized: usize = 0;
-    errdefer {
-        for (entries[0..initialized]) |entry| allocator.free(std.mem.span(entry.?));
-        allocator.free(entries);
-    }
-    for (map.keys(), map.values()) |key, value| {
-        entries[initialized] = (try std.fmt.allocPrintSentinel(allocator, "{s}={s}", .{ key, value }, 0)).ptr;
-        initialized += 1;
-    }
-    return .{ .slice = entries };
+fn validSelectionValue(value: []const u8, required: bool) bool {
+    if (required and value.len == 0) return false;
+    return value.len <= maximum_selection_value_bytes and
+        std.unicode.utf8ValidateSlice(value) and
+        std.mem.findScalar(u8, value, 0) == null;
 }
 
-fn injectEnvironment(map: *std.process.Environ.Map) error{OutOfMemory}!void {
-    const overrides = [_]struct { name: []const u8, value: []const u8 }{
-        .{ .name = "PAGER", .value = "cat" },
-        .{ .name = "GIT_PAGER", .value = "cat" },
-        .{ .name = "MANPAGER", .value = "cat" },
-        .{ .name = "SYSTEMD_PAGER", .value = "cat" },
-        .{ .name = "GH_PAGER", .value = "cat" },
-        .{ .name = "GIT_EDITOR", .value = "false" },
-        .{ .name = "GIT_SEQUENCE_EDITOR", .value = "false" },
-        .{ .name = "VISUAL", .value = "false" },
-        .{ .name = "EDITOR", .value = "false" },
-        .{ .name = "TERM", .value = "dumb" },
-        .{ .name = "COLORTERM", .value = "" },
-        .{ .name = "GIT_TERMINAL_PROMPT", .value = "0" },
-        // Documented identity for agent-aware child programs.
-        .{ .name = "AI_AGENT", .value = "zi" },
-        .{ .name = "PYTHONUNBUFFERED", .value = "1" },
-        .{ .name = "TQDM_DISABLE", .value = "1" },
-        .{ .name = "HAX_TRACE", .value = "" },
-        .{ .name = "HAX_TRANSCRIPT", .value = "" },
-        .{ .name = "ZI_TRACE", .value = "" },
-        .{ .name = "ZI_TRANSCRIPT", .value = "" },
-    };
-    for (overrides) |override| try map.put(override.name, override.value);
+fn validRunSelection(selection: ?RunSelection) bool {
+    const value = selection orelse return true;
+    if (!validSelectionValue(value.provider, true)) return false;
+    if (value.model) |model| if (!validSelectionValue(model, false)) return false;
+    if (value.effort) |effort| if (!validSelectionValue(effort, false)) return false;
+    return true;
+}
+
+fn entryHasName(entry: []const u8, name: []const u8) bool {
+    return entry.len > name.len and entry[name.len] == '=' and
+        std.mem.eql(u8, entry[0..name.len], name);
+}
+
+fn inheritedEntryOverridden(entry: []const u8, has_selection: bool) bool {
+    if (entryHasName(entry, "ZIG_PROGRESS") or
+        entryHasName(entry, "HAX_SUBAGENT_DEPTH")) return true;
+    for (fixed_environment_overrides) |override| {
+        if (entryHasName(entry, override.name)) return true;
+    }
+    if (has_selection) {
+        const selection_names = [_][]const u8{
+            "HAX_PROVIDER",
+            "HAX_MODEL",
+            "HAX_EFFORT",
+            "HAX_PRESET",
+        };
+        for (selection_names) |name| if (entryHasName(entry, name)) return true;
+    }
+    return false;
+}
+
+fn wipeAndFreeEntry(allocator: std.mem.Allocator, entry: [*:0]const u8) void {
+    const bytes = std.mem.span(entry);
+    @memset(@constCast(bytes), 0);
+    allocator.free(bytes);
+}
+
+fn deinitEnvironment(
+    allocator: std.mem.Allocator,
+    environment: std.process.Environ.PosixBlock,
+) void {
+    for (environment.slice) |entry| wipeAndFreeEntry(allocator, entry.?);
+    allocator.free(environment.slice);
+}
+
+fn appendEnvironmentEntry(
+    allocator: std.mem.Allocator,
+    entries: [:null]?[*:0]const u8,
+    initialized: *usize,
+    value: []const u8,
+) error{OutOfMemory}!void {
+    const owned = try allocator.dupeZ(u8, value);
+    entries[initialized.*] = owned.ptr;
+    initialized.* += 1;
+}
+
+fn appendEnvironmentAssignment(
+    allocator: std.mem.Allocator,
+    entries: [:null]?[*:0]const u8,
+    initialized: *usize,
+    name: []const u8,
+    value: []const u8,
+) error{OutOfMemory}!void {
+    const owned = try std.fmt.allocPrintSentinel(allocator, "{s}={s}", .{ name, value }, 0);
+    entries[initialized.*] = owned.ptr;
+    initialized.* += 1;
+}
+
+fn createEnvironment(
+    allocator: std.mem.Allocator,
+    inherited: std.process.Environ,
+    run_selection: ?RunSelection,
+    parent_subagent_depth: u8,
+) error{OutOfMemory}!std.process.Environ.PosixBlock {
+    const inherited_entries = inherited.block.view().slice;
+    var retained_count: usize = 0;
+    for (inherited_entries) |entry_pointer| {
+        const entry = std.mem.span(entry_pointer);
+        if (!inheritedEntryOverridden(entry, run_selection != null)) retained_count += 1;
+    }
+    const dynamic_count: usize = if (run_selection != null) 5 else 1;
+    const appended_count = std.math.add(
+        usize,
+        fixed_environment_overrides.len,
+        dynamic_count,
+    ) catch return error.OutOfMemory;
+    const entry_count = std.math.add(
+        usize,
+        retained_count,
+        appended_count,
+    ) catch return error.OutOfMemory;
+    const entries = try allocator.allocSentinel(?[*:0]const u8, entry_count, null);
+    var initialized: usize = 0;
+    errdefer {
+        for (entries[0..initialized]) |entry| wipeAndFreeEntry(allocator, entry.?);
+        allocator.free(entries);
+    }
+
+    for (inherited_entries) |entry_pointer| {
+        const entry = std.mem.span(entry_pointer);
+        if (!inheritedEntryOverridden(entry, run_selection != null)) {
+            try appendEnvironmentEntry(allocator, entries, &initialized, entry);
+        }
+    }
+    for (fixed_environment_overrides) |override| {
+        try appendEnvironmentAssignment(
+            allocator,
+            entries,
+            &initialized,
+            override.name,
+            override.value,
+        );
+    }
+    if (run_selection) |selection| {
+        try appendEnvironmentAssignment(allocator, entries, &initialized, "HAX_PROVIDER", selection.provider);
+        try appendEnvironmentAssignment(allocator, entries, &initialized, "HAX_MODEL", selection.model orelse "");
+        try appendEnvironmentAssignment(allocator, entries, &initialized, "HAX_EFFORT", selection.effort orelse "");
+        try appendEnvironmentAssignment(allocator, entries, &initialized, "HAX_PRESET", "");
+    }
+    var depth_buffer: [1]u8 = undefined;
+    const child_depth = std.fmt.bufPrint(
+        &depth_buffer,
+        "{d}",
+        .{parent_subagent_depth + 1},
+    ) catch unreachable;
+    try appendEnvironmentAssignment(
+        allocator,
+        entries,
+        &initialized,
+        "HAX_SUBAGENT_DEPTH",
+        child_depth,
+    );
+
+    std.debug.assert(initialized == entry_count);
+    return .{ .slice = entries };
 }
 
 fn ensureTempBase(io: std.Io, path: []const u8) bool {
@@ -1111,6 +1254,8 @@ fn exerciseBashAllocations(allocator: std.mem.Allocator) !void {
     var bash = try Bash.init(allocator, std.testing.io, .{
         .environment = std.testing.environ,
         .timeout_ms = 1000,
+        .run_selection = .{ .provider = "anthropic", .model = "claude", .effort = null },
+        .parent_subagent_depth = 2,
         .output = .{ .memory_cap = 1, .temp_directory = ".zig-cache/tmp" },
     });
     defer bash.deinit();
@@ -1199,14 +1344,123 @@ test "bash defaults pin hax timeout ceiling and termination grace" {
     try std.testing.expect(observed <= after);
 }
 
-test "bash child environment overrides inherited hax tracing" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    try environment.put("HAX_TRACE", "enabled");
-    try environment.put("HAX_TRANSCRIPT", "enabled");
-    try injectEnvironment(&environment);
-    try std.testing.expectEqualStrings("", environment.get("HAX_TRACE").?);
-    try std.testing.expectEqualStrings("", environment.get("HAX_TRANSCRIPT").?);
+fn testEnvironment(entries: []const []const u8) !std.process.Environ {
+    const pointers = try std.testing.allocator.allocSentinel(?[*:0]const u8, entries.len, null);
+    var initialized: usize = 0;
+    errdefer {
+        for (pointers[0..initialized]) |entry| wipeAndFreeEntry(std.testing.allocator, entry.?);
+        std.testing.allocator.free(pointers);
+    }
+    for (entries) |entry| {
+        const owned = try std.testing.allocator.dupeZ(u8, entry);
+        pointers[initialized] = owned.ptr;
+        initialized += 1;
+    }
+    return .{ .block = .{ .slice = pointers } };
+}
+
+fn expectEnvironmentEntries(
+    environment: std.process.Environ.PosixBlock,
+    expected: []const []const u8,
+) !void {
+    try std.testing.expectEqual(expected.len, environment.slice.len);
+    for (environment.slice, expected) |actual, value| {
+        try std.testing.expectEqualStrings(value, std.mem.span(actual.?));
+    }
+}
+
+test "bash child environment preserves raw order and duplicates then appends exact overrides" {
+    var inherited = try testEnvironment(&.{
+        "KEEP=first",
+        "HAX_PROVIDER=old-1",
+        "KEEP=second",
+        "PAGER=less",
+        "HAX_PROVIDER=old-2",
+        "ZIG_PROGRESS=1",
+        "AI_AGENT=other",
+        "HAX_SUBAGENT_DEPTH=2",
+        "HAX_TRACE=secret",
+        "HAX_TRANSCRIPT=secret",
+    });
+    defer inherited.block.deinit(std.testing.allocator);
+    const environment = try createEnvironment(std.testing.allocator, inherited, .{
+        .provider = "anthropic",
+        .model = "claude-sonnet",
+        .effort = null,
+    }, 2);
+    defer deinitEnvironment(std.testing.allocator, environment);
+    try expectEnvironmentEntries(environment, &.{
+        "KEEP=first",
+        "KEEP=second",
+        "PAGER=cat",
+        "GIT_PAGER=cat",
+        "MANPAGER=cat",
+        "SYSTEMD_PAGER=cat",
+        "GH_PAGER=cat",
+        "GIT_EDITOR=false",
+        "GIT_SEQUENCE_EDITOR=false",
+        "VISUAL=false",
+        "EDITOR=false",
+        "TERM=dumb",
+        "COLORTERM=",
+        "GIT_TERMINAL_PROMPT=0",
+        "AI_AGENT=zi",
+        "PYTHONUNBUFFERED=1",
+        "TQDM_DISABLE=1",
+        "HAX_TRACE=",
+        "HAX_TRANSCRIPT=",
+        "ZI_TRACE=",
+        "ZI_TRANSCRIPT=",
+        "HAX_PROVIDER=anthropic",
+        "HAX_MODEL=claude-sonnet",
+        "HAX_EFFORT=",
+        "HAX_PRESET=",
+        "HAX_SUBAGENT_DEPTH=3",
+    });
+}
+
+test "bash child environment retains selection variables when no selection is supplied" {
+    var inherited = try testEnvironment(&.{
+        "HAX_PROVIDER=inherited-1",
+        "HAX_PROVIDER=inherited-2",
+    });
+    defer inherited.block.deinit(std.testing.allocator);
+    const environment = try createEnvironment(std.testing.allocator, inherited, null, 0);
+    defer deinitEnvironment(std.testing.allocator, environment);
+    try std.testing.expectEqualStrings(
+        "HAX_PROVIDER=inherited-1",
+        std.mem.span(environment.slice[0].?),
+    );
+    try std.testing.expectEqualStrings(
+        "HAX_PROVIDER=inherited-2",
+        std.mem.span(environment.slice[1].?),
+    );
+    try std.testing.expectEqualStrings(
+        "HAX_SUBAGENT_DEPTH=1",
+        std.mem.span(environment.slice[environment.slice.len - 1].?),
+    );
+}
+
+test "bash rejects invalid child selection and parent depth" {
+    const invalid_utf8 = [_]u8{0xff};
+    const nul_model = [_]u8{ 'a', 0, 'b' };
+    const too_long = [_]u8{'x'} ** (maximum_selection_value_bytes + 1);
+    const cases = [_]Config{
+        .{ .environment = std.testing.environ, .parent_subagent_depth = subagent_max_depth },
+        .{ .environment = std.testing.environ, .run_selection = .{ .provider = "", .model = "m" } },
+        .{ .environment = std.testing.environ, .run_selection = .{ .provider = &invalid_utf8, .model = "m" } },
+        .{ .environment = std.testing.environ, .run_selection = .{ .provider = "p", .model = &nul_model } },
+        .{
+            .environment = std.testing.environ,
+            .run_selection = .{ .provider = "p", .model = "m", .effort = &too_long },
+        },
+    };
+    for (cases) |config| {
+        try std.testing.expectError(
+            error.InvalidConfig,
+            Bash.init(std.testing.allocator, std.testing.io, config),
+        );
+    }
 }
 
 test "bash no-tasks mode validates and refuses background before execution" {

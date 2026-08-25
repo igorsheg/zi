@@ -37,6 +37,8 @@ pub const Inputs = struct {
     edit_config: tool.Edit.Config = .{},
     write_config: tool.Write.Config = .{},
     bash_config: tool.Bash.Config = .{},
+    run_selection: ?tool.Bash.RunSelection = null,
+    parent_subagent_depth: u8 = 0,
     enable_tools: bool = true,
     enable_tasks: bool = true,
 };
@@ -298,6 +300,8 @@ pub fn init(inputs: Inputs) InitError!Owner {
     errdefer inputs.allocator.destroy(bash);
     var bash_config = inputs.bash_config;
     bash_config.environment = inputs.environ;
+    bash_config.run_selection = inputs.run_selection;
+    bash_config.parent_subagent_depth = inputs.parent_subagent_depth;
     bash_config.task_registry = registry;
     bash.* = try Bash.init(inputs.allocator, inputs.io, bash_config);
 
