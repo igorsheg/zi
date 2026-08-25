@@ -47,6 +47,7 @@ pub const Environment = struct {
         return .{
             .xdg_config_home = self.get("XDG_CONFIG_HOME"),
             .xdg_state_home = self.get("XDG_STATE_HOME"),
+            .xdg_cache_home = self.get("XDG_CACHE_HOME"),
             .home = self.get("HOME"),
         };
     }
@@ -54,6 +55,121 @@ pub const Environment = struct {
 
 fn validEnvironmentKey(name: []const u8) bool {
     return name.len != 0 and std.mem.findAny(u8, name, &.{ 0, '=' }) == null;
+}
+
+/// Owned process directories derived only from a stable PathInputs snapshot.
+/// Each non-null field is a separate allocation and must be released by deinit.
+pub const RuntimePaths = struct {
+    config_root: ?[]u8,
+    state_root: ?[]u8,
+    cache_root: ?[]u8,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        inputs: config.Loader.PathInputs,
+    ) config.Loader.PathError!RuntimePaths {
+        const config_root = try loaderRoot(allocator, inputs, .config);
+        errdefer if (config_root) |path| allocator.free(path);
+        const state_root = try loaderRoot(allocator, inputs, .state);
+        errdefer if (state_root) |path| allocator.free(path);
+        const cache_root = try cacheRoot(allocator, inputs);
+        return .{
+            .config_root = config_root,
+            .state_root = state_root,
+            .cache_root = cache_root,
+        };
+    }
+
+    pub fn deinit(self: *RuntimePaths, allocator: std.mem.Allocator) void {
+        if (self.config_root) |path| allocator.free(path);
+        if (self.state_root) |path| allocator.free(path);
+        if (self.cache_root) |path| allocator.free(path);
+        self.* = undefined;
+    }
+};
+
+fn loaderRoot(
+    allocator: std.mem.Allocator,
+    inputs: config.Loader.PathInputs,
+    tier: config.Loader.Tier,
+) config.Loader.PathError!?[]u8 {
+    const file_path = try config.Loader.buildPath(allocator, tier, inputs);
+    defer if (file_path) |path| allocator.free(path);
+    const path = file_path orelse return null;
+    const separator = std.mem.lastIndexOfScalar(u8, path, '/') orelse unreachable;
+    return allocator.dupe(u8, path[0..separator]) catch error.OutOfMemory;
+}
+
+fn cacheRoot(
+    allocator: std.mem.Allocator,
+    inputs: config.Loader.PathInputs,
+) config.Loader.PathError!?[]u8 {
+    var base = inputs.xdg_cache_home;
+    var middle: []const u8 = "";
+    if (base == null or base.?.len == 0) {
+        base = inputs.home;
+        middle = ".cache/";
+    }
+    const value = base orelse return null;
+    if (value.len == 0) return null;
+    if (value[0] != '/' or std.mem.indexOfScalar(u8, value, 0) != null or
+        !std.unicode.utf8ValidateSlice(value)) return error.InvalidPath;
+    const tail_len = 1 + middle.len + "zi".len;
+    if (value.len > config.Loader.maximum_path_bytes or
+        tail_len > config.Loader.maximum_path_bytes - value.len) return error.PathTooLong;
+    return std.fmt.allocPrint(allocator, "{s}/{s}zi", .{ value, middle }) catch error.OutOfMemory;
+}
+
+/// Reports whether an explicit file is a terminal through the supplied Io.
+/// Probe failures are treated as not-a-terminal, matching POSIX isatty usage.
+pub fn isTty(io: std.Io, file: std.Io.File) bool {
+    return file.isTty(io) catch false;
+}
+
+pub const ReadStdinError = error{ OutOfMemory, TooLarge, ReadFailed, Canceled };
+
+/// Allocator-owned bytes read from an explicit file. This type is move-only.
+pub const StdinResult = struct {
+    bytes: []u8,
+
+    pub fn deinit(self: *StdinResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+/// Reads stdin without consulting ambient I/O and consumes at most max + 1 bytes.
+pub fn readStdin(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    max: usize,
+) ReadStdinError!StdinResult {
+    return readFile(allocator, io, .stdin(), max);
+}
+
+/// Explicit-file form used when stdin is already adapted or injected by tests.
+pub fn readFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    max: usize,
+) ReadStdinError!StdinResult {
+    const capacity = std.math.add(usize, max, 1) catch return error.OutOfMemory;
+    const allocation = allocator.alloc(u8, capacity) catch return error.OutOfMemory;
+    errdefer allocator.free(allocation);
+
+    var reader_buffer: [1]u8 = undefined;
+    var file_reader = std.Io.File.Reader.initStreaming(file, io, &reader_buffer);
+    const count = file_reader.interface.readSliceShort(allocation) catch {
+        const cause = file_reader.err orelse return error.ReadFailed;
+        return switch (cause) {
+            error.Canceled => error.Canceled,
+            else => error.ReadFailed,
+        };
+    };
+    if (count > max) return error.TooLarge;
+    const bytes = allocator.realloc(allocation, count) catch return error.OutOfMemory;
+    return .{ .bytes = bytes };
 }
 
 pub const CwdError = error{ OutOfMemory, CwdTooLong, InvalidCwd, CurrentDirUnlinked, Canceled, Unexpected };
@@ -211,6 +327,140 @@ test "injected path inputs preserve bounds and allocator errors" {
         error.OutOfMemory,
         config.Loader.configPath(failing.allocator(), environment.pathInputs()),
     );
+}
+
+test "runtime paths use injected XDG roots" {
+    const config_entry = "XDG_CONFIG_HOME=/cfg";
+    const state_entry = "XDG_STATE_HOME=/state";
+    const cache_entry = "XDG_CACHE_HOME=/cache";
+    const entries = [_][*:0]const u8{ config_entry, state_entry, cache_entry, "HOME=/ignored" };
+    var environment = Environment.init(testEnviron(&entries));
+    var paths = try RuntimePaths.init(std.testing.allocator, environment.pathInputs());
+    defer paths.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/cfg/zi", paths.config_root.?);
+    try std.testing.expectEqualStrings("/state/zi", paths.state_root.?);
+    try std.testing.expectEqualStrings("/cache/zi", paths.cache_root.?);
+}
+
+test "runtime paths apply empty XDG fallback and unavailable HOME" {
+    const fallback_entries = [_][*:0]const u8{
+        "XDG_CONFIG_HOME=",
+        "XDG_STATE_HOME=",
+        "XDG_CACHE_HOME=",
+        "HOME=/home/me",
+    };
+    var fallback_environment = Environment.init(testEnviron(&fallback_entries));
+    var fallback = try RuntimePaths.init(std.testing.allocator, fallback_environment.pathInputs());
+    defer fallback.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/home/me/.config/zi", fallback.config_root.?);
+    try std.testing.expectEqualStrings("/home/me/.local/state/zi", fallback.state_root.?);
+    try std.testing.expectEqualStrings("/home/me/.cache/zi", fallback.cache_root.?);
+
+    const no_home_entries = [_][*:0]const u8{
+        "XDG_CONFIG_HOME=",
+        "XDG_STATE_HOME=",
+        "XDG_CACHE_HOME=",
+    };
+    var no_home_environment = Environment.init(testEnviron(&no_home_entries));
+    var unavailable = try RuntimePaths.init(std.testing.allocator, no_home_environment.pathInputs());
+    defer unavailable.deinit(std.testing.allocator);
+    try std.testing.expect(unavailable.config_root == null);
+    try std.testing.expect(unavailable.state_root == null);
+    try std.testing.expect(unavailable.cache_root == null);
+}
+
+fn exerciseRuntimePathAllocations(allocator: std.mem.Allocator) !void {
+    var paths = try RuntimePaths.init(allocator, .{
+        .xdg_config_home = "/config",
+        .xdg_state_home = "/state",
+        .xdg_cache_home = "/cache",
+        .home = "/home",
+    });
+    defer paths.deinit(allocator);
+}
+
+test "runtime paths validate cache inputs bounds and allocation failures" {
+    try std.testing.expectError(
+        error.InvalidPath,
+        RuntimePaths.init(std.testing.allocator, .{ .xdg_cache_home = "relative" }),
+    );
+    try std.testing.expectError(
+        error.InvalidPath,
+        RuntimePaths.init(std.testing.allocator, .{ .xdg_cache_home = "/bad\x00path" }),
+    );
+    try std.testing.expectError(
+        error.InvalidPath,
+        RuntimePaths.init(std.testing.allocator, .{ .xdg_cache_home = "/\xff" }),
+    );
+    const long = "/" ++ "x" ** config.Loader.maximum_path_bytes;
+    try std.testing.expectError(
+        error.PathTooLong,
+        RuntimePaths.init(std.testing.allocator, .{ .xdg_cache_home = long }),
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseRuntimePathAllocations,
+        .{},
+    );
+}
+
+fn writeOnlyFile(directory: std.Io.Dir, name: []const u8) !std.Io.File {
+    try directory.writeFile(std.testing.io, .{ .sub_path = name, .data = "unreadable" });
+    return directory.openFile(std.testing.io, name, .{ .mode = .write_only });
+}
+
+test "explicit file stdin read is bounded owned and reports failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input", .data = "prompt" });
+
+    const input = try tmp.dir.openFile(std.testing.io, "input", .{});
+    defer input.close(std.testing.io);
+    var result = try readFile(std.testing.allocator, std.testing.io, input, 6);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("prompt", result.bytes);
+    try std.testing.expect(!isTty(std.testing.io, input));
+
+    const oversized = try tmp.dir.openFile(std.testing.io, "input", .{});
+    defer oversized.close(std.testing.io);
+    try std.testing.expectError(
+        error.TooLarge,
+        readFile(std.testing.allocator, std.testing.io, oversized, 5),
+    );
+
+    const unreadable = try writeOnlyFile(tmp.dir, "write-only");
+    defer unreadable.close(std.testing.io);
+    try std.testing.expectError(
+        error.ReadFailed,
+        readFile(std.testing.allocator, std.testing.io, unreadable, 20),
+    );
+
+    const oom_input = try tmp.dir.openFile(std.testing.io, "input", .{});
+    defer oom_input.close(std.testing.io);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        readFile(failing.allocator(), std.testing.io, oom_input, 6),
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        readFile(std.testing.allocator, std.testing.io, oom_input, std.math.maxInt(usize)),
+    );
+}
+
+test "explicit file stdin read preserves cancellation" {
+    var descriptors: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&descriptors));
+    const read_end: std.Io.File = .{ .handle = descriptors[0], .flags = .{ .nonblocking = false } };
+    defer read_end.close(std.testing.io);
+    const write_end: std.Io.File = .{ .handle = descriptors[1], .flags = .{ .nonblocking = false } };
+    defer write_end.close(std.testing.io);
+
+    var future = std.testing.io.async(
+        readFile,
+        .{ std.testing.allocator, std.testing.io, read_end, 16 },
+    );
+    try std.testing.expectError(error.Canceled, future.cancel(std.testing.io));
 }
 
 test "millisecond conversion saturates both directions" {

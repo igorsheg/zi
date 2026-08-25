@@ -12,6 +12,7 @@ pub const PathError = error{ OutOfMemory, InvalidPath, PathTooLong };
 pub const PathInputs = struct {
     xdg_config_home: ?[]const u8 = null,
     xdg_state_home: ?[]const u8 = null,
+    xdg_cache_home: ?[]const u8 = null,
     home: ?[]const u8 = null,
 };
 
