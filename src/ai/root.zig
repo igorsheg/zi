@@ -26,6 +26,7 @@ pub const CodexAcquirePurpose = @import("Codex.zig").AcquirePurpose;
 pub const CodexAcquireDecision = @import("Codex.zig").AcquireDecision;
 pub const CodexUnauthorizedDecision = @import("Codex.zig").UnauthorizedDecision;
 pub const CodexCredentials = @import("CodexCredentials.zig");
+pub const CodexSettings = @import("CodexSettings.zig");
 pub const CodexRefresh = @import("CodexRefresh.zig");
 pub const CodexModels = @import("CodexModels.zig");
 pub const CodexOperations = @import("CodexOperations.zig");
@@ -79,6 +80,7 @@ test {
     _ = CodexAcquireDecision;
     _ = CodexUnauthorizedDecision;
     _ = CodexCredentials;
+    _ = CodexSettings;
     _ = CodexRefresh;
     _ = CodexModels;
     _ = CodexOperations;
