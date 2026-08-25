@@ -3,6 +3,7 @@ pub const Session = @import("Session.zig");
 pub const AbortRepair = @import("AbortRepair.zig");
 pub const Loop = @import("Loop.zig");
 pub const ImageInputSource = @import("ImageInputSource.zig");
+pub const ModelMetadataSource = @import("ModelMetadataSource.zig");
 pub const SystemPrompt = @import("SystemPrompt.zig");
 pub const Context = @import("Context.zig");
 pub const Compact = @import("Compact.zig");
@@ -19,6 +20,7 @@ test {
     _ = AbortRepair;
     _ = Loop;
     _ = ImageInputSource;
+    _ = ModelMetadataSource;
     _ = SystemPrompt;
     _ = Context;
     _ = Compact;

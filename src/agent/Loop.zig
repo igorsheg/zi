@@ -5,6 +5,7 @@ const TurnModule = @import("Turn.zig");
 const SessionModule = @import("Session.zig");
 const AbortRepair = @import("AbortRepair.zig");
 const ImageInputSourceModule = @import("ImageInputSource.zig");
+const ModelMetadataSourceModule = @import("ModelMetadataSource.zig");
 
 const Item = ai.Item.Item;
 const Turn = TurnModule.Turn;
@@ -244,7 +245,9 @@ pub const Params = struct {
     session: *Session,
     provider: ai.Provider.Provider,
     model: []const u8,
+    /// Fixed compatibility value used when `model_metadata_source` is absent.
     model_metadata: ai.ModelMeta.Metadata = .{},
+    model_metadata_source: ?ModelMetadataSourceModule.ModelMetadataSource = null,
     system_prompt: []const u8,
     tools: []const tool.Tool.Tool = &.{},
     effort: ?[]const u8 = null,
@@ -446,6 +449,15 @@ fn resolveImageInput(
     };
 }
 
+fn resolveModelMetadata(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    params: Params,
+) ai.ModelMeta.Metadata {
+    const source = params.model_metadata_source orelse return params.model_metadata;
+    return source.resolve(allocator, io) catch params.model_metadata;
+}
+
 fn mapHookError(err: HookError) Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -506,6 +518,7 @@ fn repairTurn(
 
 fn appendUsage(
     params: Params,
+    model_metadata: *const ai.ModelMeta.Metadata,
     input: SessionModule.UsageInput,
     prepend_boundary: bool,
     retry_usages: []const ai.Usage.StreamUsage,
@@ -516,7 +529,7 @@ fn appendUsage(
         retry_usages,
         terminal_usage,
         input.elapsed_ms,
-        &params.model_metadata,
+        model_metadata,
     );
     var attributed = input;
     attributed.stream = priced.footer.stream;
@@ -632,6 +645,10 @@ pub fn run(
         const finished_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
         const elapsed_ms: u64 = @intCast(@max(0, finished_ns - started_ns) / std.time.ns_per_ms);
         if (sink.assembly_error) |assembly_error| return assembly_error;
+        if (stream_failure) |_| {} else |stream_error| {
+            if (stream_error == error.OutOfMemory) return error.OutOfMemory;
+        }
+        const model_metadata = resolveModelMetadata(allocator, io, params);
         if (turn.last_context_tokens) |tokens| result.last_context_tokens = tokens;
 
         if (turn.state == .failed) {
@@ -655,6 +672,7 @@ pub fn run(
             result.final_items_to = repaired.items_to;
             appendUsage(
                 params,
+                &model_metadata,
                 .{
                     .stream = total_usage,
                     .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
@@ -697,6 +715,7 @@ pub fn run(
                 result.final_items_to = repaired.items_to;
                 appendUsage(
                     params,
+                    &model_metadata,
                     .{
                         .stream = total_usage,
                         .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
@@ -727,6 +746,7 @@ pub fn run(
                     const initial_count = params.session.items().len;
                     appendUsage(
                         params,
+                        &model_metadata,
                         .{
                             .stream = total_usage,
                             .elapsed_ms = if (usage_reported) elapsed_ms else null,
@@ -771,6 +791,7 @@ pub fn run(
                 result.final_items_to = repaired.items_to;
                 appendUsage(
                     params,
+                    &model_metadata,
                     .{
                         .stream = total_usage,
                         .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
@@ -813,6 +834,7 @@ pub fn run(
             result.final_items_to = repaired.items_to;
             appendUsage(
                 params,
+                &model_metadata,
                 .{
                     .stream = total_usage,
                     .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
@@ -853,6 +875,7 @@ pub fn run(
             result.final_items_to = repaired.items_to;
             appendUsage(
                 params,
+                &model_metadata,
                 .{
                     .stream = total_usage,
                     .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
@@ -907,7 +930,7 @@ pub fn run(
         const retry_usages = turn.retry_usages;
         const retry_count = turn.retry_usage_count;
         const terminal_context_tokens = turn.last_context_tokens;
-        appendUsage(params, .{
+        appendUsage(params, &model_metadata, .{
             .stream = total_usage,
             .elapsed_ms = elapsed_ms,
             .response = captured.response,
@@ -1178,6 +1201,19 @@ test "loop commits a tool batch before requesting the final response" {
 }
 
 test "loop provider failure copies diagnostics and keeps reported usage" {
+    const Source = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ModelMetadataSourceModule.CallbackError!ai.ModelMeta.Metadata {
+            self.calls += 1;
+            return error.Failed;
+        }
+    };
     const Fake = struct {
         const Self = @This();
         pub fn stream(
@@ -1197,6 +1233,7 @@ test "loop provider failure copies diagnostics and keeps reported usage" {
             message = @splat('x');
         }
     };
+    var source: Source = .{};
     var fake: Fake = .{};
     var session = try Session.init(std.testing.allocator, .{});
     defer session.deinit();
@@ -1204,10 +1241,13 @@ test "loop provider failure copies diagnostics and keeps reported usage" {
         .session = &session,
         .provider = ai.Provider.Provider.from(&fake, "fake"),
         .model = "model",
+        .model_metadata = .{ .rates = .{ .input = 1, .output = 1 } },
+        .model_metadata_source = ModelMetadataSourceModule.ModelMetadataSource.from(&source),
         .system_prompt = "system",
     });
     defer loop_result.deinit(std.testing.allocator);
     try std.testing.expectEqual(Outcome.provider_error, loop_result.outcome);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
     try std.testing.expectEqualStrings("boom", loop_result.diagnostic.?);
     try std.testing.expectEqual(@as(?u64, 8), loop_result.last_context_tokens);
     try std.testing.expect(session.items().len >= 2);
@@ -1216,12 +1256,25 @@ test "loop provider failure copies diagnostics and keeps reported usage" {
         "response",
         session.items()[session.items().len - 1].turn_usage.value.provenance.response_id.?,
     );
-    const source = session.items()[session.items().len - 1].turn_usage.source.?;
-    try std.testing.expectEqualStrings("fake", source.provider.?);
-    try std.testing.expectEqualStrings("model", source.model.?);
+    const usage_source = session.items()[session.items().len - 1].turn_usage.source.?;
+    try std.testing.expectEqualStrings("fake", usage_source.provider.?);
+    try std.testing.expectEqualStrings("model", usage_source.model.?);
 }
 
-test "loop recovers the typed assembly error hidden behind sink cancellation" {
+test "loop recovers the typed assembly error before metadata refresh" {
+    const Source = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ModelMetadataSourceModule.CallbackError!ai.ModelMeta.Metadata {
+            self.calls += 1;
+            return error.OutOfMemory;
+        }
+    };
     const Fake = struct {
         const Self = @This();
         pub fn stream(
@@ -1235,6 +1288,7 @@ test "loop recovers the typed assembly error hidden behind sink cancellation" {
             try sink.emit(.{ .tool_call_start = .{ .id = "id", .name = too_long } });
         }
     };
+    var source: Source = .{};
     var fake: Fake = .{};
     var session = try Session.init(std.testing.allocator, .{});
     defer session.deinit();
@@ -1245,9 +1299,53 @@ test "loop recovers the typed assembly error hidden behind sink cancellation" {
             .session = &session,
             .provider = ai.Provider.Provider.from(&fake, "fake"),
             .model = "model",
+            .model_metadata_source = ModelMetadataSourceModule.ModelMetadataSource.from(&source),
             .system_prompt = "system",
         },
     ));
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    try std.testing.expectEqual(@as(usize, 0), session.items().len);
+}
+
+test "provider stream OOM precedes metadata refresh" {
+    const Source = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ModelMetadataSourceModule.CallbackError!ai.ModelMeta.Metadata {
+            self.calls += 1;
+            return .{};
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            _: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            return error.OutOfMemory;
+        }
+    };
+    var source: Source = .{};
+    var provider: Provider = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try std.testing.expectError(error.OutOfMemory, run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .model_metadata_source = ModelMetadataSourceModule.ModelMetadataSource.from(&source),
+        .system_prompt = "system",
+    }));
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
     try std.testing.expectEqual(@as(usize, 0), session.items().len);
 }
 
@@ -2899,6 +2997,104 @@ test "resolved metadata prices retry and terminal usage before admission" {
     try std.testing.expectEqual(@as(usize, 2), recorder.attempt_count);
     try std.testing.expectEqual(@as(?u64, 7), recorder.attempt_inputs[0]);
     try std.testing.expectEqual(@as(?u64, 3), recorder.attempt_inputs[1]);
+}
+
+test "live metadata is sampled after the stream and overrides stale fixed pricing" {
+    const Source = struct {
+        const Self = @This();
+        metadata: ai.ModelMeta.Metadata = .{ .rates = .{ .input = 1, .output = 1 } },
+        calls: usize = 0,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ModelMetadataSourceModule.CallbackError!ai.ModelMeta.Metadata {
+            self.calls += 1;
+            return self.metadata;
+        }
+    };
+    const Fake = struct {
+        const Self = @This();
+        source: *Source,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.source.metadata.rates.input = 3;
+            try sink.emit(.{ .text_delta = "done" });
+            try sink.emit(.{ .done = .{ .usage = .{ .input_tokens = 1_000_000 } } });
+        }
+    };
+    var source: Source = .{};
+    var fake: Fake = .{ .source = &source };
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "provider"),
+        .model = "model",
+        .model_metadata = .{ .rates = .{ .input = 1, .output = 1 } },
+        .model_metadata_source = ModelMetadataSourceModule.ModelMetadataSource.from(&source),
+        .system_prompt = "system",
+    });
+    defer loop_result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    const usage = session.items()[session.items().len - 1].turn_usage.value;
+    try std.testing.expectEqual(@as(?f64, 3), usage.cost_total_usd);
+}
+
+test "metadata source OOM falls back and persists completed usage" {
+    const Source = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ModelMetadataSourceModule.CallbackError!ai.ModelMeta.Metadata {
+            self.calls += 1;
+            return error.OutOfMemory;
+        }
+    };
+    const Fake = struct {
+        const Self = @This();
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .text_delta = "done" });
+            try sink.emit(.{ .done = .{ .usage = .{ .input_tokens = 1_000_000 } } });
+        }
+    };
+    var source: Source = .{};
+    var fake: Fake = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "provider"),
+        .model = "model",
+        .model_metadata = .{ .rates = .{ .input = 2, .output = 1 } },
+        .model_metadata_source = ModelMetadataSourceModule.ModelMetadataSource.from(&source),
+        .system_prompt = "system",
+    });
+    defer loop_result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqual(Outcome.complete, loop_result.outcome);
+    const usage = session.items()[session.items().len - 1].turn_usage.value;
+    try std.testing.expectEqual(@as(?f64, 2), usage.cost_total_usd);
 }
 
 test "ordinary observation retains exact spend when retry is unpriced" {

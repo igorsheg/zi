@@ -8,6 +8,7 @@ const Compact = @import("Compact.zig");
 const Loop = @import("Loop.zig");
 const SessionModule = @import("Session.zig");
 const TurnModule = @import("Turn.zig");
+const ModelMetadataSourceModule = @import("ModelMetadataSource.zig");
 
 const Item = ai.Item.Item;
 const Session = SessionModule.Session;
@@ -52,7 +53,9 @@ pub const Params = struct {
     session: *Session,
     provider: ai.Provider.Provider,
     model: []const u8,
+    /// Fixed compatibility value used when `model_metadata_source` is absent.
     model_metadata: ai.ModelMeta.Metadata = .{},
+    model_metadata_source: ?ModelMetadataSourceModule.ModelMetadataSource = null,
     system_prompt: []const u8,
     tools: []const tool.Tool.Tool = &.{},
     effort: ?[]const u8 = null,
@@ -218,6 +221,15 @@ const CancelState = struct {
     }
 };
 
+fn resolveModelMetadata(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    params: Params,
+) ai.ModelMeta.Metadata {
+    const source = params.model_metadata_source orelse return params.model_metadata;
+    return source.resolve(allocator, io) catch params.model_metadata;
+}
+
 fn mapHookError(err: Loop.HookError) RunError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -244,6 +256,7 @@ fn mapUsageObserverError(err: Loop.UsageObserverError) RunError {
 
 fn usageInput(
     params: Params,
+    model_metadata: *const ai.ModelMeta.Metadata,
     turn: *const Turn,
     elapsed_ms: u64,
     response: ai.StreamEvent.ResponseIdentity,
@@ -252,7 +265,7 @@ fn usageInput(
         turn.retryUsages(),
         turn.usage,
         elapsed_ms,
-        &params.model_metadata,
+        model_metadata,
     );
     var result: UsageInputResolution = .{
         .input = .{
@@ -375,18 +388,28 @@ fn appendRejectedResponse(
 
 /// Runs a standalone transaction against an idle session.
 pub fn run(allocator: std.mem.Allocator, io: std.Io, params: Params) RunError!Result {
-    return runWithLease(allocator, io, params, .standalone);
+    return runOwned(allocator, io, params, .standalone);
 }
 
 /// Runs from inside `Loop.ContinuationHook` and restores the hook phase.
 pub fn runContinuation(allocator: std.mem.Allocator, io: std.Io, params: Params) RunError!Result {
-    return runWithLease(allocator, io, params, .continuation);
+    return runOwned(allocator, io, params, .continuation);
 }
 
 const Lease = enum { standalone, continuation };
 
+fn runOwned(allocator: std.mem.Allocator, io: std.Io, params: Params, lease: Lease) RunError!Result {
+    if (params.max_attempts == 0 or params.max_attempts > Compact.max_logical_attempts) {
+        return error.InvalidMaxAttempts;
+    }
+    const owned_effort = if (params.effort) |effort| try allocator.dupe(u8, effort) else null;
+    defer if (owned_effort) |effort| allocator.free(effort);
+    var stable_params = params;
+    stable_params.effort = owned_effort;
+    return runWithLease(allocator, io, stable_params, lease);
+}
+
 fn runWithLease(allocator: std.mem.Allocator, io: std.Io, params: Params, lease: Lease) RunError!Result {
-    if (params.max_attempts == 0 or params.max_attempts > Compact.max_logical_attempts) return error.InvalidMaxAttempts;
     switch (lease) {
         .standalone => try params.session.beginStandaloneCompaction(),
         .continuation => try params.session.beginContinuationCompaction(),
@@ -440,7 +463,8 @@ fn runWithLease(allocator: std.mem.Allocator, io: std.Io, params: Params, lease:
         }, ai.Provider.EventSink.from(&sink));
         const finished_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
         const elapsed_ms: u64 = @intCast(@max(0, finished_ns - started_ns) / std.time.ns_per_ms);
-        const resolution = usageInput(params, &turn, elapsed_ms, captured.response);
+        const model_metadata = resolveModelMetadata(allocator, io, params);
+        const resolution = usageInput(params, &model_metadata, &turn, elapsed_ms, captured.response);
         const cancelled = cancel_state.sample();
         var prepared = try prepareUsage(params, resolution.input);
         defer prepared.deinit(params.session.allocator);
@@ -685,7 +709,20 @@ test "four rejected attempts exhaust the fixed maximum" {
     ));
 }
 
-test "provider failure and cancellation are distinct and retain usage" {
+test "metadata failure preserves provider outcomes and terminal usage" {
+    const Source = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ModelMetadataSourceModule.CallbackError!ai.ModelMeta.Metadata {
+            self.calls += 1;
+            return error.Failed;
+        }
+    };
     inline for (.{
         .{ ScriptedProvider.Step.failure, Outcome.provider_failure },
         .{ ScriptedProvider.Step.transport_failure, Outcome.provider_failure },
@@ -693,15 +730,18 @@ test "provider failure and cancellation are distinct and retain usage" {
     }) |case| {
         var session = try Session.init(std.testing.allocator, .{});
         defer session.deinit();
+        var source: Source = .{};
         var scripted: ScriptedProvider = .{ .steps = &.{case[0]} };
         var result = try run(std.testing.allocator, std.testing.io, .{
             .session = &session,
             .provider = ai.Provider.Provider.from(&scripted, "provider"),
             .model = "model",
+            .model_metadata_source = ModelMetadataSourceModule.ModelMetadataSource.from(&source),
             .system_prompt = "system",
         });
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(case[1], result.outcome);
+        try std.testing.expectEqual(@as(usize, 1), source.calls);
         try std.testing.expectEqual(@as(usize, 1), session.items().len);
         try std.testing.expect(session.items()[0] == .turn_usage);
     }
@@ -844,6 +884,141 @@ test "Loop continuation compacts before the next provider stream" {
     try std.testing.expectEqual(@as(usize, 2), main_provider.rounds);
     try std.testing.expect(main_provider.saw_seed);
     try std.testing.expectEqualSlices(bool, &.{ true, true }, seam.actions[0..seam.count]);
+}
+
+fn exerciseEffortOwnership(lease: Lease) !void {
+    const EffortProvider = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            const effort = request.context.effort orelse return error.InvalidRequest;
+            if (!std.mem.eql(u8, effort, "original-effort")) return error.InvalidRequest;
+            self.calls += 1;
+            if (self.calls == 1) {
+                try sink.emit(.{ .tool_call_start = .{ .id = "call", .name = "read" } });
+                try sink.emit(.{ .tool_call_end = "call" });
+                try sink.emit(.{ .done = .{} });
+                return;
+            }
+            try sink.emit(.{ .text_delta = "summary" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const ReplacingSource = struct {
+        const Self = @This();
+        effort: *[]u8,
+        calls: usize = 0,
+
+        pub fn resolve(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ModelMetadataSourceModule.CallbackError!ai.ModelMeta.Metadata {
+            self.calls += 1;
+            if (self.calls == 1) {
+                allocator.free(self.effort.*);
+                self.effort.* = try allocator.dupe(u8, "replaced-effort");
+            }
+            return .{};
+        }
+    };
+
+    var effort = try std.testing.allocator.dupe(u8, "original-effort");
+    defer std.testing.allocator.free(effort);
+    var source: ReplacingSource = .{ .effort = &effort };
+    var provider: EffortProvider = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    if (lease == .continuation) {
+        try session.beginRun();
+        session.beginHookMutation();
+    }
+    defer if (lease == .continuation) {
+        session.endHookMutation();
+        session.endRun();
+    };
+    const params: Params = .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .model_metadata_source = ModelMetadataSourceModule.ModelMetadataSource.from(&source),
+        .system_prompt = "system",
+        .effort = effort,
+    };
+    var result = switch (lease) {
+        .standalone => try run(std.testing.allocator, std.testing.io, params),
+        .continuation => try runContinuation(std.testing.allocator, std.testing.io, params),
+    };
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Outcome.compacted, result.outcome);
+    try std.testing.expectEqual(@as(usize, 2), result.attempts);
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    try std.testing.expectEqualStrings("replaced-effort", effort);
+}
+
+test "compaction owns effort across metadata callbacks and logical attempts" {
+    inline for (.{ Lease.standalone, Lease.continuation }) |lease| try exerciseEffortOwnership(lease);
+}
+
+fn exerciseEffortAllocationFailure(lease: Lease) !void {
+    const Source = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ModelMetadataSourceModule.CallbackError!ai.ModelMeta.Metadata {
+            self.calls += 1;
+            return .{};
+        }
+    };
+
+    var provider: ScriptedProvider = .{ .steps = &.{.success} };
+    var source: Source = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    if (lease == .continuation) {
+        try session.beginRun();
+        session.beginHookMutation();
+    }
+    defer if (lease == .continuation) {
+        session.endHookMutation();
+        session.endRun();
+    };
+    var buffer: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(buffer[0..]);
+    const params: Params = .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .model_metadata_source = ModelMetadataSourceModule.ModelMetadataSource.from(&source),
+        .system_prompt = "system",
+        .effort = "original-effort",
+    };
+
+    const result = switch (lease) {
+        .standalone => run(fixed.allocator(), std.testing.io, params),
+        .continuation => runContinuation(fixed.allocator(), std.testing.io, params),
+    };
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expectEqual(@as(usize, 0), provider.calls);
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    try std.testing.expectEqual(@as(usize, 0), session.items().len);
+}
+
+test "compaction effort allocation failure has no provider or session effect" {
+    inline for (.{ Lease.standalone, Lease.continuation }) |lease| try exerciseEffortAllocationFailure(lease);
 }
 
 test "provider phase rejects nested standalone and continuation compaction" {
@@ -1257,6 +1432,97 @@ test "every compaction attempt is priced and observed in the total" {
 
     try std.testing.expectEqual(@as(usize, 2), costs.calls);
     try std.testing.expectApproxEqAbs(0.000005, costs.total, 1e-15);
+}
+
+test "compaction samples live metadata once per completed stream" {
+    const Source = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ModelMetadataSourceModule.CallbackError!ai.ModelMeta.Metadata {
+            self.calls += 1;
+            return .{ .rates = .{
+                .input = @floatFromInt(self.calls),
+                .output = 1,
+            } };
+        }
+    };
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try session.addUser("work");
+    var provider: ScriptedProvider = .{ .steps = &.{ .tool, .success } };
+    var source: Source = .{};
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .model_metadata = .{ .rates = .{ .input = 99, .output = 99 } },
+        .model_metadata_source = ModelMetadataSourceModule.ModelMetadataSource.from(&source),
+        .system_prompt = "system",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    var costs: [2]f64 = undefined;
+    var count: usize = 0;
+    for (session.items()) |item| if (item == .turn_usage) {
+        costs[count] = item.turn_usage.value.cost_total_usd.?;
+        count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectApproxEqAbs(0.000002, costs[0], 1e-15);
+    try std.testing.expectApproxEqAbs(0.000005, costs[1], 1e-15);
+}
+
+test "compaction metadata failure falls back and persists every completed attempt" {
+    const Source = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ModelMetadataSourceModule.CallbackError!ai.ModelMeta.Metadata {
+            self.calls += 1;
+            if (self.calls == 2) return error.Failed;
+            return .{ .rates = .{ .input = 1, .output = 1 } };
+        }
+    };
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try session.addUser("work");
+    var provider: ScriptedProvider = .{ .steps = &.{ .tool, .success } };
+    var source: Source = .{};
+    var seam: SeamRecorder = .{};
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .model_metadata = .{ .rates = .{ .input = 4, .output = 4 } },
+        .model_metadata_source = ModelMetadataSourceModule.ModelMetadataSource.from(&source),
+        .system_prompt = "system",
+        .seam_hook = SeamHook.from(&seam),
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Outcome.compacted, result.outcome);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    try std.testing.expectEqual(@as(usize, 2), countItems(session.items(), .turn_usage));
+    try std.testing.expectEqual(@as(usize, 2), seam.calls);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, seam.next_actions[0..seam.calls]);
+    var costs: [2]f64 = undefined;
+    var count: usize = 0;
+    for (session.items()) |item| if (item == .turn_usage) {
+        costs[count] = item.turn_usage.value.cost_total_usd.?;
+        count += 1;
+    };
+    try std.testing.expectApproxEqAbs(0.000002, costs[0], 1e-15);
+    try std.testing.expectApproxEqAbs(0.000012, costs[1], 1e-15);
 }
 
 test "physical retries fold into the accepted aggregate footer" {
