@@ -15,6 +15,34 @@ const TaskRegistryModule = @import("TaskRegistry.zig");
 
 const maximum_json_bytes: usize = 1024 * 1024;
 
+pub const Clock = struct {
+    context: ?*anyopaque = null,
+    now_fn: *const fn (std.Io, ?*anyopaque) i128 = awakeNow,
+
+    pub fn now(self: Clock, io: std.Io) i128 {
+        return self.now_fn(io, self.context);
+    }
+
+    pub fn from(implementation: anytype) Clock {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("Clock.from expects a single-item pointer");
+        }
+        const Adapter = struct {
+            fn now(_: std.Io, context: ?*anyopaque) i128 {
+                const self: Pointer = @ptrCast(@alignCast(context.?));
+                return self.nowNs();
+            }
+        };
+        return .{ .context = implementation, .now_fn = Adapter.now };
+    }
+
+    fn awakeNow(io: std.Io, _: ?*anyopaque) i128 {
+        return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    }
+};
+
 pub const Config = struct {
     environment: std.process.Environ = .empty,
     shell: ?[]const u8 = null,
@@ -27,6 +55,7 @@ pub const Config = struct {
     /// Borrowed. The owner must shut down and deinitialize the registry before Bash.
     task_registry: ?*TaskRegistryModule.TaskRegistry = null,
     background_yield_ms: u64 = 1000,
+    clock: Clock = .{},
 };
 
 /// Owns the resolved shell, injected child environment, and a bounded cache of
@@ -49,6 +78,7 @@ pub const Bash = struct {
     maximum_retained_spill_bytes: usize,
     task_registry: ?*TaskRegistryModule.TaskRegistry,
     background_yield_ms: u64,
+    clock: Clock,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -108,6 +138,7 @@ pub const Bash = struct {
             .maximum_retained_spill_bytes = config.maximum_retained_spill_bytes,
             .task_registry = config.task_registry,
             .background_yield_ms = config.background_yield_ms,
+            .clock = config.clock,
         };
     }
 
@@ -324,7 +355,7 @@ pub const Bash = struct {
         const deadline: ?i128 = if (!background and timeout_ms == 0)
             null
         else
-            deadlineAfterMs(std.Io.Clock.awake.now(self.io).nanoseconds, wait_ms);
+            deadlineAfterMs(self.clock.now(self.io), wait_ms);
         while (true) {
             task.poll() catch return error.InvalidResult;
             try drainManaged(task, &sink, &captured_cursor);
@@ -360,7 +391,7 @@ pub const Bash = struct {
                 task.terminate(.force);
                 continue;
             };
-            const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+            const now = self.clock.now(self.io);
             if (deadline) |limit| if (now >= limit and task.leaderRunning()) break;
             const remaining_ns: u64 = if (deadline) |limit|
                 if (now >= limit)
@@ -408,14 +439,14 @@ pub const Bash = struct {
     ) ToolContract.RunError!ToolContract.Result {
         task.terminate(.graceful);
         const grace_deadline = deadlineAfterMs(
-            std.Io.Clock.awake.now(self.io).nanoseconds,
+            self.clock.now(self.io),
             self.termination_grace_ms,
         );
         var forced = false;
         while (task.status() == .running) {
             task.poll() catch return error.InvalidResult;
             try drainManaged(task, sink, captured_cursor);
-            const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+            const now = self.clock.now(self.io);
             if (!forced and now >= grace_deadline) {
                 task.terminate(.force);
                 forced = true;
@@ -1084,6 +1115,17 @@ test "bash live display repeats output rather than marking it summarized" {
     try std.testing.expectEqual(@as(usize, 0), result.hidden_tail_bytes);
 }
 
+test "managed deadlines preserve backward time and saturate" {
+    try std.testing.expectEqual(
+        -@as(i128, std.time.ns_per_ms),
+        deadlineAfterMs(-2 * std.time.ns_per_ms, 1),
+    );
+    try std.testing.expectEqual(
+        std.math.maxInt(i128),
+        deadlineAfterMs(std.math.maxInt(i128) - 1, 1),
+    );
+}
+
 test "bash defaults pin hax timeout ceiling and termination grace" {
     var bash = try Bash.init(std.testing.allocator, std.testing.io, .{
         .environment = std.testing.environ,
@@ -1092,6 +1134,11 @@ test "bash defaults pin hax timeout ceiling and termination grace" {
     try std.testing.expectEqual(@as(u64, 120 * 1000), bash.timeout_ms);
     try std.testing.expectEqual(@as(u64, 30 * 60 * 1000), bash.maximum_timeout_ms);
     try std.testing.expectEqual(@as(u64, 2 * 1000), bash.termination_grace_ms);
+    const before = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    const observed = bash.clock.now(std.testing.io);
+    const after = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    try std.testing.expect(observed >= before);
+    try std.testing.expect(observed <= after);
 }
 
 test "bash child environment overrides inherited hax tracing" {
@@ -1238,6 +1285,7 @@ test "unwritable configured spill root falls back to tmp" {
 
 const RealTaskHarness = struct {
     io: std.Io,
+    fixed_clock: ?*FixedTaskClock = null,
 
     pub fn nowMs(self: *RealTaskHarness) i64 {
         const ns = std.Io.Clock.awake.now(self.io).nanoseconds;
@@ -1245,10 +1293,46 @@ const RealTaskHarness = struct {
     }
 
     pub fn wait(self: *RealTaskHarness, milliseconds: u64) void {
+        if (self.fixed_clock) |clock| {
+            const delta: i64 = @intCast(@min(milliseconds, @as(u64, std.math.maxInt(i64))));
+            clock.now_ms = std.math.add(i64, clock.now_ms, delta) catch std.math.maxInt(i64);
+        }
         self.io.sleep(
             .fromMilliseconds(@intCast(@min(milliseconds, @as(u64, std.math.maxInt(i64))))),
             .awake,
         ) catch |err| std.debug.panic("real task poller sleep failed: {s}", .{@errorName(err)});
+    }
+};
+
+const FixedTaskClock = struct {
+    now_ms: i64,
+
+    pub fn nowMs(self: *FixedTaskClock) i64 {
+        return self.now_ms;
+    }
+};
+
+const ManagedDetachClock = struct {
+    ready: *const std.atomic.Value(bool),
+    advanced_ns: i128,
+
+    pub fn nowNs(self: *ManagedDetachClock) i128 {
+        return if (self.ready.load(.acquire)) self.advanced_ns else 0;
+    }
+};
+
+const PrefixDisplaySink = struct {
+    ready: *std.atomic.Value(bool),
+    prefix: []const u8,
+    bytes: [256]u8 = undefined,
+    length: usize = 0,
+
+    pub fn emit(self: *PrefixDisplaySink, bytes: []const u8) error{OutOfMemory}!void {
+        if (bytes.len > self.bytes.len - self.length) return error.OutOfMemory;
+        @memcpy(self.bytes[self.length .. self.length + bytes.len], bytes);
+        self.length += bytes.len;
+        if (std.mem.indexOf(u8, self.bytes[0..self.length], self.prefix) != null)
+            self.ready.store(true, .release);
     }
 };
 
@@ -1317,18 +1401,25 @@ test "background fast finish stays synchronous and slow command is adopted" {
     const quoted_timed_marker = try shellQuoteAlloc(std.testing.allocator, timed_marker_path);
     defer std.testing.allocator.free(quoted_timed_marker);
 
-    var harness: RealTaskHarness = .{ .io = std.testing.io };
+    var registry_clock: FixedTaskClock = .{ .now_ms = 0 };
+    var harness: RealTaskHarness = .{ .io = std.testing.io, .fixed_clock = &registry_clock };
     var registry = try TaskRegistryModule.TaskRegistry.init(
         std.testing.allocator,
-        TaskRegistryModule.Clock.from(&harness),
+        TaskRegistryModule.Clock.from(&registry_clock),
         TaskRegistryModule.Poller.from(&harness),
         .{},
     );
+    var prefix_ready: std.atomic.Value(bool) = .init(false);
+    var managed_clock: ManagedDetachClock = .{
+        .ready = &prefix_ready,
+        .advanced_ns = 1001 * std.time.ns_per_ms,
+    };
     var bash = try Bash.init(std.testing.allocator, std.testing.io, .{
         .environment = std.testing.environ,
         .task_registry = &registry,
         .background_yield_ms = 1000,
         .timeout_ms = 20,
+        .clock = Clock.from(&managed_clock),
     });
     defer {
         registry.deinit();
@@ -1349,13 +1440,9 @@ test "background fast finish stays synchronous and slow command is adopted" {
     try std.testing.expectEqualStrings("fast\n[finished during launch; no task created]", fast.output);
     try std.testing.expectEqual(@as(usize, 42), fast.hidden_tail_bytes);
     try std.testing.expectEqual(@as(usize, 0), try registry.runningCount());
-    // Keep the real detach branch fast after giving process startup a generous
-    // window for the fast-finish assertion above.
-    bash.background_yield_ms = 20;
-
     const detached_command = try std.fmt.allocPrint(
         std.testing.allocator,
-        "while [ ! -e {s} ]; do :; done; printf one; printf two",
+        "printf one; while [ ! -e {s} ]; do :; done; printf two",
         .{quoted_slow_marker},
     );
     defer std.testing.allocator.free(detached_command);
@@ -1371,26 +1458,28 @@ test "background fast finish stays synchronous and slow command is adopted" {
         .{detached_command_json},
     );
     defer std.testing.allocator.free(detached_input);
+    var detached_display: PrefixDisplaySink = .{ .ready = &prefix_ready, .prefix = "one" };
     var detached = try bash.tool().run(
         std.testing.allocator,
         std.testing.io,
         detached_input,
-        .{},
+        .{ .display = ToolContract.DisplaySink.from(&detached_display) },
     );
     defer detached.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, detached.output, "two") == null);
-    try std.testing.expect(std.mem.endsWith(u8, detached.output, "[detached as task slow]"));
+    try std.testing.expect(prefix_ready.load(.acquire));
+    try std.testing.expectEqualStrings("one\n[detached as task slow]", detached.output);
+    try std.testing.expectEqualStrings(detached.output, detached_display.bytes[0..detached_display.length]);
     try std.testing.expectEqual(@as(usize, 1), try registry.runningCount());
     try touchTestMarker(&tmp, slow_marker_name);
     const waited = try registry.wait(std.testing.allocator, "slow", .{ .timeout_ms = 2000 });
     defer std.testing.allocator.free(waited);
-    try std.testing.expect(std.mem.indexOf(u8, waited, "one") != null);
-    try std.testing.expect(std.mem.indexOf(u8, waited, "two") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, waited, "one"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, waited, "two"));
     try std.testing.expect(std.mem.indexOf(u8, waited, "finished (exit 0)") != null);
 
     const timed_command = try std.fmt.allocPrint(
         std.testing.allocator,
-        "while [ ! -e {s} ]; do :; done; printf timeout-start; printf timeout-end",
+        "printf timeout-start; while [ ! -e {s} ]; do :; done; printf timeout-end",
         .{quoted_timed_marker},
     );
     defer std.testing.allocator.free(timed_command);
@@ -1406,19 +1495,32 @@ test "background fast finish stays synchronous and slow command is adopted" {
         .{timed_command_json},
     );
     defer std.testing.allocator.free(timed_input);
+    var timed_ready: std.atomic.Value(bool) = .init(false);
+    managed_clock.ready = &timed_ready;
+    var timed_display: PrefixDisplaySink = .{ .ready = &timed_ready, .prefix = "timeout-start" };
     var timed = try bash.tool().run(
         std.testing.allocator,
         std.testing.io,
         timed_input,
-        .{},
+        .{ .display = ToolContract.DisplaySink.from(&timed_display) },
     );
     defer timed.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, timed.output, "timeout-end") == null);
-    try std.testing.expect(std.mem.endsWith(u8, timed.output, "[detached as task t2 after 0s timeout]"));
+    try std.testing.expect(timed_ready.load(.acquire));
+    try std.testing.expectEqualStrings(
+        "timeout-start\n[detached as task t2 after 0s timeout]",
+        timed.output,
+    );
+    try std.testing.expectEqualStrings(timed.output, timed_display.bytes[0..timed_display.length]);
     try std.testing.expectEqual(@as(usize, 1), try registry.runningCount());
+    const timed_out = try registry.wait(std.testing.allocator, "t2", .{ .timeout_ms = 2000 });
+    defer std.testing.allocator.free(timed_out);
+    try std.testing.expectEqualStrings(
+        "[t2 still running (2s); no new output — wait timed out]",
+        timed_out,
+    );
     try touchTestMarker(&tmp, timed_marker_name);
     const timed_wait = try registry.wait(std.testing.allocator, "t2", .{ .timeout_ms = 2000 });
     defer std.testing.allocator.free(timed_wait);
-    try std.testing.expect(std.mem.indexOf(u8, timed_wait, "timeout-start") != null);
-    try std.testing.expect(std.mem.indexOf(u8, timed_wait, "timeout-end") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, timed_wait, "timeout-start"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, timed_wait, "timeout-end"));
 }
