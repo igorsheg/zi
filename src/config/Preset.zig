@@ -1,6 +1,7 @@
 const std = @import("std");
 const Document = @import("Document.zig");
 const PromptValue = @import("PromptValue.zig");
+const SecureOpen = @import("SecureOpen.zig");
 
 /// At most this many definitions may be considered by one enumeration.
 pub const maximum_presets: usize = 1024;
@@ -11,6 +12,7 @@ pub const maximum_retained_bytes: usize = 1024 * 1024;
 pub const Error = error{ OutOfMemory, TooManyPresets, RetainedDataTooLarge };
 
 pub const PromptRoots = struct {
+    secure_open: SecureOpen.Capability,
     config_root: ?[]const u8 = null,
     home: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
@@ -344,6 +346,7 @@ fn promptMember(
     const resolved = PromptValue.resolve(
         allocator,
         io,
+        roots.secure_open,
         scalar,
         roots.config_root,
         roots.home,
@@ -467,6 +470,40 @@ fn wipeFree(allocator: std.mem.Allocator, value: []u8) void {
     allocator.free(value);
 }
 
+const TestSecureOpen = struct {
+    directory: ?std.Io.Dir = null,
+    base: []const u8 = "",
+
+    fn relative(self: *TestSecureOpen, path: []const u8) SecureOpen.Error![]const u8 {
+        if (self.directory == null or !std.mem.startsWith(u8, path, self.base) or
+            path.len <= self.base.len or path[self.base.len] != '/') return error.FileNotFound;
+        return path[self.base.len + 1 ..];
+    }
+
+    pub fn statAbsolute(self: *TestSecureOpen, io: std.Io, path: []const u8) SecureOpen.Error!std.Io.File.Stat {
+        const sub_path = try self.relative(path);
+        return self.directory.?.statFile(io, sub_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => error.FileNotFound,
+            else => error.Failed,
+        };
+    }
+
+    pub fn openAbsolute(self: *TestSecureOpen, io: std.Io, path: []const u8) SecureOpen.Error!std.Io.File {
+        const sub_path = try self.relative(path);
+        return self.directory.?.openFile(io, sub_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => error.FileNotFound,
+            else => error.Failed,
+        };
+    }
+};
+
+fn unavailableSecureOpen() SecureOpen.Capability {
+    const Static = struct {
+        var implementation: TestSecureOpen = .{};
+    };
+    return SecureOpen.Capability.from(&Static.implementation);
+}
+
 fn parseTest(bytes: []const u8) !Document {
     return Document.parse(std.testing.allocator, bytes, .{});
 }
@@ -493,7 +530,7 @@ test "nested and flat lookup, literal dotted names, state precedence and fallbac
         std.testing.allocator,
         std.testing.io,
         .{ .state = &state, .config = &config },
-        .{},
+        .{ .secure_open = unavailableSecureOpen() },
         "work.prod",
     );
     defer work.deinit(std.testing.allocator);
@@ -501,7 +538,13 @@ test "nested and flat lookup, literal dotted names, state precedence and fallbac
     try std.testing.expectEqualStrings("state", work_plan.provider);
     try std.testing.expect(work_plan.model.value == null);
 
-    var flat = try lookup(std.testing.allocator, std.testing.io, .{ .state = &state, .config = &config }, .{}, "flat");
+    var flat = try lookup(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .state = &state, .config = &config },
+        .{ .secure_open = unavailableSecureOpen() },
+        "flat",
+    );
     defer flat.deinit(std.testing.allocator);
     try std.testing.expectEqual(InvalidReason.not_object, flat.invalid.reason);
 }
@@ -526,7 +569,7 @@ test "lookup parity order and legacy names" {
         std.testing.allocator,
         std.testing.io,
         .{ .state = &state, .config = &config },
-        .{},
+        .{ .secure_open = unavailableSecureOpen() },
         "nested-wins",
     );
     defer nested.deinit(std.testing.allocator);
@@ -536,7 +579,7 @@ test "lookup parity order and legacy names" {
         std.testing.allocator,
         std.testing.io,
         .{ .state = &state, .config = &config },
-        .{},
+        .{ .secure_open = unavailableSecureOpen() },
         "fallthrough",
     );
     defer fallthrough.deinit(std.testing.allocator);
@@ -546,7 +589,7 @@ test "lookup parity order and legacy names" {
         std.testing.allocator,
         std.testing.io,
         .{ .state = &state, .config = &config },
-        .{},
+        .{ .secure_open = unavailableSecureOpen() },
         "masked",
     );
     defer masked.deinit(std.testing.allocator);
@@ -556,7 +599,7 @@ test "lookup parity order and legacy names" {
         std.testing.allocator,
         std.testing.io,
         .{ .state = &state, .config = &config },
-        .{},
+        .{ .secure_open = unavailableSecureOpen() },
         "scalar-mask",
     );
     defer scalar_mask.deinit(std.testing.allocator);
@@ -566,7 +609,7 @@ test "lookup parity order and legacy names" {
         std.testing.allocator,
         std.testing.io,
         .{ .config = &config },
-        .{},
+        .{ .secure_open = unavailableSecureOpen() },
         ".hidden name",
     );
     defer legacy.deinit(std.testing.allocator);
@@ -576,7 +619,7 @@ test "lookup parity order and legacy names" {
         std.testing.allocator,
         std.testing.io,
         .{ .state = &state, .config = &config },
-        .{},
+        .{ .secure_open = unavailableSecureOpen() },
     );
     defer enumeration.deinit(std.testing.allocator);
     var found_scalar_mask = false;
@@ -598,7 +641,13 @@ test "allowed scalar coercions, explicit empty, tint, unknown and atomic validat
             "\"bad-tint\":{\"provider\":\"p\",\"tint\":\"blue\"}}}",
     );
     defer document.deinit();
-    var ok = try lookup(std.testing.allocator, std.testing.io, .{ .config = &document }, .{}, "ok");
+    var ok = try lookup(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .config = &document },
+        .{ .secure_open = unavailableSecureOpen() },
+        "ok",
+    );
     defer ok.deinit(std.testing.allocator);
     const plan = try expectPlan(&ok);
     try std.testing.expectEqualStrings("7", plan.provider);
@@ -608,10 +657,22 @@ test "allowed scalar coercions, explicit empty, tint, unknown and atomic validat
     try std.testing.expectEqualStrings("0", plan.description.value.?);
     try std.testing.expectEqualStrings("SAGE", plan.tint.value.?);
 
-    var bad = try lookup(std.testing.allocator, std.testing.io, .{ .config = &document }, .{}, "bad");
+    var bad = try lookup(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .config = &document },
+        .{ .secure_open = unavailableSecureOpen() },
+        "bad",
+    );
     defer bad.deinit(std.testing.allocator);
     try std.testing.expectEqual(InvalidReason.unknown_field, bad.invalid.reason);
-    var bad_tint = try lookup(std.testing.allocator, std.testing.io, .{ .config = &document }, .{}, "bad-tint");
+    var bad_tint = try lookup(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .config = &document },
+        .{ .secure_open = unavailableSecureOpen() },
+        "bad-tint",
+    );
     defer bad_tint.deinit(std.testing.allocator);
     try std.testing.expectEqual(InvalidReason.invalid_tint, bad_tint.invalid.reason);
 }
@@ -623,6 +684,8 @@ test "prompt files expand during validation and control bytes remain data" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "~cwd", .data = "from cwd" });
     const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(base);
+    var secure_open_impl: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    const secure_open = SecureOpen.Capability.from(&secure_open_impl);
     var document = try parseTest(
         "{\"presets\":{\"ok\":{\"provider\":\"p\\u0001\",\"system_prompt\":\"@prompt\"}," ++
             "\"cwd\":{\"provider\":\"p\",\"system_prompt\":\"@~cwd\"}," ++
@@ -633,7 +696,7 @@ test "prompt files expand during validation and control bytes remain data" {
         std.testing.allocator,
         std.testing.io,
         .{ .config = &document },
-        .{ .config_root = base },
+        .{ .secure_open = secure_open, .config_root = base },
         "ok",
     );
     defer ok.deinit(std.testing.allocator);
@@ -644,7 +707,7 @@ test "prompt files expand during validation and control bytes remain data" {
         std.testing.allocator,
         std.testing.io,
         .{ .config = &document },
-        .{ .cwd = base },
+        .{ .secure_open = secure_open, .cwd = base },
         "cwd",
     );
     defer cwd.deinit(std.testing.allocator);
@@ -653,7 +716,7 @@ test "prompt files expand during validation and control bytes remain data" {
         std.testing.allocator,
         std.testing.io,
         .{ .config = &document },
-        .{ .config_root = base },
+        .{ .secure_open = secure_open, .config_root = base },
         "bad",
     );
     defer bad.deinit(std.testing.allocator);
@@ -670,7 +733,12 @@ test "enumeration keeps config order then unseen state and separates invalid" {
         "{\"presets\":{\"shared\":{\"provider\":\"s\"},\"two\":{\"provider\":\"s2\"}}}",
     );
     defer state.deinit();
-    var result = try enumerate(std.testing.allocator, std.testing.io, .{ .state = &state, .config = &config }, .{});
+    var result = try enumerate(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .state = &state, .config = &config },
+        .{ .secure_open = unavailableSecureOpen() },
+    );
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), result.plans.len);
     try std.testing.expectEqualStrings("one", result.plans[0].name);
@@ -718,7 +786,12 @@ fn exerciseAllocationFailures(allocator: std.mem.Allocator) !void {
         .{},
     );
     defer document.deinit();
-    var result = try enumerate(allocator, std.testing.io, .{ .config = &document }, .{});
+    var result = try enumerate(
+        allocator,
+        std.testing.io,
+        .{ .config = &document },
+        .{ .secure_open = unavailableSecureOpen() },
+    );
     result.deinit(allocator);
 }
 
