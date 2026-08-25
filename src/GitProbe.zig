@@ -74,7 +74,27 @@ const CommandResult = struct {
 };
 
 const RunError = error{ Canceled, Failed };
-const CommandOutput = union(enum) { failed, success: usize };
+const CommandOutput = union(enum) { failed, timeout, success: usize };
+
+/// Private command seam. Output bytes borrow the caller's fixed buffer; the
+/// executor never transfers allocation ownership to the probe composer.
+const CommandExecutor = struct {
+    context: *anyopaque,
+    execute_fn: *const fn (
+        context: *anyopaque,
+        argv: []const []const u8,
+        output: *[maximum_output_bytes]u8,
+    ) Error!CommandOutput,
+
+    fn execute(
+        self: CommandExecutor,
+        argv: []const []const u8,
+        output: *[maximum_output_bytes]u8,
+    ) Error!CommandOutput {
+        return self.execute_fn(self.context, argv, output);
+    }
+};
+
 const Selection = union(enum) {
     command: RunError!CommandResult,
     timeout: error{Canceled}!void,
@@ -99,20 +119,55 @@ pub fn probe(
     var cwd_dir = std.Io.Dir.openDir(.cwd(), io, options.cwd, .{}) catch return .unavailable;
     defer cwd_dir.close(io);
 
+    var context: ProductionExecutor = .{
+        .io = io,
+        .cwd = cwd_dir,
+        .environ = options.environ,
+        .timeout = options.timeout,
+    };
+    return composeProbe(allocator, executable, .{
+        .context = &context,
+        .execute_fn = ProductionExecutor.execute,
+    });
+}
+
+const ProductionExecutor = struct {
+    io: std.Io,
+    cwd: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
+    timeout: std.Io.Duration,
+
+    fn execute(
+        context: *anyopaque,
+        argv: []const []const u8,
+        output: *[maximum_output_bytes]u8,
+    ) Error!CommandOutput {
+        const self: *ProductionExecutor = @ptrCast(@alignCast(context));
+        return runGit(self.io, self.cwd, self.environ, argv, self.timeout, output);
+    }
+};
+
+/// Builds allocator-owned fields from independent borrowed command outputs.
+/// On OOM, all fields already allocated by this function are released.
+fn composeProbe(
+    allocator: std.mem.Allocator,
+    executable: []const u8,
+    executor: CommandExecutor,
+) Error!Result {
     var state: State = .{};
     errdefer state.deinit(allocator);
     var output_buffer: [maximum_output_bytes]u8 = undefined;
     // symbolic-ref, rather than rev-parse --abbrev-ref, makes detached HEAD
     // an error instead of returning the literal branch name "HEAD".
     const branch_args = [_][]const u8{ executable, "symbolic-ref", "--quiet", "--short", "HEAD" };
-    switch (try runGit(io, cwd_dir, options.environ, &branch_args, options.timeout, &output_buffer)) {
-        .failed => {},
+    switch (try executor.execute(&branch_args, &output_buffer)) {
+        .failed, .timeout => {},
         .success => |length| state.branch = try dupeValid(allocator, visibleOutput(output_buffer[0..length])),
     }
 
     const head_args = [_][]const u8{ executable, "log", "-1", "--format=%h%n%s" };
-    switch (try runGit(io, cwd_dir, options.environ, &head_args, options.timeout, &output_buffer)) {
-        .failed => {},
+    switch (try executor.execute(&head_args, &output_buffer)) {
+        .failed, .timeout => {},
         .success => |length| try applyHead(allocator, &state, visibleOutput(output_buffer[0..length])),
     }
 
@@ -283,7 +338,7 @@ fn runGit(
             // cancelDiscard joins the task, whose defer directly kills/reaps.
             killGroup(process_group);
             select.cancelDiscard();
-            return .failed;
+            return .timeout;
         },
         .command => |outcome| {
             // Child is already reaped before the timer is canceled.
@@ -545,39 +600,74 @@ test "invalid subject is omitted without losing valid commit" {
     try std.testing.expect(result.available.subject == null);
 }
 
-test "field timeouts preserve the independent successful probe" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buffer: [maximum_path_bytes]u8 = undefined;
-    const root = try temporaryRoot(&tmp, &root_buffer);
-    const executable = try std.fmt.allocPrint(std.testing.allocator, "{s}/git", .{root});
-    defer std.testing.allocator.free(executable);
-    var environ = std.process.Environ.Map.init(std.testing.allocator);
-    defer environ.deinit();
+const StubOutcome = union(enum) { timeout, success: []const u8 };
 
-    try writeExecutable(tmp.dir, "git", "#!/bin/sh\n" ++
-        "if [ \"$1\" = symbolic-ref ]; then /bin/sleep 5; else printf 'abc1234\\nsubject\\n'; fi\n");
-    var head = try probe(std.testing.allocator, std.testing.io, .{
-        .cwd = root,
-        .environ = &environ,
-        .git_executable = executable,
-        .timeout = .fromMilliseconds(200),
-    });
+const StubExecutor = struct {
+    branch: StubOutcome,
+    head: StubOutcome,
+
+    fn executor(self: *StubExecutor) CommandExecutor {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(
+        context: *anyopaque,
+        argv: []const []const u8,
+        output: *[maximum_output_bytes]u8,
+    ) Error!CommandOutput {
+        const self: *StubExecutor = @ptrCast(@alignCast(context));
+        const outcome = if (std.mem.eql(u8, argv[1], "symbolic-ref")) self.branch else self.head;
+        return switch (outcome) {
+            .timeout => .timeout,
+            .success => |bytes| success: {
+                if (bytes.len > output.len) break :success .failed;
+                @memcpy(output[0..bytes.len], bytes);
+                break :success .{ .success = bytes.len };
+            },
+        };
+    }
+};
+
+fn exerciseCompositionAllocations(allocator: std.mem.Allocator) !void {
+    var stub: StubExecutor = .{
+        .branch = .{ .success = "topic\n" },
+        .head = .{ .success = "abc1234\nsubject\n" },
+    };
+    var result = try composeProbe(allocator, "/git", stub.executor());
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("topic", result.available.branch.?);
+    try std.testing.expectEqualStrings("abc1234", result.available.commit.?);
+    try std.testing.expectEqualStrings("subject", result.available.subject.?);
+}
+
+test "probe composition cleans owned fields on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseCompositionAllocations,
+        .{},
+    );
+}
+
+test "field timeouts preserve the independent successful probe" {
+    var head_stub: StubExecutor = .{
+        .branch = .timeout,
+        .head = .{ .success = "abc1234\nsubject\n" },
+    };
+    var head = try composeProbe(std.testing.allocator, "/git", head_stub.executor());
     defer head.deinit(std.testing.allocator);
     try std.testing.expect(head.available.branch == null);
     try std.testing.expectEqualStrings("abc1234", head.available.commit.?);
+    try std.testing.expectEqualStrings("subject", head.available.subject.?);
 
-    try writeExecutable(tmp.dir, "git", "#!/bin/sh\n" ++
-        "if [ \"$1\" = log ]; then /bin/sleep 5; else printf 'topic\\n'; fi\n");
-    var branch = try probe(std.testing.allocator, std.testing.io, .{
-        .cwd = root,
-        .environ = &environ,
-        .git_executable = executable,
-        .timeout = .fromMilliseconds(200),
-    });
+    var branch_stub: StubExecutor = .{
+        .branch = .{ .success = "topic\n" },
+        .head = .timeout,
+    };
+    var branch = try composeProbe(std.testing.allocator, "/git", branch_stub.executor());
     defer branch.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("topic", branch.available.branch.?);
     try std.testing.expect(branch.available.commit == null);
+    try std.testing.expect(branch.available.subject == null);
 }
 
 fn waitProcessGone(io: std.Io, pid: std.posix.pid_t) !void {
