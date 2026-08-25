@@ -171,7 +171,7 @@ pub const Client = struct {
                             return .{ .failure = try failureOwned(
                                 allocator,
                                 "the codex login belongs to a different account: " ++
-                                    "run /login or /provider to switch",
+                                    "restart with the intended Codex CLI account or choose another --provider",
                                 401,
                             ) };
                         }
@@ -276,7 +276,7 @@ pub const Client = struct {
                             return .{ .failure = try failureOwned(
                                 allocator,
                                 "the codex login belongs to a different account: " ++
-                                    "run /login or /provider to switch",
+                                    "restart with the intended Codex CLI account or choose another --provider",
                                 401,
                             ) };
                         }
@@ -296,7 +296,7 @@ pub const Client = struct {
             if (owned_response.status == 401) self.config.source.noteUnauthorized(credential.value.credential());
             if (owned_response.status < 200 or owned_response.status >= 300) {
                 const message = if (owned_response.status == 401)
-                    "codex login expired: run /login again"
+                    "codex login expired: authenticate with the Codex CLI again"
                 else
                     "failed to fetch usage from " ++ usage_url;
                 return .{ .failure = try failureOwned(allocator, message, owned_response.status) };
@@ -487,7 +487,11 @@ fn failureFromOverride(
 }
 
 fn modelHttpFailure(allocator: std.mem.Allocator, status: u16) error{OutOfMemory}!Failure {
-    if (status == 401) return failureOwned(allocator, "codex login expired: run /login again", status);
+    if (status == 401) return failureOwned(
+        allocator,
+        "codex login expired: authenticate with the Codex CLI again",
+        status,
+    );
     if (status >= 200 and status < 300) return failureOwned(
         allocator,
         "codex sent an empty or truncated model catalog response",
@@ -558,7 +562,7 @@ const TestSource = struct {
                 .access_token = "new-token",
                 .account_id = "other-account",
             }) },
-            .fail => .{ .fail = .{ .message = "codex CLI token expired: rerun `codex`, or use /login" } },
+            .fail => .{ .fail = .{ .message = "codex CLI token expired: rerun the Codex CLI to authenticate" } },
         };
     }
 

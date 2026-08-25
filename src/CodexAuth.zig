@@ -231,7 +231,9 @@ const State = struct {
     ) Codex.CredentialSource.CallbackError!Codex.AcquireDecision {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (!self.available) return .{ .fail = .{ .message = "codex is not logged in — run /login" } };
+        if (!self.available) return .{ .fail = .{
+            .message = "codex is not logged in — authenticate with the Codex CLI",
+        } };
         switch (self.current.source) {
             .codex_cli => if (self.cli_stale) try self.reloadCli(),
             .managed => switch (purpose) {
@@ -265,13 +267,13 @@ const State = struct {
         if (!std.mem.eql(u8, failed.account_id, self.account_pin)) return .use_response;
         if (!credentialsEqual(failed, current)) return .{ .retry = try Codex.OwnedCredential.init(allocator, current) };
         if (self.current.source == .codex_cli) return .{ .fail = .{
-            .message = "codex CLI token expired — rerun `codex`, or use /login",
+            .message = "codex CLI token expired — rerun the Codex CLI to authenticate",
         } };
 
         return switch (try self.refresh(io, tick, true)) {
             .fresh => .{ .retry = try Codex.OwnedCredential.init(allocator, self.current.credential()) },
             .transient => .{ .fail = .{
-                .message = "could not refresh the codex login — retry, or run /login",
+                .message = "could not refresh the codex login — retry, or authenticate with the Codex CLI",
             } },
             .dead => fallback: {
                 if (try self.adoptCanonicalRecovery(failed)) {
@@ -282,7 +284,7 @@ const State = struct {
                 }
                 self.available = false;
                 break :fallback .{ .fail = .{
-                    .message = "codex login expired — run /login again",
+                    .message = "codex login expired — authenticate with the Codex CLI again",
                 } };
             },
         };

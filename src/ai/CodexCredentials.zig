@@ -365,7 +365,7 @@ fn claimString(object: *const std.json.ObjectMap, key: []const u8) ?[]const u8 {
 
 pub fn failureOverride(status: Status) Codex.FailureOverride {
     return .{ .message = switch (status) {
-        .missing, .no_tokens => "not logged in (use /login)",
+        .missing, .no_tokens => "not logged in (authenticate with the Codex CLI)",
         .unreadable => "could not read Codex CLI auth.json",
         .bad_json => "auth.json not valid JSON",
     } };
@@ -648,7 +648,7 @@ pub const BorrowedCliSource = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return .{ .fail = .{
-            .message = "codex CLI token expired — rerun `codex`, or use /login",
+            .message = "codex CLI token expired — rerun the Codex CLI to authenticate",
         } };
     }
 
@@ -799,7 +799,7 @@ test "borrowed CLI source reloads changed token only for its pinned account" {
         source.current.credential(),
     );
     try std.testing.expectEqualStrings(
-        "codex CLI token expired — rerun `codex`, or use /login",
+        "codex CLI token expired — rerun the Codex CLI to authenticate",
         unauthorized.fail.message,
     );
 

@@ -565,7 +565,7 @@ const Recovery = struct {
                     credential.deinit();
                     break :retry .{ .fail = .{
                         .message = "the codex login belongs to a different account: " ++
-                            "run /login or /provider to switch",
+                            "restart with the intended Codex CLI account or choose another --provider",
                     } };
                 }
                 if (self.replacement) |*previous| previous.deinit();

@@ -37,7 +37,7 @@ const registry = [_]Setting{
         .kind = .string,
         .min = null,
         .max = null,
-        .description = "Provider id; /provider shows the available choices",
+        .description = "Provider id; pass --provider to choose",
     },
     .{
         .key = "model",
