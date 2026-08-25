@@ -129,6 +129,17 @@ pub const Owner = struct {
         return self.bash.commandShell();
     }
 
+    /// Updates the effective effort inherited by later Bash child processes.
+    /// This is allocation-free. The caller must hold exclusive Owner access and
+    /// must not overlap this call with a Bash run or background process launch.
+    pub fn updateRunEffort(
+        self: *Owner,
+        effort: ?[]const u8,
+    ) (BindingError || error{InvalidConfig})!void {
+        if (self.task_notes) |state| if (state.active) return error.Reentrant;
+        try self.bash.updateRunEffort(effort);
+    }
+
     /// Returns a borrowed registry for observation and job adoption. The caller
     /// must not call `deinit`; this Owner retains shutdown and destruction rights.
     pub fn taskRegistry(self: *Owner) ?*TaskRegistry {
@@ -440,6 +451,44 @@ test "task mode appends task wait and owner moves without invalidating erased ad
     try std.testing.expectEqual(@intFromPtr(shell_address), @intFromPtr(moved.commandShell().ptr));
     try std.testing.expectEqual(@intFromPtr(registry_address), @intFromPtr(moved.taskRegistry().?));
     try std.testing.expectEqual(@as(usize, 4), moved.tools()[3].definition.parameters.len);
+}
+
+test "owner forwards allocation-free Bash effort updates and rejects callback reentry" {
+    var inputs = testInputs(std.testing.allocator);
+    inputs.run_selection = .{ .provider = "anthropic", .model = "claude", .effort = "low" };
+    var owner = try init(inputs);
+    defer owner.deinit();
+    try owner.updateRunEffort("high");
+    var result = try owner.tools()[3].run(
+        std.testing.allocator,
+        std.testing.io,
+        "{\"command\":\"printf '%s' $HAX_EFFORT\"}",
+        .{},
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("high", result.output);
+    result.deinit(std.testing.allocator);
+    try owner.updateRunEffort(null);
+    result = try owner.tools()[3].run(
+        std.testing.allocator,
+        std.testing.io,
+        "{\"command\":\"printf '<%s>' $HAX_EFFORT\"}",
+        .{},
+    );
+    try std.testing.expectEqualStrings("<>", result.output);
+    try std.testing.expectError(error.InvalidConfig, owner.updateRunEffort("0123456789abcdef"));
+
+    var clock: TestClock = .{};
+    var poller: TestPoller = .{};
+    var task_inputs = inputs;
+    task_inputs.enable_tasks = true;
+    task_inputs.clock = tool.TaskRegistry.Clock.from(&clock);
+    task_inputs.poller = tool.TaskRegistry.Poller.from(&poller);
+    var task_owner = try init(task_inputs);
+    defer task_owner.deinit();
+    task_owner.task_notes.?.active = true;
+    try std.testing.expectError(error.Reentrant, task_owner.updateRunEffort("medium"));
+    task_owner.task_notes.?.active = false;
 }
 
 test "pre-request hook appends notes before durability and never duplicates after hook failure" {

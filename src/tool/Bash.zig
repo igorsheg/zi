@@ -44,6 +44,8 @@ pub const Clock = struct {
 };
 
 pub const maximum_selection_value_bytes: usize = 64 * 1024;
+/// Hax rejects effort names whose length is 16 bytes or more.
+const maximum_effort_value_bytes: usize = 15;
 pub const subagent_max_depth: u8 = 3;
 
 const fixed_environment_overrides = [_]struct { name: []const u8, value: []const u8 }{
@@ -78,6 +80,57 @@ pub const RunSelection = struct {
     effort: ?[]const u8 = null,
 };
 
+const RunSelectionState = struct {
+    const provider_prefix = "HAX_PROVIDER=";
+    const model_prefix = "HAX_MODEL=";
+    const effort_prefix = "HAX_EFFORT=";
+    const preset_assignment = "HAX_PRESET=";
+
+    provider: [provider_prefix.len + maximum_selection_value_bytes + 1]u8,
+    model: [model_prefix.len + maximum_selection_value_bytes + 1]u8,
+    effort: [effort_prefix.len + maximum_effort_value_bytes + 1]u8,
+    preset: [preset_assignment.len + 1]u8,
+
+    fn init(self: *RunSelectionState, selection: RunSelection) void {
+        writeAssignment(&self.provider, provider_prefix, selection.provider);
+        writeAssignment(&self.model, model_prefix, selection.model orelse "");
+        writeAssignment(&self.effort, effort_prefix, selection.effort orelse "");
+        @memcpy(self.preset[0..preset_assignment.len], preset_assignment);
+        self.preset[preset_assignment.len] = 0;
+    }
+
+    fn updateEffort(self: *RunSelectionState, effort: ?[]const u8) void {
+        writeAssignment(&self.effort, effort_prefix, effort orelse "");
+    }
+
+    fn pointers(self: *const RunSelectionState) [4][*:0]const u8 {
+        return .{
+            @ptrCast(&self.provider),
+            @ptrCast(&self.model),
+            @ptrCast(&self.effort),
+            @ptrCast(&self.preset),
+        };
+    }
+
+    fn wipe(self: *RunSelectionState) void {
+        @memset(std.mem.asBytes(self), 0);
+    }
+
+    fn writeAssignment(storage: []u8, prefix: []const u8, value: []const u8) void {
+        std.debug.assert(prefix.len + value.len < storage.len);
+        @memcpy(storage[0..prefix.len], prefix);
+        @memcpy(storage[prefix.len .. prefix.len + value.len], value);
+        storage[prefix.len + value.len] = 0;
+    }
+};
+
+const OwnedEnvironment = struct {
+    block: std.process.Environ.PosixBlock,
+    selection_state: ?*RunSelectionState,
+    borrowed_start: usize,
+    borrowed_count: usize,
+};
+
 pub const Config = struct {
     environment: std.process.Environ = .empty,
     shell: ?[]const u8 = null,
@@ -102,6 +155,9 @@ pub const Bash = struct {
     io: std.Io,
     shell: [:0]u8,
     environment: std.process.Environ.PosixBlock,
+    run_selection_state: ?*RunSelectionState,
+    environment_borrowed_start: usize,
+    environment_borrowed_count: usize,
     home: ?[]u8,
     timeout_ms: u64,
     maximum_timeout_ms: u64,
@@ -144,13 +200,13 @@ pub const Bash = struct {
             std.process.Environ.getPosix(config.environment, "PATH"),
         );
         errdefer allocator.free(shell);
-        const environment = try createEnvironment(
+        const owned_environment = try createEnvironment(
             allocator,
             config.environment,
             config.run_selection,
             config.parent_subagent_depth,
         );
-        errdefer deinitEnvironment(allocator, environment);
+        errdefer deinitEnvironment(allocator, owned_environment);
 
         const temp_directory = try createPrivateTempDirectory(
             allocator,
@@ -168,7 +224,10 @@ pub const Bash = struct {
             .allocator = allocator,
             .io = io,
             .shell = shell,
-            .environment = environment,
+            .environment = owned_environment.block,
+            .run_selection_state = owned_environment.selection_state,
+            .environment_borrowed_start = owned_environment.borrowed_start,
+            .environment_borrowed_count = owned_environment.borrowed_count,
             .home = home,
             .timeout_ms = config.timeout_ms,
             .maximum_timeout_ms = config.maximum_timeout_ms,
@@ -187,7 +246,12 @@ pub const Bash = struct {
     pub fn deinit(self: *Bash) void {
         for (self.kept_outputs.items) |*output| output.deinit();
         self.kept_outputs.deinit(self.allocator);
-        deinitEnvironment(self.allocator, self.environment);
+        deinitEnvironment(self.allocator, .{
+            .block = self.environment,
+            .selection_state = self.run_selection_state,
+            .borrowed_start = self.environment_borrowed_start,
+            .borrowed_count = self.environment_borrowed_count,
+        });
         self.allocator.free(self.shell);
         if (self.home) |home| self.allocator.free(home);
         self.spool_store.releaseOwner();
@@ -197,6 +261,15 @@ pub const Bash = struct {
     /// Returns the resolved command shell borrowed until `deinit`.
     pub fn commandShell(self: *const Bash) []const u8 {
         return self.shell;
+    }
+
+    /// Rewrites the effective child HAX_EFFORT assignment without allocating.
+    /// The caller must have exclusive non-callback ownership. In particular,
+    /// this must not overlap a synchronous run or a background process launch.
+    pub fn updateRunEffort(self: *Bash, effort: ?[]const u8) error{InvalidConfig}!void {
+        if (!validEffortValue(effort orelse "")) return error.InvalidConfig;
+        const state = self.run_selection_state orelse return error.InvalidConfig;
+        state.updateEffort(effort);
     }
 
     pub fn tool(self: *Bash) ToolContract.Tool {
@@ -796,11 +869,17 @@ fn validSelectionValue(value: []const u8, required: bool) bool {
         std.mem.findScalar(u8, value, 0) == null;
 }
 
+fn validEffortValue(value: []const u8) bool {
+    return value.len <= maximum_effort_value_bytes and
+        std.unicode.utf8ValidateSlice(value) and
+        std.mem.findScalar(u8, value, 0) == null;
+}
+
 fn validRunSelection(selection: ?RunSelection) bool {
     const value = selection orelse return true;
     if (!validSelectionValue(value.provider, true)) return false;
     if (value.model) |model| if (!validSelectionValue(model, false)) return false;
-    if (value.effort) |effort| if (!validSelectionValue(effort, false)) return false;
+    if (value.effort) |effort| if (!validEffortValue(effort)) return false;
     return true;
 }
 
@@ -833,12 +912,17 @@ fn wipeAndFreeEntry(allocator: std.mem.Allocator, entry: [*:0]const u8) void {
     allocator.free(bytes);
 }
 
-fn deinitEnvironment(
-    allocator: std.mem.Allocator,
-    environment: std.process.Environ.PosixBlock,
-) void {
-    for (environment.slice) |entry| wipeAndFreeEntry(allocator, entry.?);
-    allocator.free(environment.slice);
+fn deinitEnvironment(allocator: std.mem.Allocator, environment: OwnedEnvironment) void {
+    for (environment.block.slice, 0..) |entry, index| {
+        const borrowed = index >= environment.borrowed_start and
+            index < environment.borrowed_start + environment.borrowed_count;
+        if (!borrowed) wipeAndFreeEntry(allocator, entry.?);
+    }
+    allocator.free(environment.block.slice);
+    if (environment.selection_state) |state| {
+        state.wipe();
+        allocator.destroy(state);
+    }
 }
 
 fn appendEnvironmentEntry(
@@ -869,7 +953,17 @@ fn createEnvironment(
     inherited: std.process.Environ,
     run_selection: ?RunSelection,
     parent_subagent_depth: u8,
-) error{OutOfMemory}!std.process.Environ.PosixBlock {
+) error{OutOfMemory}!OwnedEnvironment {
+    const selection_state = if (run_selection) |selection| blk: {
+        const state = try allocator.create(RunSelectionState);
+        state.init(selection);
+        break :blk state;
+    } else null;
+    errdefer if (selection_state) |state| {
+        state.wipe();
+        allocator.destroy(state);
+    };
+
     const inherited_entries = inherited.block.view().slice;
     var retained_count: usize = 0;
     for (inherited_entries) |entry_pointer| {
@@ -889,8 +983,13 @@ fn createEnvironment(
     ) catch return error.OutOfMemory;
     const entries = try allocator.allocSentinel(?[*:0]const u8, entry_count, null);
     var initialized: usize = 0;
+    var borrowed_start: usize = 0;
+    var borrowed_count: usize = 0;
     errdefer {
-        for (entries[0..initialized]) |entry| wipeAndFreeEntry(allocator, entry.?);
+        for (entries[0..initialized], 0..) |entry, index| {
+            const borrowed = index >= borrowed_start and index < borrowed_start + borrowed_count;
+            if (!borrowed) wipeAndFreeEntry(allocator, entry.?);
+        }
         allocator.free(entries);
     }
 
@@ -909,11 +1008,14 @@ fn createEnvironment(
             override.value,
         );
     }
-    if (run_selection) |selection| {
-        try appendEnvironmentAssignment(allocator, entries, &initialized, "HAX_PROVIDER", selection.provider);
-        try appendEnvironmentAssignment(allocator, entries, &initialized, "HAX_MODEL", selection.model orelse "");
-        try appendEnvironmentAssignment(allocator, entries, &initialized, "HAX_EFFORT", selection.effort orelse "");
-        try appendEnvironmentAssignment(allocator, entries, &initialized, "HAX_PRESET", "");
+    if (selection_state) |state| {
+        borrowed_start = initialized;
+        const pointers = state.pointers();
+        for (pointers) |pointer| {
+            entries[initialized] = pointer;
+            initialized += 1;
+        }
+        borrowed_count = pointers.len;
     }
     var depth_buffer: [1]u8 = undefined;
     const child_depth = std.fmt.bufPrint(
@@ -930,7 +1032,12 @@ fn createEnvironment(
     );
 
     std.debug.assert(initialized == entry_count);
-    return .{ .slice = entries };
+    return .{
+        .block = .{ .slice = entries },
+        .selection_state = selection_state,
+        .borrowed_start = borrowed_start,
+        .borrowed_count = borrowed_count,
+    };
 }
 
 fn ensureTempBase(io: std.Io, path: []const u8) bool {
@@ -1389,7 +1496,7 @@ test "bash child environment preserves raw order and duplicates then appends exa
         .effort = null,
     }, 2);
     defer deinitEnvironment(std.testing.allocator, environment);
-    try expectEnvironmentEntries(environment, &.{
+    try expectEnvironmentEntries(environment.block, &.{
         "KEEP=first",
         "KEEP=second",
         "PAGER=cat",
@@ -1419,6 +1526,59 @@ test "bash child environment preserves raw order and duplicates then appends exa
     });
 }
 
+test "bash effort updates keep environment pointers stable and child values exact" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+    });
+    const original = try Bash.init(failing.allocator(), std.testing.io, .{
+        .environment = std.testing.environ,
+        .run_selection = .{ .provider = "anthropic", .model = "claude", .effort = "high" },
+        .timeout_ms = 1000,
+    });
+    var bash = original;
+    defer bash.deinit();
+
+    const effort_index = bash.environment_borrowed_start + 2;
+    const state_address = @intFromPtr(bash.run_selection_state.?);
+    const assignment_address = @intFromPtr(bash.environment.slice[effort_index].?);
+    failing.fail_index = failing.alloc_index;
+
+    for ([_]?[]const u8{ "low", "minimal", "", null }) |effort| {
+        try bash.updateRunEffort(effort);
+        try std.testing.expectEqual(state_address, @intFromPtr(bash.run_selection_state.?));
+        try std.testing.expectEqual(
+            assignment_address,
+            @intFromPtr(bash.environment.slice[effort_index].?),
+        );
+        const expected = if (effort) |value| try std.fmt.allocPrint(
+            std.testing.allocator,
+            "HAX_EFFORT={s}",
+            .{value},
+        ) else try std.testing.allocator.dupe(u8, "HAX_EFFORT=");
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(
+            expected,
+            std.mem.span(bash.environment.slice[effort_index].?),
+        );
+    }
+    try std.testing.expect(!failing.has_induced_failure);
+
+    try bash.updateRunEffort("medium");
+    var result = try bash.tool().run(
+        std.testing.allocator,
+        std.testing.io,
+        "{\"command\":\"printf '%s' $HAX_EFFORT\"}",
+        .{},
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("medium", result.output);
+    try std.testing.expectError(error.InvalidConfig, bash.updateRunEffort("0123456789abcdef"));
+    try std.testing.expectEqualStrings(
+        "HAX_EFFORT=medium",
+        std.mem.span(bash.environment.slice[effort_index].?),
+    );
+}
+
 test "bash child environment retains selection variables when no selection is supplied" {
     var inherited = try testEnvironment(&.{
         "HAX_PROVIDER=inherited-1",
@@ -1429,15 +1589,15 @@ test "bash child environment retains selection variables when no selection is su
     defer deinitEnvironment(std.testing.allocator, environment);
     try std.testing.expectEqualStrings(
         "HAX_PROVIDER=inherited-1",
-        std.mem.span(environment.slice[0].?),
+        std.mem.span(environment.block.slice[0].?),
     );
     try std.testing.expectEqualStrings(
         "HAX_PROVIDER=inherited-2",
-        std.mem.span(environment.slice[1].?),
+        std.mem.span(environment.block.slice[1].?),
     );
     try std.testing.expectEqualStrings(
         "HAX_SUBAGENT_DEPTH=1",
-        std.mem.span(environment.slice[environment.slice.len - 1].?),
+        std.mem.span(environment.block.slice[environment.block.slice.len - 1].?),
     );
 }
 
