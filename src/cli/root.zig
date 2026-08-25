@@ -147,7 +147,7 @@ fn friendlyError(err: anyerror) []const u8 {
         error.TooManyRules => "too many provider routing rules are configured",
         error.InvalidRule => "a provider routing rule is invalid",
         error.MissingSessionCacheKey => "the selected provider needs a valid session cache key",
-        error.InvalidPath => "a configured path is invalid",
+        error.InvalidPath, error.InvalidStateRoot => "a configured path is invalid",
         error.PathTooLong => "a configured path is too long",
         error.TooManyPresets => "too many presets are configured",
         error.TooManyDefinitions => "too many providers are configured",

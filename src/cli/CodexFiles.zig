@@ -71,6 +71,12 @@ pub fn credentialsLoader(self: CodexFiles) ai.CodexCredentials.Loader {
     return .from(self.context);
 }
 
+/// Exact owned path used by the credential loader, or null when HOME was absent.
+/// The returned slice is borrowed until deinit.
+pub fn authPath(self: CodexFiles) ?[]const u8 {
+    return self.context.auth_path;
+}
+
 /// Reads `~/.codex/config.toml` with CodexSettings' input limit. Returned
 /// bytes belong to allocator and contain potentially sensitive user data;
 /// callers must wipe them before freeing.
@@ -197,6 +203,9 @@ test "HOME absent is missing and paths are exact and owned" {
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "auth.json", .data = "decoy" });
     var files = try init(std.testing.allocator, std.testing.io, fixture.home);
     defer files.deinit();
+    const expected_auth_path = try std.fs.path.join(std.testing.allocator, &.{ fixture.home, ".codex/auth.json" });
+    defer std.testing.allocator.free(expected_auth_path);
+    try std.testing.expectEqualStrings(expected_auth_path, files.authPath().?);
     @memset(fixture.home, 'x');
     switch (try files.credentialsLoader().load(std.testing.allocator, 8)) {
         .bytes => |bytes| {

@@ -10,6 +10,8 @@ const SecureOpen = @import("../SecureOpen.zig");
 const CatalogService = @import("../CatalogService.zig");
 const ProviderRuntime = @import("../ProviderRuntime.zig");
 const ProviderConfig = @import("../ProviderConfig.zig");
+const CodexRuntime = @import("../CodexRuntime.zig");
+const CodexAuth = @import("../CodexAuth.zig");
 const ToolRuntime = @import("../ToolRuntime.zig");
 const SessionDurability = @import("../SessionDurability.zig");
 const SessionRetentionService = @import("../SessionRetentionService.zig");
@@ -18,6 +20,7 @@ const GitProbe = @import("../GitProbe.zig");
 const Args = @import("Args.zig");
 const ProcessAdapters = @import("ProcessAdapters.zig");
 const ProcessFacts = @import("ProcessFacts.zig");
+const CodexFiles = @import("CodexFiles.zig");
 const SessionStartup = @import("SessionStartup.zig");
 const StartupConfig = @import("StartupConfig.zig");
 const OneShot = @import("OneShot.zig");
@@ -133,9 +136,36 @@ pub fn run(
     try renderWarnings(stderr, startup.warnings());
     try renderProviderWarnings(stderr, startup.providerWarnings());
 
+    var codex_files = try CodexFiles.init(allocator, io, path_inputs.home);
+    defer codex_files.deinit();
+    var codex_settings = try loadCodexSettings(allocator, codex_files);
+    defer codex_settings.deinit();
+
     var http = try ai.HttpTransport.Runtime.init(allocator, io, init.minimal.environ);
     defer http.deinit();
     var http_transport = http.transport();
+
+    var codex_runtime: ?*CodexRuntime.Owner = null;
+    defer if (codex_runtime) |owner| owner.deinit();
+    var codex_failure: ?CodexAuth.InitFailure = null;
+    switch (try CodexRuntime.Owner.create(
+        allocator,
+        io,
+        paths.state_root,
+        codex_files.credentialsLoader(),
+        http_transport.json(),
+        random.nonceSource(),
+        .system,
+    )) {
+        .ready => |owner| codex_runtime = owner,
+        .failure => |failure| codex_failure = failure,
+    }
+    var selected_provider = try config.Settings.getString(startup.store(), allocator, "provider");
+    defer selected_provider.deinit(allocator);
+    if (codex_failure) |failure| if (isExplicitCodex(selected_provider.value)) {
+        try renderCodexAuthDiagnostic(stderr, codex_files.authPath(), failure);
+        return 1;
+    };
 
     var catalog: ?*CatalogService.Owner = null;
     defer if (catalog) |value| {
@@ -183,7 +213,10 @@ pub fn run(
         .store = startup.store(),
         .api_key_environment = environment.apiKey(),
         .provider_definitions = startup.providerDefinitions(),
-        .codex_available = false,
+        .codex_available = codex_runtime != null,
+        .codex_source = if (codex_runtime) |owner| owner.credentialSource() else null,
+        .default_model = codex_settings.model,
+        .default_effort = codex_settings.model_reasoning_effort,
         .llamacpp_available = false,
         .ollama_available = false,
         .session_cache_key = &session_cache_key,
@@ -466,7 +499,7 @@ pub fn run(
     model_metadata_source.effects = &catalog_hook;
     compaction.effects = &catalog_hook;
 
-    return OneShot.run(allocator, io, .{
+    const run_result = OneShot.run(allocator, io, .{
         .session = session_run.session(),
         .provider = provider_runtime.provider(),
         .model = provider_runtime.model,
@@ -493,6 +526,16 @@ pub fn run(
         .stats_renderer = stats.renderer(),
         .style_diagnostics = ProcessAdapters.isTty(io, .stderr()),
     });
+    const publication = if (codex_runtime) |owner| owner.takePublicationOutcome() else null;
+    if (run_result) |exit_code| {
+        if (publication) |outcome| try renderPublicationWarning(stderr, outcome);
+        return exit_code;
+    } else |run_error| {
+        stdout.flush() catch |write_error| ignoreWriterFailure(write_error);
+        if (publication) |outcome| renderPublicationWarning(stderr, outcome) catch |write_error|
+            ignoreWriterFailure(write_error);
+        return run_error;
+    }
 }
 
 const LazyGit = struct {
@@ -961,6 +1004,101 @@ fn noSessionConfigured(value: ?[]const u8, provider_id: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "yes") or std.ascii.eqlIgnoreCase(text, "on");
 }
 
+fn ignoreWriterFailure(err: std.Io.Writer.Error) void {
+    switch (err) {
+        error.WriteFailed => return,
+    }
+}
+
+fn loadCodexSettings(
+    allocator: std.mem.Allocator,
+    files: CodexFiles,
+) error{OutOfMemory}!ai.CodexSettings.Owned {
+    const loaded = try files.loadSettings(allocator);
+    return switch (loaded) {
+        .missing, .unreadable => .{ .allocator = allocator },
+        .bytes => |bytes| parsed: {
+            defer SecureAllocator.wipeFree(allocator, bytes);
+            break :parsed try ai.CodexSettings.parse(allocator, bytes);
+        },
+    };
+}
+
+fn isExplicitCodex(provider: ?[]const u8) bool {
+    return if (provider) |value| std.mem.eql(u8, value, "codex") else false;
+}
+
+fn renderCodexAuthDiagnostic(
+    writer: *std.Io.Writer,
+    auth_path: ?[]const u8,
+    failure: CodexAuth.InitFailure,
+) std.Io.Writer.Error!void {
+    try writer.writeAll("zi: Codex authentication unavailable: ");
+    if (auth_path) |path| {
+        try writer.writeAll("'");
+        try DiagnosticText.write(writer, path);
+        try writer.writeAll("' ");
+    } else {
+        try writer.writeAll("HOME is not set and the Codex auth path ");
+    }
+    try writer.writeAll(switch (failure.codex_cli) {
+        .missing => "is missing; authenticate with the Codex CLI to create it",
+        .unreadable => "cannot be read safely; check its ownership and permissions",
+        .bad_json => "contains invalid JSON; repair it with the Codex CLI",
+        .no_tokens => "has no usable access token and account ID; authenticate with the Codex CLI",
+    });
+    switch (failure.managed) {
+        .bad_json => try writer.writeAll("; Zi's managed Codex credential is also corrupt"),
+        .unreadable => try writer.writeAll("; Zi's managed Codex credential is also unreadable"),
+        .no_tokens => try writer.writeAll("; Zi's managed Codex credential also has no usable tokens"),
+        .missing => {},
+    }
+    try writer.writeByte('\n');
+}
+
+fn renderPublicationWarning(
+    writer: *std.Io.Writer,
+    outcome: CodexAuth.PublicationOutcome,
+) std.Io.Writer.Error!void {
+    const failure = switch (outcome) {
+        .not_published => |value| value,
+        .uncertain => |value| value,
+        .none, .adopted_disk, .published => return,
+    };
+    try writer.writeAll("zi: warning: Codex credential update ");
+    switch (outcome) {
+        .not_published => try writer.writeAll("was definitely not published"),
+        .uncertain => try writer.writeAll("may or may not have been published"),
+        else => unreachable,
+    }
+    try writer.writeAll(": ");
+    try writer.writeAll(publicationCause(failure.cause));
+    if (failure.orphan_name) |*name| {
+        try writer.writeAll("; temporary file '");
+        try DiagnosticText.write(writer, name.bytes());
+        try writer.writeAll("' may need removal");
+    }
+    try writer.writeAll("; retry authentication if the next Codex request fails\n");
+}
+
+fn publicationCause(cause: persistence.CredentialStore.MutationCause) []const u8 {
+    return switch (cause) {
+        .invalid => "the stored credential state was invalid",
+        .too_large => "the credential update exceeded its safe size limit",
+        .busy => "another credential update was in progress",
+        .not_regular => "the credential path was not a regular private file",
+        .io_failure => "the credential file operation failed",
+        .out_of_memory => "the credential update ran out of memory",
+        .canceled => "the credential update was canceled",
+        .poisoned => "an earlier uncertain write blocked safe replacement",
+        .invalid_provider => "the credential provider name was invalid",
+        .invalid_value => "the credential value was invalid",
+        .too_deep => "the credential JSON nesting was too deep",
+        .too_many_tokens => "the credential JSON had too many tokens",
+        .string_too_large => "a credential JSON string exceeded its safe limit",
+    };
+}
+
 fn diagnostic(writer: *std.Io.Writer, message: []const u8) !u8 {
     try writer.print("zi: {s}\n", .{message});
     return 1;
@@ -1237,6 +1375,79 @@ test "provider warnings use actionable safe prose" {
             "zi: warning: provider 'custom': unknown field 'mystery\\x1b' (see docs/providers.md)\n" ++
             "zi: warning: provider 'custom': field 'api_key' is not used by API providers\n" ++
             "zi: warning: provider 'custom': field 'cache' has an invalid boolean value\n",
+        output.written(),
+    );
+}
+
+test "explicit Codex detection matches provider canonicalization semantics" {
+    try std.testing.expect(isExplicitCodex("codex"));
+    try std.testing.expect(!isExplicitCodex("Codex"));
+    try std.testing.expect(!isExplicitCodex(null));
+}
+
+test "Codex settings defaults are empty when explicit HOME has no config" {
+    var files = try CodexFiles.init(std.testing.allocator, std.testing.io, null);
+    defer files.deinit();
+    var settings = try loadCodexSettings(std.testing.allocator, files);
+    defer settings.deinit();
+    try std.testing.expect(settings.model == null);
+    try std.testing.expect(settings.model_reasoning_effort == null);
+}
+
+test "explicit Codex auth diagnostics name the exact safe path and statuses" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try renderCodexAuthDiagnostic(&output.writer, "/home/name\n/.codex/auth.json", .{
+        .managed = .bad_json,
+        .codex_cli = .no_tokens,
+    });
+    try std.testing.expectEqualStrings(
+        "zi: Codex authentication unavailable: '/home/name\\n/.codex/auth.json' " ++
+            "has no usable access token and account ID; authenticate with the Codex CLI; " ++
+            "Zi's managed Codex credential is also corrupt\n",
+        output.written(),
+    );
+
+    output.clearRetainingCapacity();
+    try renderCodexAuthDiagnostic(&output.writer, null, .{
+        .managed = .unreadable,
+        .codex_cli = .missing,
+    });
+    try std.testing.expectEqualStrings(
+        "zi: Codex authentication unavailable: HOME is not set and the Codex auth path " ++
+            "is missing; authenticate with the Codex CLI to create it; " ++
+            "Zi's managed Codex credential is also unreadable\n",
+        output.written(),
+    );
+}
+
+test "Codex publication warnings distinguish certainty and escape orphan names" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try renderPublicationWarning(&output.writer, .{ .not_published = .{
+        .cause = .busy,
+        .orphan_name = null,
+    } });
+    try std.testing.expectEqualStrings(
+        "zi: warning: Codex credential update was definitely not published: " ++
+            "another credential update was in progress; " ++
+            "retry authentication if the next Codex request fails\n",
+        output.written(),
+    );
+
+    output.clearRetainingCapacity();
+    var orphan: persistence.CredentialStore.OrphanName = .{};
+    const unsafe_name = "tmp\n\x1b";
+    @memcpy(orphan.buffer[0..unsafe_name.len], unsafe_name);
+    orphan.len = unsafe_name.len;
+    try renderPublicationWarning(&output.writer, .{ .uncertain = .{
+        .cause = .io_failure,
+        .orphan_name = orphan,
+    } });
+    try std.testing.expectEqualStrings(
+        "zi: warning: Codex credential update may or may not have been published: " ++
+            "the credential file operation failed; temporary file 'tmp\\n\\x1b' may need removal; " ++
+            "retry authentication if the next Codex request fails\n",
         output.written(),
     );
 }
