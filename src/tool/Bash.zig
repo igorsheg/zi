@@ -152,6 +152,11 @@ pub const Bash = struct {
         self.* = undefined;
     }
 
+    /// Returns the resolved command shell borrowed until `deinit`.
+    pub fn commandShell(self: *const Bash) []const u8 {
+        return self.shell;
+    }
+
     pub fn tool(self: *Bash) ToolContract.Tool {
         const selected_definition = if (self.task_registry != null) definition else definition_no_tasks;
         return ToolContract.Tool.from(self, selected_definition, .{
@@ -880,7 +885,12 @@ fn findExecutable(
     }
     var paths = std.mem.splitScalar(u8, path_env orelse "", ':');
     while (paths.next()) |directory| {
-        const candidate = try std.fs.path.join(allocator, &.{ if (directory.len == 0) "." else directory, name });
+        // Match fs_which: never interpret an empty or relative PATH entry
+        // against ambient cwd. Explicit configured names containing '/' are
+        // handled directly above and may be relative.
+        if (directory.len == 0 or directory[0] != '/' or
+            std.mem.findScalar(u8, directory, 0) != null) continue;
+        const candidate = try std.fs.path.join(allocator, &.{ directory, name });
         defer allocator.free(candidate);
         if (isExecutable(io, candidate)) {
             const result = try allocator.dupeZ(u8, candidate);
@@ -977,6 +987,54 @@ const definition_no_tasks: ToolContract.Definition = .{
         "is terminated; background tasks are unavailable.",
     .parameters = &no_task_parameters,
 };
+
+test "shell lookup ignores unsafe PATH entries and accepts explicit relative path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "bin", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bin/bash", .data = "#!/bin/sh\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "custom", .data = "#!/bin/sh\n" });
+    for ([_][]const u8{ "bin/bash", "custom" }) |name| {
+        const file = try tmp.dir.openFile(std.testing.io, name, .{});
+        defer file.close(std.testing.io);
+        try file.setPermissions(std.testing.io, .fromMode(0o700));
+    }
+    const absolute_bin = try tmp.dir.realPathFileAlloc(std.testing.io, "bin", std.testing.allocator);
+    defer std.testing.allocator.free(absolute_bin);
+    const absolute_custom = try tmp.dir.realPathFileAlloc(std.testing.io, "custom", std.testing.allocator);
+    defer std.testing.allocator.free(absolute_custom);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const relative_bin = try std.fs.path.relative(std.testing.allocator, cwd, null, cwd, absolute_bin);
+    defer std.testing.allocator.free(relative_bin);
+    const relative_custom = try std.fs.path.relative(std.testing.allocator, cwd, null, cwd, absolute_custom);
+    defer std.testing.allocator.free(relative_custom);
+    const explicit_custom = try std.fmt.allocPrint(std.testing.allocator, "./{s}", .{relative_custom});
+    defer std.testing.allocator.free(explicit_custom);
+
+    try std.testing.expect((try findExecutable(std.testing.allocator, std.testing.io, "bash", null)) == null);
+    try std.testing.expect((try findExecutable(std.testing.allocator, std.testing.io, "bash", "")) == null);
+    try std.testing.expect((try findExecutable(
+        std.testing.allocator,
+        std.testing.io,
+        "bash",
+        relative_bin,
+    )) == null);
+    const found = (try findExecutable(std.testing.allocator, std.testing.io, "bash", absolute_bin)).?;
+    defer std.testing.allocator.free(found);
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ absolute_bin, "bash" });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, found);
+
+    const configured = (try findExecutable(
+        std.testing.allocator,
+        std.testing.io,
+        explicit_custom,
+        null,
+    )).?;
+    defer std.testing.allocator.free(configured);
+    try std.testing.expectEqualStrings(explicit_custom, configured);
+}
 
 test "bash definition is synchronous hax contract" {
     try std.testing.expectEqualStrings("bash", definition.name);

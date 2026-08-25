@@ -121,6 +121,12 @@ pub const Owner = struct {
         return self.tool_handles[0..self.tool_count];
     }
 
+    /// Returns Bash's resolved command shell borrowed until `deinit`.
+    /// The slice remains stable when this move-only Owner handle is moved.
+    pub fn commandShell(self: *const Owner) []const u8 {
+        return self.bash.commandShell();
+    }
+
     /// Returns a borrowed registry for observation and job adoption. The caller
     /// must not call `deinit`; this Owner retains shutdown and destruction rights.
     pub fn taskRegistry(self: *Owner) ?*TaskRegistry {
@@ -414,6 +420,8 @@ test "task mode appends task wait and owner moves without invalidating erased ad
     const original = try init(inputs);
     const read_address = original.read;
     const bash_address = original.bash;
+    const shell = original.commandShell();
+    const shell_address = shell.ptr;
     const registry_address = original.registry.?;
     var moved = original;
     defer moved.deinit();
@@ -424,6 +432,8 @@ test "task mode appends task wait and owner moves without invalidating erased ad
     }
     try std.testing.expectEqual(@intFromPtr(read_address), @intFromPtr(moved.tools()[0].context));
     try std.testing.expectEqual(@intFromPtr(bash_address), @intFromPtr(moved.tools()[3].context));
+    try std.testing.expectEqualStrings(shell, moved.commandShell());
+    try std.testing.expectEqual(@intFromPtr(shell_address), @intFromPtr(moved.commandShell().ptr));
     try std.testing.expectEqual(@intFromPtr(registry_address), @intFromPtr(moved.taskRegistry().?));
     try std.testing.expectEqual(@as(usize, 4), moved.tools()[3].definition.parameters.len);
 }

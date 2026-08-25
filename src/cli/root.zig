@@ -4,6 +4,7 @@ const version = "0.1.0-dev";
 
 pub const Args = @import("Args.zig");
 pub const ProcessAdapters = @import("ProcessAdapters.zig");
+pub const ProcessFacts = @import("ProcessFacts.zig");
 pub const OneShot = @import("OneShot.zig");
 pub const SessionStartup = @import("SessionStartup.zig");
 pub const StartupConfig = @import("StartupConfig.zig");
@@ -94,6 +95,7 @@ fn writeHelp(writer: *std.Io.Writer) !void {
 test {
     _ = Args;
     _ = ProcessAdapters;
+    _ = ProcessFacts;
     _ = OneShot;
     _ = SessionStartup;
     _ = StartupConfig;
