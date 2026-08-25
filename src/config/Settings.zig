@@ -731,6 +731,16 @@ pub const BoolResult = struct {
     source: Store.Source,
 };
 
+pub const SizeResult = struct {
+    value: u64,
+    source: Store.Source,
+};
+
+pub const DurationMsResult = struct {
+    value: u64,
+    source: Store.Source,
+};
+
 /// Resolves and owns a string exactly as Store does. Call deinit on the result.
 pub fn getString(
     store: Store,
@@ -774,6 +784,47 @@ pub fn getBool(
     };
 }
 
+/// Resolves a positive decimal size with an optional binary K or M suffix.
+/// Invalid or out-of-bounds values fall back to the registry default, then zero.
+pub fn getSize(
+    store: Store,
+    allocator: std.mem.Allocator,
+    key: []const u8,
+) error{OutOfMemory}!SizeResult {
+    var resolved = try store.readNonempty(allocator, key);
+    defer resolved.deinit(allocator);
+    const setting = find(key);
+    const parsed = if (resolved.value) |text| parseSize(text) else null;
+    return .{
+        .value = if (parsed) |value|
+            if (inUnsignedBounds(setting, value)) value else fallbackSize(setting)
+        else
+            fallbackSize(setting),
+        .source = resolved.source,
+    };
+}
+
+/// Resolves a nonnegative decimal duration in milliseconds. Supported suffixes
+/// are ms, s, m, and h; a missing suffix means seconds. Invalid or out-of-bounds
+/// values fall back to the registry default, then zero.
+pub fn getDurationMs(
+    store: Store,
+    allocator: std.mem.Allocator,
+    key: []const u8,
+) error{OutOfMemory}!DurationMsResult {
+    var resolved = try store.readNonempty(allocator, key);
+    defer resolved.deinit(allocator);
+    const setting = find(key);
+    const parsed = if (resolved.value) |text| parseDurationMs(text) else null;
+    return .{
+        .value = if (parsed) |value|
+            if (inUnsignedBounds(setting, value)) value else fallbackDurationMs(setting)
+        else
+            fallbackDurationMs(setting),
+        .source = resolved.source,
+    };
+}
+
 fn parseCInt(text: []const u8) ?i32 {
     var start: usize = 0;
     while (start < text.len and isCWhitespace(text[start])) start += 1;
@@ -784,6 +835,83 @@ fn parseCInt(text: []const u8) ?i32 {
 fn isCWhitespace(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r' or
         byte == 0x0b or byte == 0x0c;
+}
+
+const ParsedLong = struct {
+    value: c_long,
+    end: usize,
+};
+
+fn parseLongPrefix(text: []const u8) ?ParsedLong {
+    var start: usize = 0;
+    while (start < text.len and isCWhitespace(text[start])) start += 1;
+    var end = start;
+    if (end < text.len and (text[end] == '+' or text[end] == '-')) end += 1;
+    const digits_start = end;
+    while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+    if (end == digits_start) return null;
+    return .{
+        .value = std.fmt.parseInt(c_long, text[start..end], 10) catch return null,
+        .end = end,
+    };
+}
+
+fn skipUnitWhitespace(text: []const u8, start: usize) usize {
+    var end = start;
+    while (end < text.len and (text[end] == ' ' or text[end] == '\t')) end += 1;
+    return end;
+}
+
+fn parseSize(text: []const u8) ?u64 {
+    const parsed = parseLongPrefix(text) orelse return null;
+    if (parsed.value <= 0) return null;
+    var end = skipUnitWhitespace(text, parsed.end);
+    var multiplier: u64 = 1;
+    if (end < text.len) switch (text[end]) {
+        'k', 'K' => {
+            multiplier = 1024;
+            end += 1;
+        },
+        'm', 'M' => {
+            multiplier = 1024 * 1024;
+            end += 1;
+        },
+        else => {},
+    };
+    end = skipUnitWhitespace(text, end);
+    if (end != text.len) return null;
+    const value: u64 = @intCast(parsed.value);
+    const long_max: u64 = @intCast(std.math.maxInt(c_long));
+    if (value > long_max / multiplier) return null;
+    return value * multiplier;
+}
+
+fn parseDurationMs(text: []const u8) ?u64 {
+    const parsed = parseLongPrefix(text) orelse return null;
+    if (parsed.value < 0) return null;
+    var end = skipUnitWhitespace(text, parsed.end);
+    var multiplier: u64 = undefined;
+    if (end + 1 < text.len and (text[end] == 'm' or text[end] == 'M') and
+        (text[end + 1] == 's' or text[end + 1] == 'S'))
+    {
+        multiplier = 1;
+        end += 2;
+    } else if (end == text.len or text[end] == 's' or text[end] == 'S') {
+        multiplier = 1000;
+        if (end < text.len) end += 1;
+    } else if (text[end] == 'm' or text[end] == 'M') {
+        multiplier = 60_000;
+        end += 1;
+    } else if (text[end] == 'h' or text[end] == 'H') {
+        multiplier = 3_600_000;
+        end += 1;
+    } else return null;
+    end = skipUnitWhitespace(text, end);
+    if (end != text.len) return null;
+    const value: u64 = @intCast(parsed.value);
+    const long_max: u64 = @intCast(std.math.maxInt(c_long));
+    if (value > long_max / multiplier) return null;
+    return value * multiplier;
 }
 
 fn inBounds(setting: ?*const Setting, value: i32) bool {
@@ -797,6 +925,29 @@ fn fallbackInt(setting: ?*const Setting) i32 {
     const metadata = setting orelse return 0;
     const text = metadata.default orelse return 0;
     return parseCInt(text) orelse 0;
+}
+
+fn inUnsignedBounds(setting: ?*const Setting, value: u64) bool {
+    const metadata = setting orelse return true;
+    if (metadata.min) |minimum| {
+        if (minimum >= 0 and value < @as(u64, @intCast(minimum))) return false;
+    }
+    if (metadata.max) |maximum| {
+        if (maximum < 0 or value > @as(u64, @intCast(maximum))) return false;
+    }
+    return true;
+}
+
+fn fallbackSize(setting: ?*const Setting) u64 {
+    const metadata = setting orelse return 0;
+    const text = metadata.default orelse return 0;
+    return parseSize(text) orelse 0;
+}
+
+fn fallbackDurationMs(setting: ?*const Setting) u64 {
+    const metadata = setting orelse return 0;
+    const text = metadata.default orelse return 0;
+    return parseDurationMs(text) orelse 0;
 }
 
 fn parseBool(text: []const u8) ?bool {
@@ -955,6 +1106,113 @@ test "Store adapter and typed getters preserve fallbacks bounds and source" {
     try std.testing.expect(!disabled.value);
 }
 
+test "size parser matches hax thresholds whitespace and overflow" {
+    const long_max = comptime @as(u64, @intCast(std.math.maxInt(c_long)));
+    const long_max_text = std.fmt.comptimePrint("{d}", .{long_max});
+    const long_overflow_text = std.fmt.comptimePrint("{d}", .{@as(u128, long_max) + 1});
+    const multiplied_overflow_text = std.fmt.comptimePrint("{d}k", .{long_max / 1024 + 1});
+
+    try std.testing.expectEqual(@as(?u64, 1), parseSize("1"));
+    try std.testing.expectEqual(@as(?u64, 1024), parseSize(" \t+1 \tK\t"));
+    try std.testing.expectEqual(@as(?u64, 2 * 1024 * 1024), parseSize("\n2m"));
+    try std.testing.expectEqual(@as(?u64, long_max), parseSize(long_max_text));
+
+    const invalid = [_][]const u8{
+        "",
+        " \t",
+        "0",
+        "-1",
+        "1g",
+        "1kb",
+        "1k\n",
+        long_overflow_text,
+        multiplied_overflow_text,
+    };
+    for (&invalid) |text| try std.testing.expect(parseSize(text) == null);
+}
+
+test "duration parser matches hax units whitespace and overflow" {
+    const long_max = comptime @as(u64, @intCast(std.math.maxInt(c_long)));
+    const long_max_ms = std.fmt.comptimePrint("{d}ms", .{long_max});
+    const long_overflow_ms = std.fmt.comptimePrint("{d}ms", .{@as(u128, long_max) + 1});
+    const seconds_threshold = long_max / 1000;
+    const maximum_seconds = std.fmt.comptimePrint("{d}s", .{seconds_threshold});
+    const overflowing_seconds = std.fmt.comptimePrint("{d}s", .{seconds_threshold + 1});
+    const overflowing_default_seconds = std.fmt.comptimePrint("{d}", .{long_max});
+
+    try std.testing.expectEqual(@as(?u64, 0), parseDurationMs("0"));
+    try std.testing.expectEqual(@as(?u64, 0), parseDurationMs("-0ms"));
+    try std.testing.expectEqual(@as(?u64, 12_000), parseDurationMs(" \t+12 \tS\t"));
+    try std.testing.expectEqual(@as(?u64, 12), parseDurationMs("12mS"));
+    try std.testing.expectEqual(@as(?u64, 120_000), parseDurationMs("2M"));
+    try std.testing.expectEqual(@as(?u64, 7_200_000), parseDurationMs("2h"));
+    try std.testing.expectEqual(@as(?u64, long_max), parseDurationMs(long_max_ms));
+    try std.testing.expectEqual(@as(?u64, seconds_threshold * 1000), parseDurationMs(maximum_seconds));
+
+    const invalid = [_][]const u8{
+        "",
+        " \t",
+        "-1ms",
+        "1d",
+        "1m s",
+        "1ms\n",
+        long_overflow_ms,
+        overflowing_seconds,
+        overflowing_default_seconds,
+    };
+    for (&invalid) |text| try std.testing.expect(parseDurationMs(text) == null);
+}
+
+test "size and duration getters preserve source and use converted bounds" {
+    const invalid_size: MapEnvironment = .{ .name = "HAX_TOOL_OUTPUT_CAP", .value = "0" };
+    const size_fallback = try getSize(testStore(&invalid_size), std.testing.allocator, "tool_output_cap");
+    try std.testing.expectEqual(@as(u64, 50 * 1024), size_fallback.value);
+    try std.testing.expectEqual(Store.Source.env, size_fallback.source);
+
+    const custom_size: MapEnvironment = .{ .name = "HAX_TOOL_OUTPUT_CAP", .value = "2M" };
+    const size = try getSize(testStore(&custom_size), std.testing.allocator, "tool_output_cap");
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), size.value);
+    try std.testing.expectEqual(Store.Source.env, size.source);
+
+    const excessive_grace: MapEnvironment = .{ .name = "HAX_BASH_TIMEOUT_GRACE", .value = "301s" };
+    const duration_fallback = try getDurationMs(
+        testStore(&excessive_grace),
+        std.testing.allocator,
+        "bash.timeout_grace",
+    );
+    try std.testing.expectEqual(@as(u64, 2_000), duration_fallback.value);
+    try std.testing.expectEqual(Store.Source.env, duration_fallback.source);
+
+    const maximum_grace: MapEnvironment = .{ .name = "HAX_BASH_TIMEOUT_GRACE", .value = "300000ms" };
+    const duration = try getDurationMs(testStore(&maximum_grace), std.testing.allocator, "bash.timeout_grace");
+    try std.testing.expectEqual(@as(u64, 300_000), duration.value);
+
+    const below_minimum: MapEnvironment = .{ .name = "HAX_HTTP_RETRY_BASE", .value = "0ms" };
+    const minimum_fallback = try getDurationMs(
+        testStore(&below_minimum),
+        std.testing.allocator,
+        "http.retry_base",
+    );
+    try std.testing.expectEqual(@as(u64, 1_000), minimum_fallback.value);
+
+    const unknown = try getDurationMs(testStore(&below_minimum), std.testing.allocator, "unknown");
+    try std.testing.expectEqual(@as(u64, 0), unknown.value);
+    try std.testing.expectEqual(Store.Source.default, unknown.source);
+
+    const bounded_size: Setting = .{
+        .key = "test",
+        .env = "TEST",
+        .default = "1k",
+        .keep_empty = false,
+        .kind = .size,
+        .min = 1024,
+        .max = 2048,
+        .description = "test",
+    };
+    try std.testing.expect(inUnsignedBounds(&bounded_size, parseSize("1k").?));
+    try std.testing.expect(!inUnsignedBounds(&bounded_size, parseSize("3k").?));
+}
+
 test "typed getter allocation failures are explicit" {
     const empty: EmptyEnvironment = .{};
     const store = testStore(&empty);
@@ -964,6 +1222,8 @@ test "typed getter allocation failures are explicit" {
             defer text.deinit(allocator);
             _ = try getInt(value, allocator, "compact.threshold");
             _ = try getBool(value, allocator, "markdown");
+            _ = try getSize(value, allocator, "tool_output_cap");
+            _ = try getDurationMs(value, allocator, "bash.timeout");
         }
     }.exercise, .{store});
 }
