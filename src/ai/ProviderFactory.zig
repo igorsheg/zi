@@ -15,12 +15,14 @@ const Transport = @import("Transport.zig");
 /// `resolved`, its borrowed configuration, and the transport implementation must
 /// outlive this value and every provider handle returned by `provider`. Put an
 /// Owner in its final location before calling `provider`; moving or copying it
-/// afterwards invalidates those handles. Calls through copied handles must not
-/// overlap, because streaming mutates `next_input_tokens` synchronously.
+/// afterwards invalidates those handles. The operation mutex serializes streams,
+/// input-token updates, and plan replacement. Mutation from a transport or sink
+/// callback is not allowed because those callbacks run inside the operation.
 pub const Owner = struct {
     resolved: *const ProviderRegistry.Resolved,
     transport: Transport.Transport,
     next_input_tokens: u64,
+    operation_mutex: std.Io.Mutex,
 
     pub fn init(
         resolved: *const ProviderRegistry.Resolved,
@@ -31,6 +33,7 @@ pub const Owner = struct {
             .resolved = resolved,
             .transport = transport,
             .next_input_tokens = next_input_tokens,
+            .operation_mutex = .init,
         };
     }
 
@@ -39,8 +42,20 @@ pub const Owner = struct {
         return Provider.Provider.from(self, self.resolved.metadata.provider_id);
     }
 
-    pub fn setInputTokens(self: *Owner, input_tokens: u64) void {
+    pub fn setInputTokens(self: *Owner, io: std.Io, input_tokens: u64) void {
+        self.operation_mutex.lockUncancelable(io);
+        defer self.operation_mutex.unlock(io);
         self.next_input_tokens = input_tokens;
+    }
+
+    /// Locks the resolved plan for a transactional replacement. Callers must
+    /// pair a successful call with `unlockPlan`.
+    pub fn lockPlan(self: *Owner, io: std.Io) void {
+        self.operation_mutex.lockUncancelable(io);
+    }
+
+    pub fn unlockPlan(self: *Owner, io: std.Io) void {
+        self.operation_mutex.unlock(io);
     }
 
     pub fn stream(
@@ -50,6 +65,9 @@ pub const Owner = struct {
         request: Provider.Request,
         sink: Provider.EventSink,
     ) Provider.StreamError!void {
+        self.operation_mutex.lockUncancelable(io);
+        defer self.operation_mutex.unlock(io);
+
         const plan = self.resolved.adapterForInput(self.next_input_tokens);
         var tracking_sink: TrackingSink = .{ .downstream = sink };
         const erased_sink = Provider.EventSink.from(&tracking_sink);

@@ -167,41 +167,105 @@ const WipingAllocator = struct {
     }
 };
 
-/// Stable, heap-addressed provider composition. Every string retained by the
-/// registry plan is copied into this object's wiping arena. `codex_source` is
-/// borrowed, not owned, and must follow the lifetime rule on Inputs. The
-/// resolved field has a final stable address suitable for a separately stable
-/// ProviderFactory.Owner. Call `deinit` exactly once.
+/// Stable, heap-addressed provider composition. Every borrowed resolver input
+/// retained by the registry plan is copied into this object's wiping arena. A
+/// plan-owned endpoint uses the wiping allocator directly so a successful swap
+/// can release it. `codex_source` is borrowed, not owned, and must follow the
+/// lifetime rule on Inputs. The resolved field has a final stable address
+/// suitable for a separately stable ProviderFactory.Owner. Call `deinit` exactly once.
 pub const Owned = struct {
     parent_allocator: std.mem.Allocator,
     wiping_allocator: WipingAllocator,
     arena: std.heap.ArenaAllocator,
     resolved: Registry.Resolved,
     model: []const u8,
+    /// Original requested policy before catalog-dependent clamping. An empty
+    /// slice is an explicit clear; null means no requested policy.
+    requested_effort: ?[]const u8,
     effort: ?[]const u8,
     keep_model_order: bool,
     provider_autoselected: bool,
-    /// Inline copies retained so a late catalog refresh never borrows input data.
+    /// Pure resolver inputs retained so an authoritative catalog result can
+    /// transactionally rebuild the complete adapter plan without borrowing the
+    /// caller's configuration.
+    descriptor: *const Registry.Descriptor,
+    auth: Registry.Auth,
+    overrides: Registry.Overrides,
+    rules: Registry.Rules,
+    http_policy: HttpPolicy,
     reported_metadata: ai.ModelMeta.Metadata,
     explicit_catalog_metadata: ai.ModelCatalog.Contribution,
+    catalog_contribution: ai.ModelCatalog.Contribution,
+    catalog_authoritative: bool,
 
-    /// Replaces stale cached catalog facts with a refreshed contribution. Explicit
-    /// configuration still wins the refresh, then provider-reported facts win both.
-    pub fn mergeRefreshedCatalog(
+    /// True only before an authoritative lookup when an unknown catalog wire can
+    /// change the effective routing decision for this model.
+    pub fn catalogWirePending(self: *const Owned) bool {
+        if (self.catalog_authoritative) return false;
+        const catalog = ai.ModelCatalog.merge(
+            &self.explicit_catalog_metadata,
+            &self.catalog_contribution,
+        );
+        const hints: Registry.ModelHints = .{
+            .reported = &self.reported_metadata,
+            .catalog = &catalog.metadata,
+            .catalog_wire = registryWireHint(catalog.wire),
+        };
+        return Registry.catalogWirePending(
+            self.descriptor,
+            self.model,
+            self.overrides,
+            hints,
+            self.rules,
+        ) catch unreachable;
+    }
+
+    /// Rebuilds the complete plan from retained inputs. Explicit catalog facts
+    /// win field by field over this authoritative contribution. The stable
+    /// `resolved` field address changes value only after the new plan succeeds.
+    pub fn applyAuthoritativeCatalog(
         self: *Owned,
         contribution: ai.ModelCatalog.Contribution,
-    ) void {
-        if (self.resolved.metadata.catalog_id == null) {
-            self.resolved.metadata.model = self.reported_metadata;
-            return;
-        }
+    ) ResolveError!void {
         const catalog = ai.ModelCatalog.merge(&self.explicit_catalog_metadata, &contribution);
-        self.resolved.metadata.model = ai.ModelMeta.merge(&self.reported_metadata, &catalog.metadata);
+        const hints: Registry.ModelHints = .{
+            .reported = &self.reported_metadata,
+            .catalog = &catalog.metadata,
+            .catalog_wire = registryWireHint(catalog.wire),
+        };
+        var next = try Registry.resolveDescriptor(
+            self.wiping_allocator.allocator(),
+            self.descriptor,
+            self.model,
+            self.auth,
+            self.overrides,
+            hints,
+            self.rules,
+        );
+        errdefer next.deinit();
+        applyHttpPolicy(&next.adapter, self.http_policy);
+        const effort_allocator = self.wiping_allocator.allocator();
+        const next_effort = try clampEffort(
+            effort_allocator,
+            self.requested_effort,
+            &next,
+        );
+        errdefer freeEffort(effort_allocator, next_effort);
+
+        var previous = self.resolved;
+        const previous_effort = self.effort;
+        self.resolved = next;
+        self.effort = next_effort;
+        self.catalog_contribution = contribution;
+        self.catalog_authoritative = true;
+        previous.deinit();
+        freeEffort(effort_allocator, previous_effort);
     }
 
     pub fn deinit(self: *Owned) void { // ziglint-ignore: Z030
         const parent = self.parent_allocator;
         self.resolved.deinit();
+        freeEffort(self.wiping_allocator.allocator(), self.effort);
         self.arena.deinit();
         self.* = undefined;
         parent.destroy(self);
@@ -225,7 +289,7 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
     const dynamic = compiled_descriptor == null;
     const descriptor = if (compiled_descriptor) |value| blk: {
         if (!isSupportedPlan(value.id)) return error.UnknownProvider;
-        break :blk value;
+        break :blk try copyDescriptor(allocator, value);
     } else try dynamicDescriptor(allocator, definition orelse return error.UnknownProvider);
 
     var overrides: Registry.Overrides = .{
@@ -255,29 +319,30 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
     );
     const model = try selectModel(allocator, inputs.store, descriptor.id, inputs);
 
-    // Retain the two higher-precedence sources by value. The cached contribution
-    // is only an initial fallback and can be replaced by a late refresh.
+    // Retain every hint source by value. The cache-only contribution is an
+    // initial fallback and is replaced by an authoritative late result.
     owned.reported_metadata = if (inputs.hints.reported) |value| value.* else .{};
     owned.explicit_catalog_metadata = .{
         .metadata = if (inputs.hints.catalog) |value| value.* else .{},
         .wire = explicitCatalogWireHint(inputs.hints),
     };
-    var source_contribution: ai.ModelCatalog.Contribution = undefined;
-    var merged_contribution: ai.ModelCatalog.Contribution = undefined;
-    var effective_hints = inputs.hints;
+    owned.catalog_contribution = .{};
     if (inputs.hints_source) |source| {
         const lookup_provider_id = if (overrides.catalog_id) |value|
             if (value.len == 0) descriptor.id else value
         else
             descriptor.catalog_id orelse descriptor.id;
-        source_contribution = try source.lookup(allocator, lookup_provider_id, model);
-        merged_contribution = ai.ModelCatalog.merge(
-            &owned.explicit_catalog_metadata,
-            &source_contribution,
-        );
-        effective_hints.catalog = &merged_contribution.metadata;
-        effective_hints.catalog_wire = registryWireHint(merged_contribution.wire);
+        owned.catalog_contribution = try source.lookup(allocator, lookup_provider_id, model);
     }
+    const merged_contribution = ai.ModelCatalog.merge(
+        &owned.explicit_catalog_metadata,
+        &owned.catalog_contribution,
+    );
+    const effective_hints: Registry.ModelHints = .{
+        .reported = &owned.reported_metadata,
+        .catalog = &merged_contribution.metadata,
+        .catalog_wire = registryWireHint(merged_contribution.wire),
+    };
 
     const rules = if (dynamic or descriptor.kind == .recipe) blk: {
         try validateCombinedRules(descriptor.id, definition, inputs.rules, model);
@@ -287,18 +352,31 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
         break :blk try copyRules(allocator, inputs.rules);
     };
 
+    owned.descriptor = descriptor;
+    owned.auth = auth;
+    owned.overrides = overrides;
+    owned.rules = rules;
+    owned.http_policy = inputs.http_policy;
+    owned.catalog_authoritative = false;
     owned.resolved = try Registry.resolveDescriptor(
-        allocator,
-        descriptor,
+        owned.wiping_allocator.allocator(),
+        owned.descriptor,
         model,
-        auth,
-        overrides,
+        owned.auth,
+        owned.overrides,
         effective_hints,
-        rules,
+        owned.rules,
     );
-    applyHttpPolicy(&owned.resolved.adapter, inputs.http_policy);
+    errdefer owned.resolved.deinit();
+    applyHttpPolicy(&owned.resolved.adapter, owned.http_policy);
     owned.model = owned.resolved.metadata.model_id;
-    owned.effort = try selectEffort(allocator, inputs.store, descriptor.id, inputs, &owned.resolved);
+    owned.requested_effort = try selectRequestedEffort(allocator, inputs.store, descriptor.id, inputs);
+    owned.effort = try clampEffort(
+        owned.wiping_allocator.allocator(),
+        owned.requested_effort,
+        &owned.resolved,
+    );
+    errdefer freeEffort(owned.wiping_allocator.allocator(), owned.effort);
     owned.keep_model_order = !(if (definition) |value| value.sort_models orelse true else true);
     owned.provider_autoselected = !selection.explicit;
     return owned;
@@ -466,23 +544,37 @@ fn selectModel(
     return allocator.dupe(u8, fallback orelse return error.MissingModel);
 }
 
-fn selectEffort(
+fn selectRequestedEffort(
     allocator: std.mem.Allocator,
     store: Store,
     provider: []const u8,
     inputs: Inputs,
-    resolved: *const Registry.Resolved,
 ) !?[]const u8 {
     const selected = try store.readForProvider(allocator, "effort", provider);
-    if (selected.value) |value| if (value.len == 0) return null;
-    const requested = selected.value orelse if (std.mem.eql(u8, provider, "codex"))
-        inputs.default_effort
-    else
-        null;
+    if (selected.value) |value| return value;
+    if (selected.source != .default) return null;
+    if (!std.mem.eql(u8, provider, "codex")) return null;
+    const fallback = inputs.default_effort orelse return null;
+    const copy: []const u8 = try allocator.dupe(u8, fallback);
+    return copy;
+}
+
+fn clampEffort(
+    allocator: std.mem.Allocator,
+    requested: ?[]const u8,
+    resolved: *const Registry.Resolved,
+) !?[]const u8 {
     const value = requested orelse return null;
     const clamped = resolved.metadata.efforts.clamp(value) orelse return null;
+    if (clamped.len == 0) return "";
     const copy: []const u8 = try allocator.dupe(u8, clamped);
     return copy;
+}
+
+fn freeEffort(allocator: std.mem.Allocator, effort: ?[]const u8) void {
+    const value = effort orelse return;
+    if (value.len == 0) return;
+    allocator.free(@constCast(value));
 }
 
 fn findDefinition(definitions: []const Definition, provider: []const u8) ?Definition {
@@ -490,6 +582,19 @@ fn findDefinition(definitions: []const Definition, provider: []const u8) ?Defini
         if (std.mem.eql(u8, definition.id, provider)) return definition;
     }
     return null;
+}
+
+fn copyDescriptor(
+    allocator: std.mem.Allocator,
+    source: *const Registry.Descriptor,
+) ResolveError!*Registry.Descriptor {
+    const descriptor = try allocator.create(Registry.Descriptor);
+    descriptor.* = source.*;
+    descriptor.id = try allocator.dupe(u8, source.id);
+    descriptor.display_name = try allocator.dupe(u8, source.display_name);
+    descriptor.base_url = if (source.base_url) |value| try allocator.dupe(u8, value) else null;
+    descriptor.catalog_id = if (source.catalog_id) |value| try allocator.dupe(u8, value) else null;
+    return descriptor;
 }
 
 fn dynamicDescriptor(
@@ -2131,6 +2236,8 @@ const ObservingAllocator = struct {
     fail_index: ?usize = null,
     allocations: usize = 0,
     frees: usize = 0,
+    live_bytes: usize = 0,
+    peak_live_bytes: usize = 0,
     zeroed_frees: usize = 0,
     secret_seen_on_free: bool = false,
 
@@ -2150,7 +2257,10 @@ const ObservingAllocator = struct {
         const index = self.allocations;
         self.allocations += 1;
         if (self.fail_index == index) return null;
-        return self.backing.rawAlloc(len, alignment, ret_addr);
+        const memory = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
+        return memory;
     }
 
     fn resize(
@@ -2161,7 +2271,14 @@ const ObservingAllocator = struct {
         ret_addr: usize,
     ) bool {
         const self: *ObservingAllocator = @ptrCast(@alignCast(context));
-        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (new_len >= memory.len) {
+            self.live_bytes += new_len - memory.len;
+        } else {
+            self.live_bytes -= memory.len - new_len;
+        }
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
+        return true;
     }
 
     fn remap(
@@ -2172,7 +2289,14 @@ const ObservingAllocator = struct {
         ret_addr: usize,
     ) ?[*]u8 {
         const self: *ObservingAllocator = @ptrCast(@alignCast(context));
-        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+        const remapped = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        if (new_len >= memory.len) {
+            self.live_bytes += new_len - memory.len;
+        } else {
+            self.live_bytes -= memory.len - new_len;
+        }
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
+        return remapped;
     }
 
     fn free(
@@ -2183,6 +2307,7 @@ const ObservingAllocator = struct {
     ) void {
         const self: *ObservingAllocator = @ptrCast(@alignCast(context));
         self.frees += 1;
+        self.live_bytes -= memory.len;
         if (std.mem.indexOf(u8, memory, "super-secret") != null) self.secret_seen_on_free = true;
         var all_zero = true;
         for (memory) |byte| all_zero = all_zero and byte == 0;
@@ -2717,59 +2842,6 @@ test "explicit catalog hints merge over cached metadata and wire" {
     try std.testing.expectEqual(@as(usize, 3), source.calls);
 }
 
-test "late catalog refresh preserves explicit and reported metadata precedence" {
-    const environment: TestEnvironment = .{
-        .entries = &.{.{ .name = "OPENCODE_API_KEY", .value = "key" }},
-    };
-    var document = try Document.parse(
-        std.testing.allocator,
-        "{\"provider\":\"opencode-zen\",\"model\":\"model\"}",
-        .{},
-    );
-    defer document.deinit();
-    var source: TestModelHintsSource = .{
-        .expected_provider = "opencode",
-        .expected_model = "model",
-        .contribution = .{ .metadata = .{
-            .context_window = 100,
-            .max_output = 200,
-            .rates = .{ .input = 1, .output = 1, .cache_read = 1 },
-        } },
-    };
-    var explicit: ai.ModelMeta.Metadata = .{
-        .context_window = 300,
-        .rates = .{ .output = 2 },
-    };
-    var reported: ai.ModelMeta.Metadata = .{
-        .max_output = 900,
-        .rates = .{ .input = 9 },
-    };
-    var result = try resolve(.{
-        .allocator = std.testing.allocator,
-        .store = testStore(&document, &environment),
-        .api_key_environment = .from(&environment),
-        .hints_source = .from(&source),
-        .hints = .{ .reported = &reported, .catalog = &explicit },
-    });
-    defer result.deinit();
-    try std.testing.expectEqual(@as(?f64, 1), result.resolved.metadata.model.rates.cache_read);
-
-    // The owner retained the higher-precedence sources inline.
-    explicit.context_window = 999;
-    reported.max_output = 999;
-    result.mergeRefreshedCatalog(.{ .metadata = .{
-        .context_window = 500,
-        .max_output = 700,
-        .rates = .{ .input = 4, .output = 5, .cache_read = 7 },
-    } });
-    const metadata = result.resolved.metadata.model;
-    try std.testing.expectEqual(@as(u64, 300), metadata.context_window);
-    try std.testing.expectEqual(@as(u64, 900), metadata.max_output);
-    try std.testing.expectEqual(@as(?f64, 9), metadata.rates.input);
-    try std.testing.expectEqual(@as(?f64, 2), metadata.rates.output);
-    try std.testing.expectEqual(@as(?f64, 7), metadata.rates.cache_read);
-}
-
 test "empty cached contribution preserves descriptor defaults and unsupported wire maps exactly" {
     const environment: TestEnvironment = .{
         .entries = &.{.{ .name = "OPENCODE_API_KEY", .value = "key" }},
@@ -2805,4 +2877,234 @@ test "empty cached contribution preserves descriptor defaults and unsupported wi
         .hints_source = .from(&unsupported_source),
     }));
     try std.testing.expectEqual(@as(usize, 1), unsupported_source.calls);
+}
+
+test "catalog pending respects routing and authoritative empty clears stale facts" {
+    const environment: TestEnvironment = .{};
+    var document = try Document.parse(
+        std.testing.allocator,
+        "{\"model\":\"model\"}",
+        .{},
+    );
+    defer document.deinit();
+    const catalog_definition: Definition = .{
+        .id = @constCast("pending-dynamic"),
+        .api = .catalog,
+        .base_url = @constCast("https://pending.test/v1"),
+    };
+    var source: TestModelHintsSource = .{
+        .expected_provider = "pending-dynamic",
+        .expected_model = "model",
+        .contribution = .{ .metadata = .{ .context_window = 123 } },
+    };
+    var pending = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "pending-dynamic",
+        .provider_definitions = &.{catalog_definition},
+        .hints_source = .from(&source),
+    });
+    defer pending.deinit();
+    try std.testing.expect(pending.catalogWirePending());
+    try std.testing.expectEqual(@as(u64, 123), pending.resolved.metadata.model.context_window);
+    try pending.applyAuthoritativeCatalog(.{});
+    try std.testing.expect(!pending.catalogWirePending());
+    try std.testing.expect(pending.resolved.metadata.wire == .openai_chat);
+    try std.testing.expectEqual(@as(u64, 0), pending.resolved.metadata.model.context_window);
+
+    const explicit_definition: Definition = .{
+        .id = @constCast("explicit-dynamic"),
+        .api = .openai_responses,
+        .base_url = @constCast("https://explicit.test/v1"),
+    };
+    var explicit = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "explicit-dynamic",
+        .provider_definitions = &.{explicit_definition},
+    });
+    defer explicit.deinit();
+    try std.testing.expect(!explicit.catalogWirePending());
+
+    const rule_definition: Definition = .{
+        .id = @constCast("rule-dynamic"),
+        .api = .openai_completions,
+        .base_url = @constCast("https://rules.test/v1"),
+        .model_apis_declared_nonempty = true,
+    };
+    const wire_rule: Registry.Rule = .{ .pattern = "*", .target = .{ .wire = .anthropic_messages } };
+    var concrete_rule = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "rule-dynamic",
+        .provider_definitions = &.{rule_definition},
+        .rules = .{ .values = &.{wire_rule} },
+    });
+    defer concrete_rule.deinit();
+    try std.testing.expect(!concrete_rule.catalogWirePending());
+
+    const catalog_rule: Registry.Rule = .{ .pattern = "*", .target = .catalog };
+    var routed_catalog = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "rule-dynamic",
+        .provider_definitions = &.{rule_definition},
+        .rules = .{ .values = &.{catalog_rule} },
+    });
+    defer routed_catalog.deinit();
+    try std.testing.expect(routed_catalog.catalogWirePending());
+}
+
+test "authoritative catalog reclamps the original requested effort" {
+    const environment: TestEnvironment = .{};
+    var document = try Document.parse(
+        std.testing.allocator,
+        "{\"model\":\"model\",\"effort\":\"high\"}",
+        .{},
+    );
+    defer document.deinit();
+    const definition: Definition = .{
+        .id = @constCast("effort-catalog"),
+        .api = .catalog,
+        .base_url = @constCast("https://effort.test/v1"),
+    };
+    const stale_high = try ai.Effort.Set.init(&.{"high"});
+    var source: TestModelHintsSource = .{
+        .expected_provider = "effort-catalog",
+        .expected_model = "model",
+        .contribution = .{ .metadata = .{ .efforts = stale_high } },
+    };
+    var owned = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "effort-catalog",
+        .provider_definitions = &.{definition},
+        .hints_source = .from(&source),
+    });
+    defer owned.deinit();
+    try std.testing.expectEqualStrings("high", owned.requested_effort.?);
+    try std.testing.expectEqualStrings("high", owned.effort.?);
+
+    const known_low = try ai.Effort.Set.init(&.{"low"});
+    try owned.applyAuthoritativeCatalog(.{ .metadata = .{ .efforts = known_low } });
+    try std.testing.expectEqualStrings("low", owned.effort.?);
+
+    const known_empty = try ai.Effort.Set.init(&.{});
+    try owned.applyAuthoritativeCatalog(.{ .metadata = .{ .efforts = known_empty } });
+    try std.testing.expectEqual(@as(?[]const u8, null), owned.effort);
+
+    const later_high = try ai.Effort.Set.init(&.{"high"});
+    try owned.applyAuthoritativeCatalog(.{ .metadata = .{ .efforts = later_high } });
+    try std.testing.expectEqualStrings("high", owned.effort.?);
+}
+
+test "repeated authoritative effort reclamps keep live allocation bytes bounded" {
+    const environment: TestEnvironment = .{};
+    var document = try Document.parse(
+        std.testing.allocator,
+        "{\"model\":\"model\",\"effort\":\"high\"}",
+        .{},
+    );
+    defer document.deinit();
+    const definition: Definition = .{
+        .id = @constCast("bounded-effort-catalog"),
+        .api = .catalog,
+        .base_url = @constCast("https://effort.test/v1"),
+    };
+    const initial_high = try ai.Effort.Set.init(&.{"high"});
+    const low = try ai.Effort.Set.init(&.{"low"});
+    const high = try ai.Effort.Set.init(&.{"high"});
+    var observing: ObservingAllocator = .{ .backing = std.testing.allocator };
+    var owned = try resolve(.{
+        .allocator = observing.allocator(),
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "bounded-effort-catalog",
+        .provider_definitions = &.{definition},
+        .hints = .{ .catalog = &.{ .efforts = initial_high } },
+    });
+
+    try owned.applyAuthoritativeCatalog(.{ .metadata = .{ .efforts = low } });
+    const low_live_bytes = observing.live_bytes;
+    const allocations_before_high = observing.allocations;
+    try owned.applyAuthoritativeCatalog(.{ .metadata = .{ .efforts = high } });
+    const allocations_per_apply = observing.allocations - allocations_before_high;
+    const live_byte_bound = @max(low_live_bytes, observing.live_bytes);
+
+    const live_before_oom = observing.live_bytes;
+    observing.fail_index = observing.allocations + allocations_per_apply - 1;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        owned.applyAuthoritativeCatalog(.{ .metadata = .{ .efforts = low } }),
+    );
+    try std.testing.expectEqualStrings("high", owned.effort.?);
+    try std.testing.expectEqual(live_before_oom, observing.live_bytes);
+    observing.fail_index = null;
+
+    const zeroed_before = observing.zeroed_frees;
+    for (0..2000) |index| {
+        const efforts = if (index % 2 == 0) low else high;
+        try owned.applyAuthoritativeCatalog(.{ .metadata = .{ .efforts = efforts } });
+        try std.testing.expect(observing.live_bytes <= live_byte_bound);
+    }
+    try std.testing.expectEqualStrings("high", owned.effort.?);
+    try std.testing.expect(observing.zeroed_frees >= zeroed_before + 2000);
+
+    owned.deinit();
+    try std.testing.expectEqual(@as(usize, 0), observing.live_bytes);
+}
+
+test "authoritative catalog rebuild is transactional on allocation failure" {
+    const environment: TestEnvironment = .{};
+    var document = try Document.parse(
+        std.testing.allocator,
+        "{\"model\":\"model\",\"effort\":\"high\"}",
+        .{},
+    );
+    defer document.deinit();
+    const efforts = try ai.Effort.Set.init(&.{"high"});
+    const metadata: ai.ModelMeta.Metadata = .{ .efforts = efforts };
+    const definition: Definition = .{
+        .id = @constCast("oom-catalog"),
+        .api = .catalog,
+        .base_url = @constCast("https://oom.test/v1"),
+        .api_key = @constCast("super-secret-authoritative"),
+    };
+    var observing: ObservingAllocator = .{ .backing = std.testing.allocator };
+    var owned = try resolve(.{
+        .allocator = observing.allocator(),
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "oom-catalog",
+        .provider_definitions = &.{definition},
+        .hints = .{ .catalog = &metadata },
+    });
+    observing.fail_index = observing.allocations;
+    var failed = false;
+    for (0..4096) |index| {
+        const wire: ai.Wire = if (index % 2 == 0) .anthropic_messages else .openai_responses;
+        const previous_wire = owned.resolved.metadata.wire;
+        const previous_effort = owned.effort;
+        const previous_endpoint = try std.testing.allocator.dupe(u8, owned.resolved.endpoint);
+        defer std.testing.allocator.free(previous_endpoint);
+        owned.applyAuthoritativeCatalog(.{ .wire = .{ .wire = wire } }) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(owned.resolved.metadata.wire == previous_wire);
+            try std.testing.expectEqualStrings(previous_effort.?, owned.effort.?);
+            try std.testing.expectEqualStrings(previous_endpoint, owned.resolved.endpoint);
+            failed = true;
+            break;
+        };
+    }
+    try std.testing.expect(failed);
+    observing.fail_index = null;
+    try owned.applyAuthoritativeCatalog(.{ .wire = .{ .wire = .openai_responses } });
+    try std.testing.expect(owned.resolved.adapter == .openai_responses);
+    owned.deinit();
+    try std.testing.expect(!observing.secret_seen_on_free);
 }

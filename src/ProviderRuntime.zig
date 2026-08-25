@@ -17,8 +17,9 @@ pub const InitError = ProviderConfig.ResolveError;
 /// The transport implementation and its context are borrowed and must outlive
 /// this value and every provider call. `Inputs.codex_source`, when present, is
 /// also borrowed under `ProviderConfig.Inputs`' lifetime rule. Provider calls
-/// and `setInputTokens` must not overlap. Call `deinit` exactly once, after all
-/// copied provider handles have stopped being used.
+/// are serialized with catalog replacement and input-token updates. Catalog or
+/// token mutation from a transport or sink callback is not allowed. Call
+/// `deinit` exactly once, after all copied provider handles have stopped being used.
 pub const Owned = struct {
     allocator: std.mem.Allocator,
     config: *ProviderConfig.Owned,
@@ -34,16 +35,27 @@ pub const Owned = struct {
         return self.factory.provider();
     }
 
-    pub fn setInputTokens(self: *Owned, input_tokens: u64) void {
-        self.factory.setInputTokens(input_tokens);
+    pub fn setInputTokens(self: *Owned, io: std.Io, input_tokens: u64) void {
+        self.factory.setInputTokens(io, input_tokens);
     }
 
-    /// Installs fresh catalog facts without changing provider or wire selection.
-    pub fn mergeRefreshedCatalog(
+    pub fn catalogWirePending(self: *Owned, io: std.Io) bool {
+        self.factory.lockPlan(io);
+        defer self.factory.unlockPlan(io);
+        return self.config.catalogWirePending();
+    }
+
+    /// Transactionally rebuilds the provider plan from an authoritative catalog
+    /// result while preserving existing provider handles.
+    pub fn applyAuthoritativeCatalog(
         self: *Owned,
+        io: std.Io,
         contribution: ai.ModelCatalog.Contribution,
-    ) void {
-        self.config.mergeRefreshedCatalog(contribution);
+    ) InitError!void {
+        self.factory.lockPlan(io);
+        defer self.factory.unlockPlan(io);
+        try self.config.applyAuthoritativeCatalog(contribution);
+        self.effort = self.config.effort;
     }
 
     /// Destroys the factory before wiping and destroying resolved configuration.
@@ -130,6 +142,11 @@ const TestCodexSource = struct {
 
 const FakeTransport = struct {
     calls: usize = 0,
+    chat_calls: usize = 0,
+    responses_calls: usize = 0,
+    anthropic_calls: usize = 0,
+    rewire_auth_valid: bool = true,
+    rewire_body_valid: bool = true,
     saw_cache_a: bool = false,
     saw_cache_b: bool = false,
 
@@ -145,17 +162,41 @@ const FakeTransport = struct {
             std.mem.find(u8, request.json_body, "12345678-1234-4234-8234-123456789abc") != null;
         self.saw_cache_b = self.saw_cache_b or
             std.mem.find(u8, request.json_body, "abcdefab-cdef-4abc-8def-abcdefabcdef") != null;
+        var bearer_secret = false;
+        var anthropic_secret = false;
+        for (request.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "authorization")) {
+                bearer_secret = std.mem.eql(u8, header.value, "Bearer runtime-secret");
+            }
+            if (std.ascii.eqlIgnoreCase(header.name, "x-api-key")) {
+                anthropic_secret = std.mem.eql(u8, header.value, "runtime-secret");
+            }
+        }
         if (std.mem.endsWith(u8, request.url, "/chat/completions")) {
+            self.chat_calls += 1;
+            self.rewire_auth_valid = self.rewire_auth_valid and bearer_secret;
+            self.rewire_body_valid = self.rewire_body_valid and
+                std.mem.eql(u8, request.url, "https://runtime.test/v1/chat/completions") and
+                std.mem.find(u8, request.json_body, "\"messages\":[") != null;
             try sink.emit(.{ .data = "{\"id\":\"r\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}" });
             try sink.emit(.{ .data = "{\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1},\"choices\":[]}" });
             try sink.emit(.{ .data = "[DONE]" });
         } else if (std.mem.endsWith(u8, request.url, "/messages")) {
+            self.anthropic_calls += 1;
+            self.rewire_auth_valid = self.rewire_auth_valid and anthropic_secret;
+            self.rewire_body_valid = self.rewire_body_valid and
+                std.mem.eql(u8, request.url, "https://runtime.test/v1/messages") and
+                std.mem.find(u8, request.json_body, "\"messages\":[") != null;
             try sink.emit(.{ .data = "{\"type\":\"message_start\",\"message\":{" ++
                 "\"id\":\"r\",\"model\":\"model\",\"usage\":{\"input_tokens\":2}}}" });
             try sink.emit(.{ .data = "{\"type\":\"message_delta\",\"delta\":{" ++
                 "\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}" });
             try sink.emit(.{ .data = "{\"type\":\"message_stop\"}" });
         } else {
+            self.responses_calls += 1;
+            self.rewire_auth_valid = self.rewire_auth_valid and bearer_secret;
+            self.rewire_body_valid = self.rewire_body_valid and
+                std.mem.find(u8, request.json_body, "\"input\":[") != null;
             try sink.emit(.{ .data = "{\"type\":\"response.completed\",\"response\":{" ++
                 "\"id\":\"r\",\"model\":\"model\",\"usage\":{" ++
                 "\"input_tokens\":2,\"output_tokens\":1}}}" });
@@ -219,7 +260,7 @@ test "composition streams every wire family and remains stable when its handle m
         try std.testing.expectEqualStrings(case.id, moved.metadata.provider_id);
         try std.testing.expect(moved.keep_model_order);
         try std.testing.expect(!moved.provider_autoselected);
-        moved.setInputTokens(12);
+        moved.setInputTokens(std.testing.io, 12);
         try streamRuntime(&moved, &collector);
         moved.deinit();
     }
@@ -243,6 +284,254 @@ test "composition streams every wire family and remains stable when its handle m
     try streamRuntime(&codex, &collector);
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
     try std.testing.expectEqual(@as(usize, 4), collector.done);
+}
+
+test "authoritative catalog rewires an existing provider handle" {
+    const environment: TestEnvironment = .{};
+    var document = try config_module.Document.parse(
+        std.testing.allocator,
+        "{\"model\":\"model\"}",
+        .{},
+    );
+    defer document.deinit();
+    const definition: config_module.ProviderDefinitions.Definition = .{
+        .id = @constCast("dynamic-catalog"),
+        .api = .catalog,
+        .base_url = @constCast("https://runtime.test/v1"),
+        .api_key = @constCast("runtime-secret"),
+    };
+    var fake: FakeTransport = .{};
+    var runtime = try init(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "dynamic-catalog",
+        .provider_definitions = &.{definition},
+    }, Transport.Transport.from(&fake), 0);
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.catalogWirePending(std.testing.io));
+    const provider = runtime.provider();
+    var collector: Collector = .{};
+    const request: Provider.Request = .{
+        .model = runtime.model,
+        .context = .{ .system_prompt = "system", .items = &.{}, .tools = &.{} },
+    };
+    try provider.stream(
+        std.testing.allocator,
+        std.testing.io,
+        request,
+        Provider.EventSink.from(&collector),
+    );
+    try runtime.applyAuthoritativeCatalog(std.testing.io, .{ .wire = .{ .wire = .anthropic_messages } });
+    try std.testing.expect(!runtime.catalogWirePending(std.testing.io));
+    try provider.stream(
+        std.testing.allocator,
+        std.testing.io,
+        request,
+        Provider.EventSink.from(&collector),
+    );
+    try runtime.applyAuthoritativeCatalog(std.testing.io, .{ .wire = .{ .wire = .openai_responses } });
+    try provider.stream(
+        std.testing.allocator,
+        std.testing.io,
+        request,
+        Provider.EventSink.from(&collector),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.chat_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.anthropic_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.responses_calls);
+    try std.testing.expect(fake.rewire_auth_valid);
+    try std.testing.expect(fake.rewire_body_valid);
+    try std.testing.expectEqual(@as(usize, 3), collector.done);
+}
+
+test "runtime effort changes only after a successful authoritative apply" {
+    const environment: TestEnvironment = .{};
+    var document = try config_module.Document.parse(std.testing.allocator, "{}", .{});
+    defer document.deinit();
+    var source: TestCodexSource = .{};
+    var fake: FakeTransport = .{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+    });
+    var runtime = try init(.{
+        .allocator = failing.allocator(),
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .codex_available = true,
+        .codex_source = .from(&source),
+        .default_model = "model",
+        .default_effort = "high",
+        .session_cache_key = "12345678-1234-4234-8234-123456789abc",
+    }, Transport.Transport.from(&fake), 0);
+    defer runtime.deinit();
+    try std.testing.expectEqualStrings("high", runtime.effort.?);
+
+    const low = try ai.Effort.Set.init(&.{"low"});
+    try runtime.applyAuthoritativeCatalog(std.testing.io, .{ .metadata = .{ .efforts = low } });
+    try std.testing.expectEqualStrings("low", runtime.effort.?);
+    failing.fail_index = failing.alloc_index;
+    const high = try ai.Effort.Set.init(&.{"high"});
+    try std.testing.expectError(error.OutOfMemory, runtime.applyAuthoritativeCatalog(
+        std.testing.io,
+        .{ .metadata = .{ .efforts = high } },
+    ));
+    try std.testing.expectEqualStrings("low", runtime.effort.?);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try runtime.applyAuthoritativeCatalog(std.testing.io, .{ .metadata = .{ .efforts = high } });
+    try std.testing.expectEqualStrings("high", runtime.effort.?);
+}
+
+test "catalog apply waits for an in-flight old provider handle" {
+    const BlockingTransport = struct {
+        const Self = @This();
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        calls: usize = 0,
+        old_endpoint_valid: bool = false,
+        new_endpoint_valid: bool = false,
+
+        pub fn ssePost(
+            _: std.mem.Allocator,
+            io: std.Io,
+            self: *Self,
+            request: Transport.Request,
+            sink: Transport.EventSink,
+        ) Transport.StreamError!Transport.Result {
+            self.calls += 1;
+            if (self.calls == 1) {
+                self.entered.set(io);
+                self.release.waitUncancelable(io);
+                self.old_endpoint_valid = std.mem.eql(
+                    u8,
+                    request.url,
+                    "https://blocked.test/v1/chat/completions",
+                );
+                try sink.emit(.{ .data = "{\"id\":\"r\",\"choices\":[{" ++
+                    "\"delta\":{},\"finish_reason\":\"stop\"}]}" });
+                try sink.emit(.{ .data = "[DONE]" });
+            } else {
+                self.new_endpoint_valid = std.mem.eql(
+                    u8,
+                    request.url,
+                    "https://blocked.test/v1/messages",
+                );
+                try sink.emit(.{ .data = "{\"type\":\"message_start\",\"message\":{" ++
+                    "\"id\":\"r\",\"model\":\"model\",\"usage\":{\"input_tokens\":2}}}" });
+                try sink.emit(.{ .data = "{\"type\":\"message_delta\",\"delta\":{" ++
+                    "\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}" });
+                try sink.emit(.{ .data = "{\"type\":\"message_stop\"}" });
+            }
+            return .{ .status = 200, .outcome = .completed };
+        }
+    };
+    const StreamThread = struct {
+        const Self = @This();
+        runtime: *Owned,
+        collector: *Collector,
+        result: ?anyerror = null,
+
+        fn run(self: *Self) void {
+            streamRuntime(self.runtime, self.collector) catch |err| {
+                self.result = err;
+            };
+        }
+    };
+    const ApplyThread = struct {
+        const Self = @This();
+        runtime: *Owned,
+        started: std.Io.Event = .unset,
+        finished: std.Io.Event = .unset,
+        result: ?anyerror = null,
+
+        fn run(self: *Self) void {
+            self.started.set(std.testing.io);
+            self.runtime.applyAuthoritativeCatalog(std.testing.io, .{
+                .wire = .{ .wire = .anthropic_messages },
+            }) catch |err| {
+                self.result = err;
+            };
+            self.finished.set(std.testing.io);
+        }
+    };
+    const QueryThread = struct {
+        const Self = @This();
+        runtime: *Owned,
+        started: std.Io.Event = .unset,
+        finished: std.Io.Event = .unset,
+        pending: bool = false,
+
+        fn run(self: *Self) void {
+            self.started.set(std.testing.io);
+            self.pending = self.runtime.catalogWirePending(std.testing.io);
+            self.finished.set(std.testing.io);
+        }
+    };
+
+    const environment: TestEnvironment = .{};
+    var document = try config_module.Document.parse(
+        std.testing.allocator,
+        "{\"model\":\"model\"}",
+        .{},
+    );
+    defer document.deinit();
+    const definition: config_module.ProviderDefinitions.Definition = .{
+        .id = @constCast("blocked-catalog"),
+        .api = .catalog,
+        .base_url = @constCast("https://blocked.test/v1"),
+    };
+    var transport: BlockingTransport = .{};
+    var runtime = try init(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "blocked-catalog",
+        .provider_definitions = &.{definition},
+    }, Transport.Transport.from(&transport), 0);
+    defer runtime.deinit();
+    const old_handle = runtime.provider();
+    var collector: Collector = .{};
+
+    var stream_context: StreamThread = .{ .runtime = &runtime, .collector = &collector };
+    var stream_thread = try std.Thread.spawn(.{}, StreamThread.run, .{&stream_context});
+    defer {
+        transport.release.set(std.testing.io);
+        stream_thread.join();
+    }
+    transport.entered.waitUncancelable(std.testing.io);
+    try std.testing.expect(!runtime.factory.operation_mutex.tryLock());
+
+    var query_context: QueryThread = .{ .runtime = &runtime };
+    var query_thread = try std.Thread.spawn(.{}, QueryThread.run, .{&query_context});
+    defer query_thread.join();
+    query_context.started.waitUncancelable(std.testing.io);
+    try std.testing.expect(!query_context.finished.isSet());
+
+    var apply_context: ApplyThread = .{ .runtime = &runtime };
+    var apply_thread = try std.Thread.spawn(.{}, ApplyThread.run, .{&apply_context});
+    defer apply_thread.join();
+    apply_context.started.waitUncancelable(std.testing.io);
+    try std.testing.expect(!apply_context.finished.isSet());
+    transport.release.set(std.testing.io);
+    query_context.finished.waitUncancelable(std.testing.io);
+    apply_context.finished.waitUncancelable(std.testing.io);
+
+    if (stream_context.result) |err| return err;
+    if (apply_context.result) |err| return err;
+    try old_handle.stream(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .model = runtime.model,
+            .context = .{ .system_prompt = "system", .items = &.{}, .tools = &.{} },
+        },
+        Provider.EventSink.from(&collector),
+    );
+    try std.testing.expect(transport.old_endpoint_valid);
+    try std.testing.expect(transport.new_endpoint_valid);
+    try std.testing.expectEqual(@as(usize, 2), collector.done);
 }
 
 fn exerciseInitAllocationFailures(

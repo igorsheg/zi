@@ -486,6 +486,36 @@ pub fn validateRules(rules: Rules, model_id: []const u8) Error!void {
     }
 }
 
+/// Reports whether resolving this model may change wire after an unknown catalog
+/// wire becomes available. Inputs must satisfy the same validation contract as
+/// `resolveDescriptor`.
+pub fn catalogWirePending(
+    descriptor: *const Descriptor,
+    model_id: []const u8,
+    overrides: Overrides,
+    hints: ModelHints,
+    rules: Rules,
+) Error!bool {
+    const effective_catalog_id: ?[]const u8 = if (overrides.catalog_id) |value|
+        (if (value.len == 0) null else value)
+    else
+        descriptor.catalog_id;
+    const catalog_enabled = effective_catalog_id != null;
+    const unknown = hints.catalog_wire == .unknown and
+        (hints.catalog == null or hints.catalog.?.wire == null);
+
+    for (rules.values) |rule| {
+        if (try globMatches(rule.pattern, model_id)) {
+            return switch (rule.target) {
+                .wire => false,
+                .catalog => catalog_enabled and unknown,
+            };
+        }
+    }
+    if (overrides.wire != null) return false;
+    return catalog_enabled and descriptor.catalog_wires and unknown;
+}
+
 fn catalogWire(hints: ModelHints) Error!?Wire {
     return switch (hints.catalog_wire) {
         .unknown => if (hints.catalog) |catalog| catalog.wire else null,
