@@ -3,6 +3,7 @@ const std = @import("std");
 const version = "0.1.0-dev";
 
 pub const Args = @import("Args.zig");
+pub const CodexFiles = @import("CodexFiles.zig");
 pub const ProcessAdapters = @import("ProcessAdapters.zig");
 pub const ProcessFacts = @import("ProcessFacts.zig");
 pub const OneShot = @import("OneShot.zig");
@@ -191,6 +192,7 @@ fn writeHelp(writer: *std.Io.Writer) !void {
 
 test {
     _ = Args;
+    _ = CodexFiles;
     _ = ProcessAdapters;
     _ = ProcessFacts;
     _ = OneShot;
