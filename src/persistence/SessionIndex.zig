@@ -61,6 +61,7 @@ pub const PruneReport = struct {
 
 pub const Error = error{
     OutOfMemory,
+    Cancelled,
     InvalidLimits,
     InvalidPath,
     PathTooLong,
@@ -186,6 +187,15 @@ pub fn list(
 /// pruning. Both bucket directories and session files are opened without
 /// following their final symlink. Marker election and background
 /// scheduling belong to a higher layer.
+pub const PruneTick = struct {
+    context: ?*anyopaque,
+    check_fn: *const fn (?*anyopaque) error{Cancelled}!void,
+
+    pub fn check(self: PruneTick) error{Cancelled}!void {
+        return self.check_fn(self.context);
+    }
+};
+
 pub fn pruneBefore(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -194,8 +204,31 @@ pub fn pruneBefore(
     exclude_path: ?[]const u8,
     limits: Limits,
 ) Error!PruneReport {
+    return pruneBeforeWithTick(
+        allocator,
+        io,
+        state_root,
+        cutoff_epoch_seconds,
+        exclude_path,
+        limits,
+        null,
+    );
+}
+
+/// The optional tick is checked before traversal, between buckets, and between
+/// entries. Cancellation returns `error.Cancelled` with no success report.
+pub fn pruneBeforeWithTick(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state_root: []const u8,
+    cutoff_epoch_seconds: i64,
+    exclude_path: ?[]const u8,
+    limits: Limits,
+    tick: ?PruneTick,
+) Error!PruneReport {
     try validateLimits(limits);
     if (exclude_path) |path| try validateAbsolutePath(path, limits.max_path_bytes);
+    try checkPruneTick(tick);
     const sessions_path = try sessionsDirectory(allocator, state_root, limits.max_path_bytes);
     defer allocator.free(sessions_path);
     const cutoff_nanoseconds = std.math.mul(i96, cutoff_epoch_seconds, std.time.ns_per_s) catch
@@ -212,6 +245,7 @@ pub fn pruneBefore(
     defer sessions.close(io);
     var buckets = sessions.iterate();
     while (buckets.next(io) catch return error.IoFailure) |bucket_entry| {
+        try checkPruneTick(tick);
         report.buckets += 1;
         if (report.buckets > limits.max_buckets) return error.TooManyBuckets;
         const bucket_stat = sessions.statFile(io, bucket_entry.name, .{ .follow_symlinks = false }) catch {
@@ -233,6 +267,7 @@ pub fn pruneBefore(
             defer bucket.close(io);
             var entries = bucket.iterate();
             while (entries.next(io) catch return error.IoFailure) |entry| {
+                try checkPruneTick(tick);
                 report.scanned += 1;
                 if (report.scanned > limits.max_entries_total) return error.TooManyEntries;
                 if (!isHaxStandardName(entry.name)) {
@@ -299,13 +334,20 @@ pub fn pruneBefore(
                 };
                 report.recovery.pruned += 1;
             }
+            try checkPruneTick(tick);
         }
+        try checkPruneTick(tick);
         sessions.deleteDir(io, bucket_entry.name) catch |err| switch (err) {
             error.DirNotEmpty => {},
             else => report.recovery.unreadable += 1,
         };
     }
+    try checkPruneTick(tick);
     return report;
+}
+
+fn checkPruneTick(tick: ?PruneTick) error{Cancelled}!void {
+    if (tick) |value| try value.check();
 }
 
 fn validateAbsolutePath(path: []const u8, max_path_bytes: usize) Error!void {
