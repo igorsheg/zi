@@ -119,6 +119,7 @@ pub const RunError = error{
     ScratchTooLarge,
     HookFailed,
     HookIndeterminate,
+    UsageCapacityExceeded,
 };
 
 const Captured = struct {
@@ -228,7 +229,18 @@ fn mapHookError(err: Loop.HookError) RunError {
 const UsageInputResolution = struct {
     input: SessionModule.UsageInput,
     spend: ai.UsagePricing.Spend,
+    attempts: [TurnModule.maximum_retry_usages + 1]ai.Usage.StreamUsage = undefined,
+    attempt_count: usize = 0,
 };
+
+fn mapUsageObserverError(err: Loop.UsageObserverError) RunError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.CapacityExceeded => error.UsageCapacityExceeded,
+        error.Failed => error.HookFailed,
+        error.Indeterminate => error.HookIndeterminate,
+    };
+}
 
 fn usageInput(
     params: Params,
@@ -242,7 +254,7 @@ fn usageInput(
         elapsed_ms,
         &params.model_metadata,
     );
-    return .{
+    var result: UsageInputResolution = .{
         .input = .{
             .stream = priced.footer.stream,
             .elapsed_ms = priced.footer.elapsed_ms,
@@ -259,18 +271,24 @@ fn usageInput(
         },
         .spend = priced.spend,
     };
+    const retries = turn.retryUsages();
+    @memcpy(result.attempts[0..retries.len], retries);
+    result.attempts[retries.len] = turn.usage;
+    result.attempt_count = retries.len + 1;
+    return result;
 }
 
-fn observeLatestUsage(params: Params, spend: ai.UsagePricing.Spend) RunError!void {
+fn observeLatestUsage(params: Params, resolution: *const UsageInputResolution) RunError!void {
     const observer = params.usage_observer orelse return;
     const item = params.session.items()[params.session.items().len - 1];
     std.debug.assert(item == .turn_usage);
     observer.observe(.{
         .footer = item.turn_usage.value,
-        .spend = spend,
+        .spend = resolution.spend,
+        .attempts = resolution.attempts[0..resolution.attempt_count],
         .kind = .compaction,
         .terminal_context_tokens = null,
-    }) catch |err| return mapHookError(err);
+    }) catch |err| return mapUsageObserverError(err);
 }
 
 fn prepareUsage(
@@ -286,11 +304,15 @@ fn prepareUsage(
     return prepared;
 }
 
-fn commitUsage(params: Params, prepared: *SessionModule.PreparedUsage, spend: ai.UsagePricing.Spend) RunError!void {
+fn commitUsage(
+    params: Params,
+    prepared: *SessionModule.PreparedUsage,
+    resolution: *const UsageInputResolution,
+) RunError!void {
     params.session.beginCompactionMutation();
     params.session.commitPreparedUsage(prepared);
     params.session.endCompactionMutation();
-    try observeLatestUsage(params, spend);
+    try observeLatestUsage(params, resolution);
 }
 
 fn commitAccepted(
@@ -314,9 +336,9 @@ fn callSeam(params: Params, next_action: bool) RunError!void {
 fn commitTerminalUsage(
     params: Params,
     prepared: *SessionModule.PreparedUsage,
-    spend: ai.UsagePricing.Spend,
+    resolution: *const UsageInputResolution,
 ) RunError!void {
-    try commitUsage(params, prepared, spend);
+    try commitUsage(params, prepared, resolution);
     try callSeam(params, false);
 }
 
@@ -424,23 +446,23 @@ fn runWithLease(allocator: std.mem.Allocator, io: std.Io, params: Params, lease:
         defer prepared.deinit(params.session.allocator);
 
         if (sink.assembly_error) |assembly_error| {
-            try commitTerminalUsage(params, &prepared, resolution.spend);
+            try commitTerminalUsage(params, &prepared, &resolution);
             return assembly_error;
         }
         if (stream_result) |_| {} else |stream_error| {
             if (stream_error == error.OutOfMemory) {
-                try commitTerminalUsage(params, &prepared, resolution.spend);
+                try commitTerminalUsage(params, &prepared, &resolution);
                 return error.OutOfMemory;
             }
             var diagnostic = captured.takeDiagnostic();
             errdefer if (diagnostic) |value| allocator.free(value);
             if (diagnostic == null) {
                 diagnostic = copyStreamErrorDiagnostic(allocator, stream_error) catch |err| {
-                    try commitTerminalUsage(params, &prepared, resolution.spend);
+                    try commitTerminalUsage(params, &prepared, &resolution);
                     return err;
                 };
             }
-            try commitTerminalUsage(params, &prepared, resolution.spend);
+            try commitTerminalUsage(params, &prepared, &resolution);
             return .{
                 .outcome = if (stream_error == error.Cancelled or cancelled) .cancelled else .provider_failure,
                 .attempts = attempt,
@@ -448,7 +470,7 @@ fn runWithLease(allocator: std.mem.Allocator, io: std.Io, params: Params, lease:
             };
         }
         if (turn.state != .done or cancelled) {
-            try commitTerminalUsage(params, &prepared, resolution.spend);
+            try commitTerminalUsage(params, &prepared, &resolution);
             return .{
                 .outcome = if (cancelled) .cancelled else .provider_failure,
                 .attempts = attempt,
@@ -465,23 +487,23 @@ fn runWithLease(allocator: std.mem.Allocator, io: std.Io, params: Params, lease:
         if (!has_tool_call) {
             if (summary) |text| {
                 var seed = Compact.buildSeed(allocator, text) catch |err| {
-                    try commitTerminalUsage(params, &prepared, resolution.spend);
+                    try commitTerminalUsage(params, &prepared, &resolution);
                     return err;
                 };
                 defer seed.deinit(allocator);
                 commitAccepted(params, seed.bytes, &prepared) catch |err| {
-                    try commitTerminalUsage(params, &prepared, resolution.spend);
+                    try commitTerminalUsage(params, &prepared, &resolution);
                     return err;
                 };
-                try observeLatestUsage(params, resolution.spend);
+                try observeLatestUsage(params, &resolution);
                 if (lease == .standalone) try callSeam(params, false);
                 return .{ .outcome = .compacted, .attempts = attempt };
             }
-            try commitTerminalUsage(params, &prepared, resolution.spend);
+            try commitTerminalUsage(params, &prepared, &resolution);
             return .{ .outcome = .no_summary, .attempts = attempt };
         }
 
-        try commitUsage(params, &prepared, resolution.spend);
+        try commitUsage(params, &prepared, &resolution);
         if (attempt == params.max_attempts) {
             try callSeam(params, false);
             return .{ .outcome = .no_summary, .attempts = attempt };
@@ -1271,10 +1293,16 @@ test "physical retries fold into the accepted aggregate footer" {
         calls: usize = 0,
         total: f64 = 0,
         has_unpriced: bool = false,
+        attempt_count: usize = 0,
+        attempt_inputs: [3]?u64 = .{ null, null, null },
         pub fn observe(self: *Self, observation: Loop.UsageObservation) Loop.HookError!void {
             self.calls += 1;
             self.total += observation.spend.known_usd;
             self.has_unpriced = self.has_unpriced or observation.spend.has_unpriced;
+            self.attempt_count = observation.attempts.len;
+            for (observation.attempts, 0..) |attempt, index| {
+                self.attempt_inputs[index] = attempt.input_tokens;
+            }
         }
     };
     var session = try Session.init(std.testing.allocator, .{ .provider_id = "provider", .model = "model" });
@@ -1304,5 +1332,9 @@ test "physical retries fold into the accepted aggregate footer" {
     try std.testing.expectEqual(@as(?u64, 2), usage.stream.output_tokens);
     try std.testing.expect(usage.cost_total_usd == null);
     try std.testing.expect(costs.has_unpriced);
+    try std.testing.expectEqual(@as(usize, 3), costs.attempt_count);
+    try std.testing.expectEqual(@as(?u64, 10), costs.attempt_inputs[0]);
+    try std.testing.expectEqual(@as(?u64, 20), costs.attempt_inputs[1]);
+    try std.testing.expectEqual(@as(?u64, 3), costs.attempt_inputs[2]);
     try std.testing.expectEqualStrings("terminal", usage.provenance.response_id.?);
 }

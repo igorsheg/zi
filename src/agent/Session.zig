@@ -357,6 +357,20 @@ pub const Session = struct {
         return self.addUserWithOrigin(continuation_marker, .continuation);
     }
 
+    /// Atomically appends one background-task notification without a boundary.
+    /// Allocation or admission failure leaves the session unchanged.
+    pub fn addTaskNote(self: *Session, text: []const u8) Error!void {
+        try self.ensureMutable();
+        if (text.len > self.limits.user_text_bytes) return error.UserTextTooLarge;
+        const admission = try self.reserveValues(1, text.len, 0, 0);
+        const owned_text = try self.allocator.dupe(u8, text);
+        self.record.appendAssumeCapacity(.{ .user_message = .{
+            .text = owned_text,
+            .origin = .task_note,
+        } });
+        self.commitAdmission(admission);
+    }
+
     /// Atomically appends a boundary and a compaction seed. The newest seed is
     /// the provider context floor; earlier retained history remains intact.
     pub fn addCompactSeed(self: *Session, text: []const u8) Error!void {
@@ -1300,4 +1314,31 @@ test "reconfigure limits rejects aggregate history and preserves old limits" {
     try std.testing.expectError(error.TooManyItems, session.reconfigureLimits(.{ .items = 1 }));
     try session.addBoundary();
     try std.testing.expectEqual(@as(usize, 3), session.items().len);
+}
+
+test "task note atomically appends one tagged user message" {
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try session.addTaskNote("[task t1 exited 0]");
+    try std.testing.expectEqual(@as(usize, 1), session.items().len);
+    try std.testing.expect(session.items()[0] == .user_message);
+    try std.testing.expectEqual(ai.Item.UserOrigin.task_note, session.items()[0].user_message.origin);
+}
+
+fn exerciseTaskNoteAllocations(allocator: std.mem.Allocator) !void {
+    var session = try Session.init(allocator, .{});
+    defer session.deinit();
+    session.addTaskNote("[task t1 exited 0]") catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), session.items().len);
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 1), session.items().len);
+}
+
+test "task note allocation failures leave the session unchanged" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseTaskNoteAllocations,
+        .{},
+    );
 }

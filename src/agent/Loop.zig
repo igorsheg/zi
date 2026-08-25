@@ -78,12 +78,14 @@ pub const HookError = error{
 };
 
 pub const SeamKind = enum {
+    prompt,
     provider_failure,
     completion,
     tool_batch,
     compaction,
     interruption,
     pause,
+    task_note,
 };
 
 /// Synchronous durability callback. The session and all of its contents are
@@ -132,15 +134,25 @@ pub const UsageKind = enum {
 pub const UsageObservation = struct {
     footer: ai.Usage.TurnUsage,
     spend: ai.UsagePricing.Spend,
+    /// Ordered physical retry attempts followed by the terminal attempt.
+    /// Borrowed only for the synchronous observer call.
+    attempts: []const ai.Usage.StreamUsage,
     kind: UsageKind,
     terminal_context_tokens: ?u64 = null,
 };
 
+pub const UsageObserverError = error{
+    OutOfMemory,
+    CapacityExceeded,
+    Failed,
+    Indeterminate,
+};
+
 pub const UsageObserver = struct {
     context: *anyopaque,
-    observe_fn: *const fn (*anyopaque, UsageObservation) HookError!void,
+    observe_fn: *const fn (*anyopaque, UsageObservation) UsageObserverError!void,
 
-    pub fn observe(self: UsageObserver, observation: UsageObservation) HookError!void {
+    pub fn observe(self: UsageObserver, observation: UsageObservation) UsageObserverError!void {
         return self.observe_fn(self.context, observation);
     }
 
@@ -152,12 +164,39 @@ pub const UsageObserver = struct {
         }
         const Implementation = pointer_info.pointer.child;
         const Adapter = struct {
-            fn observe(context: *anyopaque, observation: UsageObservation) HookError!void {
+            fn observe(context: *anyopaque, observation: UsageObservation) UsageObserverError!void {
                 const self: *Implementation = @ptrCast(@alignCast(context));
                 return self.observe(observation);
             }
         };
         return .{ .context = implementation, .observe_fn = Adapter.observe };
+    }
+};
+
+/// Runs before every provider request and before its session snapshot. The
+/// implementation may append provider-visible bookkeeping to the session.
+pub const PreRequestHook = struct {
+    context: *anyopaque,
+    call_fn: *const fn (*anyopaque, *Session) HookError!void,
+
+    pub fn call(self: PreRequestHook, session: *Session) HookError!void {
+        return self.call_fn(self.context, session);
+    }
+
+    pub fn from(implementation: anytype) PreRequestHook {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("PreRequestHook.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn call(context: *anyopaque, session: *Session) HookError!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.call(session);
+            }
+        };
+        return .{ .context = implementation, .call_fn = Adapter.call };
     }
 };
 
@@ -209,6 +248,7 @@ pub const Params = struct {
     observer: ?Observer = null,
     seam_hook: ?SeamHook = null,
     usage_observer: ?UsageObserver = null,
+    pre_request_hook: ?PreRequestHook = null,
     continuation_hook: ?ContinuationHook = null,
     maximum_request_images: usize = default_maximum_request_images,
     maximum_request_image_base64_bytes: usize = default_maximum_request_image_base64_bytes,
@@ -270,6 +310,7 @@ pub const Error = error{
     SessionBusy,
     HookFailed,
     HookIndeterminate,
+    UsageCapacityExceeded,
 };
 
 const SignalState = struct {
@@ -392,6 +433,15 @@ fn mapHookError(err: HookError) Error {
     };
 }
 
+fn mapUsageObserverError(err: UsageObserverError) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.CapacityExceeded => error.UsageCapacityExceeded,
+        error.Failed => error.HookFailed,
+        error.Indeterminate => error.HookIndeterminate,
+    };
+}
+
 fn callSeam(params: Params, kind: SeamKind, next_action: bool) Error!void {
     const hook = params.seam_hook orelse return;
     hook.call(params.session, kind, next_action) catch |err| return mapHookError(err);
@@ -466,14 +516,18 @@ fn appendUsage(
     params.session.endHookMutation();
     if (!admitted) return;
     const observer = params.usage_observer orelse return;
+    var attempts: [TurnModule.maximum_retry_usages + 1]ai.Usage.StreamUsage = undefined;
+    @memcpy(attempts[0..retry_usages.len], retry_usages);
+    attempts[retry_usages.len] = terminal_usage;
     const item = &params.session.items()[params.session.items().len - 1];
     std.debug.assert(item.* == .turn_usage);
     observer.observe(.{
         .footer = item.turn_usage.value,
         .spend = priced.spend,
+        .attempts = attempts[0 .. retry_usages.len + 1],
         .kind = .ordinary,
         .terminal_context_tokens = terminal_context_tokens,
-    }) catch |err| return mapHookError(err);
+    }) catch |err| return mapUsageObserverError(err);
 }
 
 pub fn run(
@@ -502,6 +556,14 @@ pub fn run(
     defer turn.deinit();
 
     while (result.turns < params.max_turns) {
+        if (params.pre_request_hook) |hook| {
+            params.session.beginHookMutation();
+            hook.call(params.session) catch |err| {
+                params.session.endHookMutation();
+                return mapHookError(err);
+            };
+            params.session.endHookMutation();
+        }
         turn.reset();
         var captured: Captured = .{ .allocator = allocator };
         defer captured.deinit();
@@ -2115,7 +2177,7 @@ test "lifecycle hooks order durable tool continuation and final completion" {
                     if (next_action) return error.Failed;
                     self.log.push('F');
                 },
-                .provider_failure, .interruption, .pause => return error.Failed,
+                .prompt, .provider_failure, .interruption, .pause, .task_note => return error.Failed,
             }
         }
     };
@@ -2562,11 +2624,17 @@ test "resolved metadata prices retry and terminal usage before admission" {
         calls: usize = 0,
         context_tokens: ?u64 = null,
         kind: ?UsageKind = null,
+        attempt_count: usize = 0,
+        attempt_inputs: [2]?u64 = .{ null, null },
 
         pub fn observe(self: *Self, observation: UsageObservation) HookError!void {
             self.calls += 1;
             self.context_tokens = observation.terminal_context_tokens;
             self.kind = observation.kind;
+            self.attempt_count = observation.attempts.len;
+            for (observation.attempts, 0..) |attempt, index| {
+                self.attempt_inputs[index] = attempt.input_tokens;
+            }
         }
     };
     var fake: Fake = .{};
@@ -2592,6 +2660,9 @@ test "resolved metadata prices retry and terminal usage before admission" {
     try std.testing.expectEqual(@as(usize, 1), recorder.calls);
     try std.testing.expectEqual(@as(?u64, 5), recorder.context_tokens);
     try std.testing.expectEqual(UsageKind.ordinary, recorder.kind.?);
+    try std.testing.expectEqual(@as(usize, 2), recorder.attempt_count);
+    try std.testing.expectEqual(@as(?u64, 7), recorder.attempt_inputs[0]);
+    try std.testing.expectEqual(@as(?u64, 3), recorder.attempt_inputs[1]);
 }
 
 test "ordinary observation retains exact spend when retry is unpriced" {
@@ -2642,4 +2713,92 @@ test "ordinary observation retains exact spend when retry is unpriced" {
     try std.testing.expectEqual(@as(f64, 1), recorder.spend.known_usd);
     try std.testing.expect(recorder.spend.has_unpriced);
     try std.testing.expect(recorder.spend.estimated);
+}
+
+test "pre-request hook runs before first and next snapshots and between loop runs" {
+    const Provider = struct {
+        const Self = @This();
+        round: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.round += 1;
+            var note_count: usize = 0;
+            for (request.context.items) |item| if (item == .user_message and
+                item.user_message.origin == .task_note)
+            {
+                note_count += 1;
+            };
+            if (note_count != self.round) return error.InvalidRequest;
+            if (self.round == 1) {
+                try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "echo" } });
+                try sink.emit(.{ .tool_call_delta = .{ .id = "one", .arguments_delta = "{}" } });
+                try sink.emit(.{ .tool_call_end = "one" });
+            } else {
+                try sink.emit(.{ .text_delta = "done" });
+            }
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const Echo = struct {
+        const Self = @This();
+        pub fn run(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ?[]const u8,
+            _: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            return .{ .output = try allocator.dupe(u8, "ok") };
+        }
+    };
+    const Notes = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn call(self: *Self, session: *Session) HookError!void {
+            self.calls += 1;
+            var buffer: [32]u8 = undefined;
+            const note = std.fmt.bufPrint(&buffer, "[note {d}]", .{self.calls}) catch return error.Failed;
+            session.addTaskNote(note) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Failed,
+            };
+        }
+    };
+
+    var provider: Provider = .{};
+    var echo: Echo = .{};
+    var notes: Notes = .{};
+    var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&echo, test_definition, .{})};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var first = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .tools = &tools,
+        .pre_request_hook = PreRequestHook.from(&notes),
+    });
+    first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), notes.calls);
+
+    var second = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .tools = &tools,
+        .continued = true,
+        .pre_request_hook = PreRequestHook.from(&notes),
+    });
+    second.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), notes.calls);
+    try std.testing.expectEqual(@as(usize, 3), provider.round);
 }
