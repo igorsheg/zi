@@ -52,6 +52,7 @@ pub const Params = struct {
     session: *Session,
     provider: ai.Provider.Provider,
     model: []const u8,
+    model_metadata: ai.ModelMeta.Metadata = .{},
     system_prompt: []const u8,
     tools: []const tool.Tool.Tool = &.{},
     effort: ?[]const u8 = null,
@@ -90,6 +91,7 @@ pub const RunError = error{
     FinalTextTooLarge,
     TooManyItems,
     TooManyPendingToolCalls,
+    TooManyRetryUsages,
     TextTooLarge,
     ReasoningTooLarge,
     ToolArgumentsTooLarge,
@@ -223,26 +225,52 @@ fn mapHookError(err: Loop.HookError) RunError {
     };
 }
 
+const UsageInputResolution = struct {
+    input: SessionModule.UsageInput,
+    spend: ai.UsagePricing.Spend,
+};
+
 fn usageInput(
     params: Params,
     turn: *const Turn,
     elapsed_ms: u64,
     response: ai.StreamEvent.ResponseIdentity,
-) SessionModule.UsageInput {
+) UsageInputResolution {
+    const priced = ai.UsagePricing.resolveAttempts(
+        turn.retryUsages(),
+        turn.usage,
+        elapsed_ms,
+        &params.model_metadata,
+    );
     return .{
-        .stream = turn.totalUsage(),
-        .elapsed_ms = elapsed_ms,
-        .response = response,
-        .source_provider = params.provider.id,
-        .source_model = params.model,
+        .input = .{
+            .stream = priced.footer.stream,
+            .elapsed_ms = priced.footer.elapsed_ms,
+            .uncached_input_tokens = priced.footer.uncached_input_tokens,
+            .cost_input_usd = priced.footer.cost_input_usd,
+            .cost_cache_read_usd = priced.footer.cost_cache_read_usd,
+            .cost_cache_write_usd = priced.footer.cost_cache_write_usd,
+            .cost_output_usd = priced.footer.cost_output_usd,
+            .cost_total_usd = priced.footer.cost_total_usd,
+            .cost_estimated = priced.footer.cost_estimated,
+            .response = response,
+            .source_provider = params.provider.id,
+            .source_model = params.model,
+        },
+        .spend = priced.spend,
     };
 }
 
-fn observeLatestUsage(params: Params) RunError!void {
+fn observeLatestUsage(params: Params, spend: ai.UsagePricing.Spend) RunError!void {
     const observer = params.usage_observer orelse return;
     const item = params.session.items()[params.session.items().len - 1];
     std.debug.assert(item == .turn_usage);
-    observer.observe(item.turn_usage.value) catch |err| return mapHookError(err);
+    observer.observe(.{
+        .footer = item.turn_usage.value,
+        .spend = spend,
+        .kind = .compaction,
+        .terminal_context_tokens = null,
+    }) catch |err| return mapHookError(err);
 }
 
 fn prepareUsage(
@@ -258,11 +286,11 @@ fn prepareUsage(
     return prepared;
 }
 
-fn commitUsage(params: Params, prepared: *SessionModule.PreparedUsage) RunError!void {
+fn commitUsage(params: Params, prepared: *SessionModule.PreparedUsage, spend: ai.UsagePricing.Spend) RunError!void {
     params.session.beginCompactionMutation();
     params.session.commitPreparedUsage(prepared);
     params.session.endCompactionMutation();
-    try observeLatestUsage(params);
+    try observeLatestUsage(params, spend);
 }
 
 fn commitAccepted(
@@ -286,8 +314,9 @@ fn callSeam(params: Params, next_action: bool) RunError!void {
 fn commitTerminalUsage(
     params: Params,
     prepared: *SessionModule.PreparedUsage,
+    spend: ai.UsagePricing.Spend,
 ) RunError!void {
-    try commitUsage(params, prepared);
+    try commitUsage(params, prepared, spend);
     try callSeam(params, false);
 }
 
@@ -389,29 +418,29 @@ fn runWithLease(allocator: std.mem.Allocator, io: std.Io, params: Params, lease:
         }, ai.Provider.EventSink.from(&sink));
         const finished_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
         const elapsed_ms: u64 = @intCast(@max(0, finished_ns - started_ns) / std.time.ns_per_ms);
-        const input = usageInput(params, &turn, elapsed_ms, captured.response);
+        const resolution = usageInput(params, &turn, elapsed_ms, captured.response);
         const cancelled = cancel_state.sample();
-        var prepared = try prepareUsage(params, input);
+        var prepared = try prepareUsage(params, resolution.input);
         defer prepared.deinit(params.session.allocator);
 
         if (sink.assembly_error) |assembly_error| {
-            try commitTerminalUsage(params, &prepared);
+            try commitTerminalUsage(params, &prepared, resolution.spend);
             return assembly_error;
         }
         if (stream_result) |_| {} else |stream_error| {
             if (stream_error == error.OutOfMemory) {
-                try commitTerminalUsage(params, &prepared);
+                try commitTerminalUsage(params, &prepared, resolution.spend);
                 return error.OutOfMemory;
             }
             var diagnostic = captured.takeDiagnostic();
             errdefer if (diagnostic) |value| allocator.free(value);
             if (diagnostic == null) {
                 diagnostic = copyStreamErrorDiagnostic(allocator, stream_error) catch |err| {
-                    try commitTerminalUsage(params, &prepared);
+                    try commitTerminalUsage(params, &prepared, resolution.spend);
                     return err;
                 };
             }
-            try commitTerminalUsage(params, &prepared);
+            try commitTerminalUsage(params, &prepared, resolution.spend);
             return .{
                 .outcome = if (stream_error == error.Cancelled or cancelled) .cancelled else .provider_failure,
                 .attempts = attempt,
@@ -419,7 +448,7 @@ fn runWithLease(allocator: std.mem.Allocator, io: std.Io, params: Params, lease:
             };
         }
         if (turn.state != .done or cancelled) {
-            try commitTerminalUsage(params, &prepared);
+            try commitTerminalUsage(params, &prepared, resolution.spend);
             return .{
                 .outcome = if (cancelled) .cancelled else .provider_failure,
                 .attempts = attempt,
@@ -436,23 +465,23 @@ fn runWithLease(allocator: std.mem.Allocator, io: std.Io, params: Params, lease:
         if (!has_tool_call) {
             if (summary) |text| {
                 var seed = Compact.buildSeed(allocator, text) catch |err| {
-                    try commitTerminalUsage(params, &prepared);
+                    try commitTerminalUsage(params, &prepared, resolution.spend);
                     return err;
                 };
                 defer seed.deinit(allocator);
                 commitAccepted(params, seed.bytes, &prepared) catch |err| {
-                    try commitTerminalUsage(params, &prepared);
+                    try commitTerminalUsage(params, &prepared, resolution.spend);
                     return err;
                 };
-                try observeLatestUsage(params);
+                try observeLatestUsage(params, resolution.spend);
                 if (lease == .standalone) try callSeam(params, false);
                 return .{ .outcome = .compacted, .attempts = attempt };
             }
-            try commitTerminalUsage(params, &prepared);
+            try commitTerminalUsage(params, &prepared, resolution.spend);
             return .{ .outcome = .no_summary, .attempts = attempt };
         }
 
-        try commitUsage(params, &prepared);
+        try commitUsage(params, &prepared, resolution.spend);
         if (attempt == params.max_attempts) {
             try callSeam(params, false);
             return .{ .outcome = .no_summary, .attempts = attempt };
@@ -544,9 +573,10 @@ const UsageRecorder = struct {
 
     pub fn observe(
         self: *UsageRecorder,
-        usage: ai.Usage.TurnUsage,
+        observation: Loop.UsageObservation,
     ) Loop.HookError!void {
-        self.input_tokens[self.calls] = usage.stream.input_tokens;
+        if (observation.kind != .compaction or observation.terminal_context_tokens != null) return error.Failed;
+        self.input_tokens[self.calls] = observation.footer.stream.input_tokens;
         self.calls += 1;
     }
 };
@@ -1029,7 +1059,7 @@ test "final seam errors preserve the accepted atomic arrangement" {
 const ExactUsage = struct {
     failure: Loop.HookError,
     calls: usize = 0,
-    pub fn observe(self: *ExactUsage, _: ai.Usage.TurnUsage) Loop.HookError!void {
+    pub fn observe(self: *ExactUsage, _: Loop.UsageObservation) Loop.HookError!void {
         self.calls += 1;
         return self.failure;
     }
@@ -1170,4 +1200,109 @@ test "accepted seed admission failure still commits its prepared usage" {
     try std.testing.expect(session.items()[0] == .turn_usage);
     try std.testing.expectEqual(@as(usize, 1), seam.calls);
     try std.testing.expect(!seam.next_actions[0]);
+}
+
+test "every compaction attempt is priced and observed in the total" {
+    const CostObserver = struct {
+        const Self = @This();
+        calls: usize = 0,
+        total: f64 = 0,
+
+        pub fn observe(self: *Self, observation: Loop.UsageObservation) Loop.HookError!void {
+            self.calls += 1;
+            self.total += observation.footer.cost_total_usd.?;
+            if (!observation.footer.cost_estimated) return error.Failed;
+        }
+    };
+    var session = try Session.init(std.testing.allocator, .{
+        .provider_id = "provider",
+        .model = "model",
+    });
+    defer session.deinit();
+    try session.addCompactSeed("old seed");
+    try session.addUser("work");
+    var provider: ScriptedProvider = .{ .steps = &.{ .tool, .success } };
+    var costs: CostObserver = .{};
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .model_metadata = .{ .rates = .{ .input = 1, .output = 1 } },
+        .system_prompt = "system",
+        .usage_observer = UsageObserver.from(&costs),
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), costs.calls);
+    try std.testing.expectApproxEqAbs(0.000005, costs.total, 1e-15);
+}
+
+test "physical retries fold into the accepted aggregate footer" {
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .retry = .{
+                .attempt = 1,
+                .maximum_attempts = 3,
+                .delay_ms = 0,
+                .usage = .{ .input_tokens = 10 },
+            } });
+            try sink.emit(.{ .retry = .{
+                .attempt = 2,
+                .maximum_attempts = 3,
+                .delay_ms = 0,
+                .usage = .{ .input_tokens = 20 },
+            } });
+            try sink.emit(.{ .text_delta = "summary" });
+            try sink.emit(.{ .done = .{
+                .usage = .{ .input_tokens = 3, .output_tokens = 2, .cost_usd = 1 },
+                .response = .{ .id = "terminal" },
+            } });
+        }
+    };
+    const Costs = struct {
+        const Self = @This();
+        calls: usize = 0,
+        total: f64 = 0,
+        has_unpriced: bool = false,
+        pub fn observe(self: *Self, observation: Loop.UsageObservation) Loop.HookError!void {
+            self.calls += 1;
+            self.total += observation.spend.known_usd;
+            self.has_unpriced = self.has_unpriced or observation.spend.has_unpriced;
+        }
+    };
+    var session = try Session.init(std.testing.allocator, .{ .provider_id = "provider", .model = "model" });
+    defer session.deinit();
+    try session.addUser("work");
+    const items_from = session.items().len;
+    var fake: Fake = .{};
+    var costs: Costs = .{};
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "provider"),
+        .model = "model",
+        .system_prompt = "system",
+        .usage_observer = UsageObserver.from(&costs),
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), costs.calls);
+    try std.testing.expectApproxEqAbs(1, costs.total, 1e-15);
+    const added = session.items()[items_from..];
+    try std.testing.expectEqual(@as(usize, 3), added.len);
+    try std.testing.expect(added[0] == .turn_boundary);
+    try std.testing.expect(added[1] == .user_message);
+    try std.testing.expect(added[2] == .turn_usage);
+    const usage = added[2].turn_usage.value;
+    try std.testing.expectEqual(@as(?u64, 33), usage.stream.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 2), usage.stream.output_tokens);
+    try std.testing.expect(usage.cost_total_usd == null);
+    try std.testing.expect(costs.has_unpriced);
+    try std.testing.expectEqualStrings("terminal", usage.provenance.response_id.?);
 }

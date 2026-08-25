@@ -123,14 +123,25 @@ pub const SeamHook = struct {
     }
 };
 
-/// Receives each usage footer immediately after the footer is admitted to the
-/// session. The value is borrowed only for the synchronous call.
+pub const UsageKind = enum {
+    ordinary,
+    compaction,
+};
+
+/// Borrowed, by-value accounting observation delivered after footer admission.
+pub const UsageObservation = struct {
+    footer: ai.Usage.TurnUsage,
+    spend: ai.UsagePricing.Spend,
+    kind: UsageKind,
+    terminal_context_tokens: ?u64 = null,
+};
+
 pub const UsageObserver = struct {
     context: *anyopaque,
-    observe_fn: *const fn (*anyopaque, ai.Usage.TurnUsage) HookError!void,
+    observe_fn: *const fn (*anyopaque, UsageObservation) HookError!void,
 
-    pub fn observe(self: UsageObserver, usage: ai.Usage.TurnUsage) HookError!void {
-        return self.observe_fn(self.context, usage);
+    pub fn observe(self: UsageObserver, observation: UsageObservation) HookError!void {
+        return self.observe_fn(self.context, observation);
     }
 
     pub fn from(implementation: anytype) UsageObserver {
@@ -141,9 +152,9 @@ pub const UsageObserver = struct {
         }
         const Implementation = pointer_info.pointer.child;
         const Adapter = struct {
-            fn observe(context: *anyopaque, usage: ai.Usage.TurnUsage) HookError!void {
+            fn observe(context: *anyopaque, observation: UsageObservation) HookError!void {
                 const self: *Implementation = @ptrCast(@alignCast(context));
-                return self.observe(usage);
+                return self.observe(observation);
             }
         };
         return .{ .context = implementation, .observe_fn = Adapter.observe };
@@ -187,6 +198,7 @@ pub const Params = struct {
     session: *Session,
     provider: ai.Provider.Provider,
     model: []const u8,
+    model_metadata: ai.ModelMeta.Metadata = .{},
     system_prompt: []const u8,
     tools: []const tool.Tool.Tool = &.{},
     effort: ?[]const u8 = null,
@@ -229,6 +241,7 @@ pub const Error = error{
     OutOfMemory,
     TooManyItems,
     TooManyPendingToolCalls,
+    TooManyRetryUsages,
     TextTooLarge,
     ReasoningTooLarge,
     ToolArgumentsTooLarge,
@@ -424,8 +437,25 @@ fn appendUsage(
     params: Params,
     input: SessionModule.UsageInput,
     prepend_boundary: bool,
+    retry_usages: []const ai.Usage.StreamUsage,
+    terminal_usage: ai.Usage.StreamUsage,
+    terminal_context_tokens: ?u64,
 ) Error!void {
+    const priced = ai.UsagePricing.resolveAttempts(
+        retry_usages,
+        terminal_usage,
+        input.elapsed_ms,
+        &params.model_metadata,
+    );
     var attributed = input;
+    attributed.stream = priced.footer.stream;
+    attributed.uncached_input_tokens = priced.footer.uncached_input_tokens;
+    attributed.cost_input_usd = priced.footer.cost_input_usd;
+    attributed.cost_cache_read_usd = priced.footer.cost_cache_read_usd;
+    attributed.cost_cache_write_usd = priced.footer.cost_cache_write_usd;
+    attributed.cost_output_usd = priced.footer.cost_output_usd;
+    attributed.cost_total_usd = priced.footer.cost_total_usd;
+    attributed.cost_estimated = priced.footer.cost_estimated;
     attributed.source_provider = params.provider.id;
     attributed.source_model = params.model;
     params.session.beginHookMutation();
@@ -438,7 +468,12 @@ fn appendUsage(
     const observer = params.usage_observer orelse return;
     const item = &params.session.items()[params.session.items().len - 1];
     std.debug.assert(item.* == .turn_usage);
-    observer.observe(item.turn_usage.value) catch |err| return mapHookError(err);
+    observer.observe(.{
+        .footer = item.turn_usage.value,
+        .spend = priced.spend,
+        .kind = .ordinary,
+        .terminal_context_tokens = terminal_context_tokens,
+    }) catch |err| return mapHookError(err);
 }
 
 pub fn run(
@@ -507,6 +542,10 @@ pub fn run(
 
         if (turn.state == .failed) {
             const total_usage = turn.totalUsage();
+            const terminal_usage = turn.usage;
+            const retry_usages = turn.retry_usages;
+            const retry_count = turn.retry_usage_count;
+            const terminal_context_tokens = turn.last_context_tokens;
             const usage_reported = ai.Usage.usageReported(total_usage);
             const has_response_content = turn.hasAssistantText();
             const prepend_boundary = owes_boundary and has_response_content;
@@ -520,11 +559,20 @@ pub fn run(
             );
             result.final_items_from = repaired.items_from;
             result.final_items_to = repaired.items_to;
-            appendUsage(params, .{
-                .stream = total_usage,
-                .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
-                .response = captured.response,
-            }, usage_boundary) catch |err| return settleTerminalMutationFailure(params, .provider_failure, err);
+            appendUsage(
+                params,
+                .{
+                    .stream = total_usage,
+                    .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
+                    .response = captured.response,
+                },
+                usage_boundary,
+                retry_usages[0..retry_count],
+                terminal_usage,
+                terminal_context_tokens,
+            ) catch |err| {
+                return settleTerminalMutationFailure(params, .provider_failure, err);
+            };
             result.outcome = .provider_error;
             result.diagnostic = captured.takeDiagnostic();
             try callSeam(params, .provider_failure, false);
@@ -536,6 +584,10 @@ pub fn run(
             if (stream_error == error.OutOfMemory) return error.OutOfMemory;
             if (stream_error == error.Cancelled and signals.signal == .abort) {
                 const total_usage = turn.totalUsage();
+                const terminal_usage = turn.usage;
+                const retry_usages = turn.retry_usages;
+                const retry_count = turn.retry_usage_count;
+                const terminal_context_tokens = turn.last_context_tokens;
                 const usage_reported = ai.Usage.usageReported(total_usage);
                 const has_response_content = turn.survivesCancel();
                 const prepend_boundary = owes_boundary and has_response_content;
@@ -549,11 +601,20 @@ pub fn run(
                 );
                 result.final_items_from = repaired.items_from;
                 result.final_items_to = repaired.items_to;
-                appendUsage(params, .{
-                    .stream = total_usage,
-                    .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
-                    .response = captured.response,
-                }, usage_boundary) catch |err| return settleTerminalMutationFailure(params, .interruption, err);
+                appendUsage(
+                    params,
+                    .{
+                        .stream = total_usage,
+                        .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
+                        .response = captured.response,
+                    },
+                    usage_boundary,
+                    retry_usages[0..retry_count],
+                    terminal_usage,
+                    terminal_context_tokens,
+                ) catch |err| {
+                    return settleTerminalMutationFailure(params, .interruption, err);
+                };
                 result.outcome = .interrupted;
                 result.abort_marker_placed = repaired.marker_placed;
                 try callSeam(params, .interruption, false);
@@ -561,16 +622,29 @@ pub fn run(
             }
             if (stream_error == error.Cancelled and signals.signal == .pause) {
                 const total_usage = turn.totalUsage();
+                const terminal_usage = turn.usage;
+                const retry_usages = turn.retry_usages;
+                const retry_count = turn.retry_usage_count;
+                const terminal_context_tokens = turn.last_context_tokens;
                 const paused_empty = turn.items.items.len == 0;
                 if (paused_empty) {
                     const usage_reported = ai.Usage.usageReported(total_usage);
                     const usage_boundary = owes_boundary and usage_reported;
                     const initial_count = params.session.items().len;
-                    appendUsage(params, .{
-                        .stream = total_usage,
-                        .elapsed_ms = if (usage_reported) elapsed_ms else null,
-                        .response = captured.response,
-                    }, usage_boundary) catch |err| return settleTerminalMutationFailure(params, .pause, err);
+                    appendUsage(
+                        params,
+                        .{
+                            .stream = total_usage,
+                            .elapsed_ms = if (usage_reported) elapsed_ms else null,
+                            .response = captured.response,
+                        },
+                        usage_boundary,
+                        retry_usages[0..retry_count],
+                        terminal_usage,
+                        terminal_context_tokens,
+                    ) catch |err| {
+                        return settleTerminalMutationFailure(params, .pause, err);
+                    };
                     turn.reset();
                     result.final_items_from = initial_count + @as(usize, @intFromBool(usage_boundary));
                     result.final_items_to = result.final_items_from;
@@ -583,6 +657,10 @@ pub fn run(
             } else {
                 turn.state = .failed;
                 const total_usage = turn.totalUsage();
+                const terminal_usage = turn.usage;
+                const retry_usages = turn.retry_usages;
+                const retry_count = turn.retry_usage_count;
+                const terminal_context_tokens = turn.last_context_tokens;
                 const usage_reported = ai.Usage.usageReported(total_usage);
                 const has_response_content = turn.hasAssistantText();
                 const prepend_boundary = owes_boundary and has_response_content;
@@ -597,11 +675,20 @@ pub fn run(
                 );
                 result.final_items_from = repaired.items_from;
                 result.final_items_to = repaired.items_to;
-                appendUsage(params, .{
-                    .stream = total_usage,
-                    .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
-                    .response = captured.response,
-                }, usage_boundary) catch |err| return settleTerminalMutationFailure(params, .provider_failure, err);
+                appendUsage(
+                    params,
+                    .{
+                        .stream = total_usage,
+                        .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
+                        .response = captured.response,
+                    },
+                    usage_boundary,
+                    retry_usages[0..retry_count],
+                    terminal_usage,
+                    terminal_context_tokens,
+                ) catch |err| {
+                    return settleTerminalMutationFailure(params, .provider_failure, err);
+                };
                 result.outcome = .provider_error;
                 result.diagnostic = captured.takeDiagnostic();
                 try callSeam(params, .provider_failure, false);
@@ -612,6 +699,10 @@ pub fn run(
         if (turn.state != .done) {
             turn.state = .failed;
             const total_usage = turn.totalUsage();
+            const terminal_usage = turn.usage;
+            const retry_usages = turn.retry_usages;
+            const retry_count = turn.retry_usage_count;
+            const terminal_context_tokens = turn.last_context_tokens;
             const usage_reported = ai.Usage.usageReported(total_usage);
             const has_response_content = turn.hasAssistantText();
             const prepend_boundary = owes_boundary and has_response_content;
@@ -626,11 +717,20 @@ pub fn run(
             );
             result.final_items_from = repaired.items_from;
             result.final_items_to = repaired.items_to;
-            appendUsage(params, .{
-                .stream = total_usage,
-                .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
-                .response = captured.response,
-            }, usage_boundary) catch |err| return settleTerminalMutationFailure(params, .provider_failure, err);
+            appendUsage(
+                params,
+                .{
+                    .stream = total_usage,
+                    .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
+                    .response = captured.response,
+                },
+                usage_boundary,
+                retry_usages[0..retry_count],
+                terminal_usage,
+                terminal_context_tokens,
+            ) catch |err| {
+                return settleTerminalMutationFailure(params, .provider_failure, err);
+            };
             result.outcome = .provider_error;
             result.diagnostic = captured.takeDiagnostic();
             try callSeam(params, .provider_failure, false);
@@ -640,6 +740,10 @@ pub fn run(
         signals.record(if (params.checkpoint) |checkpoint| checkpoint.sample() else .none);
         if (signals.signal == .abort) {
             const total_usage = turn.totalUsage();
+            const terminal_usage = turn.usage;
+            const retry_usages = turn.retry_usages;
+            const retry_count = turn.retry_usage_count;
+            const terminal_context_tokens = turn.last_context_tokens;
             const usage_reported = ai.Usage.usageReported(total_usage);
             const has_response_content = turn.survivesCancel();
             const prepend_boundary = owes_boundary and has_response_content;
@@ -653,11 +757,20 @@ pub fn run(
             );
             result.final_items_from = repaired.items_from;
             result.final_items_to = repaired.items_to;
-            appendUsage(params, .{
-                .stream = total_usage,
-                .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
-                .response = captured.response,
-            }, usage_boundary) catch |err| return settleTerminalMutationFailure(params, .interruption, err);
+            appendUsage(
+                params,
+                .{
+                    .stream = total_usage,
+                    .elapsed_ms = if (ai.Usage.usageReported(total_usage)) elapsed_ms else null,
+                    .response = captured.response,
+                },
+                usage_boundary,
+                retry_usages[0..retry_count],
+                terminal_usage,
+                terminal_context_tokens,
+            ) catch |err| {
+                return settleTerminalMutationFailure(params, .interruption, err);
+            };
             result.outcome = .interrupted;
             result.abort_marker_placed = repaired.marker_placed;
             try callSeam(params, .interruption, false);
@@ -696,11 +809,15 @@ pub fn run(
         // Pre-admit the terminal usage footer before any tool side effect. This
         // makes every later settlement allocation-infallible at the record seam.
         const total_usage = turn.totalUsage();
+        const terminal_usage = turn.usage;
+        const retry_usages = turn.retry_usages;
+        const retry_count = turn.retry_usage_count;
+        const terminal_context_tokens = turn.last_context_tokens;
         appendUsage(params, .{
             .stream = total_usage,
             .elapsed_ms = elapsed_ms,
             .response = captured.response,
-        }, false) catch |err| {
+        }, false, retry_usages[0..retry_count], terminal_usage, terminal_context_tokens) catch |err| {
             turn.reset();
             const seam_kind: SeamKind = if (pause_preempted)
                 .pause
@@ -1234,7 +1351,7 @@ test "terminal usage hook failure keeps precedence after one interruption seam" 
     };
     const Usage = struct {
         const Self = @This();
-        pub fn observe(_: *Self, _: ai.Usage.TurnUsage) HookError!void {
+        pub fn observe(_: *Self, _: UsageObservation) HookError!void {
             return error.Failed;
         }
     };
@@ -2006,8 +2123,8 @@ test "lifecycle hooks order durable tool continuation and final completion" {
         const Self = @This();
         log: *Log,
 
-        pub fn observe(self: *Self, usage: ai.Usage.TurnUsage) HookError!void {
-            if (usage.elapsed_ms == null) return error.Failed;
+        pub fn observe(self: *Self, observation: UsageObservation) HookError!void {
+            if (observation.footer.elapsed_ms == null or observation.kind != .ordinary) return error.Failed;
             self.log.push('U');
         }
     };
@@ -2122,9 +2239,9 @@ test "usage observer sees admitted provider failure and preserves out of memory"
         calls: usize = 0,
         detailed_cause: ?[]const u8 = null,
 
-        pub fn observe(self: *Self, usage: ai.Usage.TurnUsage) HookError!void {
+        pub fn observe(self: *Self, observation: UsageObservation) HookError!void {
             self.calls += 1;
-            if (usage.stream.input_tokens != 3) return error.Failed;
+            if (observation.footer.stream.input_tokens != 3) return error.Failed;
             self.detailed_cause = "observer allocation failed";
             return error.OutOfMemory;
         }
@@ -2280,7 +2397,7 @@ test "run lease rejects nested runs and provider or observer mutations" {
         session: *Session,
         mutation_busy: bool = false,
 
-        pub fn observe(self: *Self, _: ai.Usage.TurnUsage) HookError!void {
+        pub fn observe(self: *Self, _: UsageObservation) HookError!void {
             self.session.addUser("forbidden") catch |err| {
                 self.mutation_busy = err == error.SessionBusy;
                 return;
@@ -2417,4 +2534,112 @@ test "multi-tool allocation failures settle every accepted call before returning
         exerciseToolSettlementAllocations,
         .{},
     );
+}
+
+test "resolved metadata prices retry and terminal usage before admission" {
+    const Fake = struct {
+        const Self = @This();
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .retry = .{
+                .attempt = 1,
+                .maximum_attempts = 2,
+                .delay_ms = 0,
+                .usage = .{ .input_tokens = 7 },
+            } });
+            try sink.emit(.{ .text_delta = "done" });
+            try sink.emit(.{ .done = .{ .usage = .{ .input_tokens = 3, .output_tokens = 2, .cost_usd = 1 } } });
+        }
+    };
+    const Recorder = struct {
+        const Self = @This();
+        calls: usize = 0,
+        context_tokens: ?u64 = null,
+        kind: ?UsageKind = null,
+
+        pub fn observe(self: *Self, observation: UsageObservation) HookError!void {
+            self.calls += 1;
+            self.context_tokens = observation.terminal_context_tokens;
+            self.kind = observation.kind;
+        }
+    };
+    var fake: Fake = .{};
+    var recorder: Recorder = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "provider"),
+        .model = "model",
+        .model_metadata = .{ .rates = .{ .input = 1, .output = 2 } },
+        .system_prompt = "system",
+        .usage_observer = UsageObserver.from(&recorder),
+    });
+    defer loop_result.deinit(std.testing.allocator);
+
+    const usage = session.items()[session.items().len - 1].turn_usage.value;
+    try std.testing.expectEqual(@as(?u64, 10), usage.stream.input_tokens);
+    try std.testing.expectApproxEqAbs(0.00001, usage.cost_input_usd.?, 1e-15);
+    try std.testing.expectApproxEqAbs(0.000004, usage.cost_output_usd.?, 1e-15);
+    try std.testing.expectApproxEqAbs(1.000007, usage.cost_total_usd.?, 1e-15);
+    try std.testing.expect(usage.cost_estimated);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try std.testing.expectEqual(@as(?u64, 5), recorder.context_tokens);
+    try std.testing.expectEqual(UsageKind.ordinary, recorder.kind.?);
+}
+
+test "ordinary observation retains exact spend when retry is unpriced" {
+    const Fake = struct {
+        const Self = @This();
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .retry = .{
+                .attempt = 1,
+                .maximum_attempts = 2,
+                .delay_ms = 0,
+                .usage = .{ .input_tokens = 10 },
+            } });
+            try sink.emit(.{ .text_delta = "done" });
+            try sink.emit(.{ .done = .{ .usage = .{ .input_tokens = 3, .cost_usd = 1 } } });
+        }
+    };
+    const Recorder = struct {
+        const Self = @This();
+        calls: usize = 0,
+        spend: ai.UsagePricing.Spend = .{},
+        pub fn observe(self: *Self, observation: UsageObservation) HookError!void {
+            self.calls += 1;
+            self.spend = observation.spend;
+        }
+    };
+    var fake: Fake = .{};
+    var recorder: Recorder = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "provider"),
+        .model = "model",
+        .system_prompt = "system",
+        .usage_observer = UsageObserver.from(&recorder),
+    });
+    defer result.deinit(std.testing.allocator);
+
+    const footer = session.items()[session.items().len - 1].turn_usage.value;
+    try std.testing.expect(footer.cost_total_usd == null);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try std.testing.expectEqual(@as(f64, 1), recorder.spend.known_usd);
+    try std.testing.expect(recorder.spend.has_unpriced);
+    try std.testing.expect(recorder.spend.estimated);
 }

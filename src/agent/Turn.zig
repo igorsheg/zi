@@ -22,6 +22,7 @@ pub const Limits = struct {
 };
 
 pub const Error = error{
+    TooManyRetryUsages,
     OutOfMemory,
     TooManyItems,
     TooManyPendingToolCalls,
@@ -48,6 +49,8 @@ const PendingToolCall = struct {
 
 /// Pure assembly state for one provider stream.
 /// The turn owns all buffered bytes and assembled items.
+pub const maximum_retry_usages: usize = 100;
+
 pub const Turn = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
@@ -62,6 +65,8 @@ pub const Turn = struct {
     /// attempt alone determines the last context window.
     usage: ai.Usage.StreamUsage = .{},
     retry_usage: ai.Usage.StreamUsage = .{},
+    retry_usages: [maximum_retry_usages]ai.Usage.StreamUsage = undefined,
+    retry_usage_count: u8 = 0,
     last_context_tokens: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) Turn {
@@ -78,6 +83,7 @@ pub const Turn = struct {
         self.resetAttempt();
         self.usage = .{};
         self.retry_usage = .{};
+        self.retry_usage_count = 0;
         self.last_context_tokens = null;
     }
 
@@ -93,6 +99,10 @@ pub const Turn = struct {
             if (item == .assistant_message or item == .tool_call) return true;
         }
         return false;
+    }
+
+    pub fn retryUsages(self: *const Turn) []const ai.Usage.StreamUsage {
+        return self.retry_usages[0..self.retry_usage_count];
     }
 
     /// Returns billable usage for the terminal attempt and every retried attempt.
@@ -145,7 +155,12 @@ pub const Turn = struct {
             },
             .reasoning_item => |reasoning_item| try self.consumeReasoningItem(reasoning_item.opaque_json),
             .retry => |retry| {
-                if (retry.usage) |usage| ai.Usage.add(&self.retry_usage, usage);
+                if (retry.usage) |usage| {
+                    if (self.retry_usage_count >= maximum_retry_usages) return error.TooManyRetryUsages;
+                    self.retry_usages[self.retry_usage_count] = usage;
+                    self.retry_usage_count += 1;
+                    ai.Usage.add(&self.retry_usage, usage);
+                }
                 self.resetAttempt();
             },
             .progress => {},
@@ -976,4 +991,27 @@ test "last context requires both terminal counters and reset clears accounting" 
     turn.reset();
     try std.testing.expect(!ai.Usage.usageReported(turn.totalUsage()));
     try std.testing.expect(turn.last_context_tokens == null);
+}
+
+test "retry usages retain provider order up to the transport bound" {
+    var turn = Turn.init(std.testing.allocator, .{});
+    defer turn.deinit();
+    for (0..maximum_retry_usages) |index| {
+        try turn.consume(.{ .retry = .{
+            .attempt = @intCast(index + 1),
+            .maximum_attempts = @intCast(maximum_retry_usages + 1),
+            .delay_ms = 0,
+            .usage = .{ .input_tokens = index },
+        } });
+    }
+    try std.testing.expectEqual(@as(usize, maximum_retry_usages), turn.retryUsages().len);
+    for (turn.retryUsages(), 0..) |usage, index| {
+        try std.testing.expectEqual(@as(?u64, index), usage.input_tokens);
+    }
+    try std.testing.expectError(error.TooManyRetryUsages, turn.consume(.{ .retry = .{
+        .attempt = 101,
+        .maximum_attempts = 101,
+        .delay_ms = 0,
+        .usage = .{ .input_tokens = 101 },
+    } }));
 }

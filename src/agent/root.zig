@@ -6,6 +6,7 @@ pub const SystemPrompt = @import("SystemPrompt.zig");
 pub const Context = @import("Context.zig");
 pub const Compact = @import("Compact.zig");
 pub const CompactRunner = @import("CompactRunner.zig");
+pub const UsageStats = @import("UsageStats.zig");
 pub const GuidanceDiscovery = @import("GuidanceDiscovery.zig");
 pub const EnvironmentDiscovery = @import("EnvironmentDiscovery.zig");
 pub const SkillDiscovery = @import("SkillDiscovery.zig");
@@ -20,6 +21,7 @@ test {
     _ = Context;
     _ = Compact;
     _ = CompactRunner;
+    _ = UsageStats;
     _ = GuidanceDiscovery;
     _ = EnvironmentDiscovery;
     _ = SkillDiscovery;

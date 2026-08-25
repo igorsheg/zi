@@ -4,6 +4,7 @@ pub const Item = @import("Item.zig");
 pub const StreamEvent = @import("StreamEvent.zig");
 pub const Provider = @import("Provider.zig");
 pub const Usage = @import("Usage.zig");
+pub const UsagePricing = @import("UsagePricing.zig");
 pub const Transport = @import("Transport.zig");
 pub const JsonTransport = @import("JsonTransport.zig");
 pub const HttpTransport = @import("HttpTransport.zig");
@@ -46,6 +47,7 @@ test {
     _ = StreamEvent;
     _ = Provider;
     _ = Usage;
+    _ = UsagePricing;
     _ = Transport;
     _ = Sse;
     _ = Retry;
