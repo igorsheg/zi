@@ -66,15 +66,33 @@ pub fn writeWithDiff(
     content: []const u8,
     options: Options,
 ) Error!Result {
+    return writeWithDiffAtPhysicalPathMax(
+        allocator,
+        io,
+        path,
+        content,
+        options,
+        std.fs.max_path_bytes,
+    );
+}
+
+fn writeWithDiffAtPhysicalPathMax(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    content: []const u8,
+    options: Options,
+    physical_max_path_bytes: usize,
+) Error!Result {
     if (path.len == 0) return diagnosticCopy(allocator, "cannot write an empty path");
     if (std.mem.findScalar(u8, path, 0) != null)
         return diagnosticCopy(allocator, "path contains a NUL byte");
-    if (path.len > options.maximum_path_bytes) {
-        return diagnosticFormat(
-            allocator,
-            "path is {d} bytes; path cap is {d}",
-            .{ path.len, options.maximum_path_bytes },
-        );
+    const maximum_path_bytes = pathPayloadCap(
+        options.maximum_path_bytes,
+        physical_max_path_bytes,
+    );
+    if (path.len > maximum_path_bytes) {
+        return pathCapDiagnostic(allocator, path.len, maximum_path_bytes);
     }
     if (content.len > options.maximum_file_bytes) {
         return diagnosticFormat(
@@ -84,13 +102,23 @@ pub fn writeWithDiff(
         );
     }
 
-    const target_path = resolveFinalSymlinks(allocator, io, path, options.maximum_path_bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return diagnosticFormat(
+    var expanded_path_length: ?usize = null;
+    const target_path = resolveFinalSymlinksReportingLength(
+        allocator,
+        io,
+        path,
+        maximum_path_bytes,
+        &expanded_path_length,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (expanded_path_length) |length| {
+            return pathCapDiagnostic(allocator, length, maximum_path_bytes);
+        }
+        return diagnosticFormat(
             allocator,
             "resolving {s}: {s}",
             .{ path, errorReason(err) },
-        ),
+        );
     };
     var target = inspectTarget(allocator, io, target_path, options.maximum_file_bytes) catch |err| {
         defer allocator.free(target_path);
@@ -290,6 +318,28 @@ fn resolveFinalSymlinks(
     path: []const u8,
     maximum_path_bytes: usize,
 ) ResolveError![]u8 {
+    var path_too_long_length: ?usize = null;
+    return resolveFinalSymlinksReportingLength(
+        allocator,
+        io,
+        path,
+        maximum_path_bytes,
+        &path_too_long_length,
+    );
+}
+
+fn resolveFinalSymlinksReportingLength(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    maximum_path_bytes: usize,
+    path_too_long_length: *?usize,
+) ResolveError![]u8 {
+    path_too_long_length.* = null;
+    if (path.len > maximum_path_bytes) {
+        path_too_long_length.* = path.len;
+        return error.NameTooLong;
+    }
     var current = try allocator.dupe(u8, path);
     errdefer allocator.free(current);
     for (0..maximum_symlink_hops) |_| {
@@ -310,6 +360,7 @@ fn resolveFinalSymlinks(
                 &.{ std.fs.path.dirname(current) orelse ".", link_target },
             );
         if (next.len > maximum_path_bytes) {
+            path_too_long_length.* = next.len;
             allocator.free(next);
             return error.NameTooLong;
         }
@@ -328,6 +379,23 @@ fn diffLabel(
     if (old and !existed) return allocator.dupe(u8, "/dev/null");
     if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
     return std.fmt.allocPrint(allocator, "{c}/{s}", .{ if (old) @as(u8, 'a') else 'b', path });
+}
+
+fn pathPayloadCap(configured_max_path_bytes: usize, physical_max_path_bytes: usize) usize {
+    if (physical_max_path_bytes == 0) return 0;
+    return @min(configured_max_path_bytes, physical_max_path_bytes - 1);
+}
+
+fn pathCapDiagnostic(
+    allocator: std.mem.Allocator,
+    path_length: usize,
+    maximum_path_bytes: usize,
+) error{OutOfMemory}!Result {
+    return diagnosticFormat(
+        allocator,
+        "path is {d} bytes; path cap is {d}",
+        .{ path_length, maximum_path_bytes },
+    );
 }
 
 fn diagnosticCopy(allocator: std.mem.Allocator, message: []const u8) error{OutOfMemory}!Result {
@@ -558,6 +626,42 @@ test "path and symlink expansion bounds fail before mutation" {
     });
     defer bounded.deinit(allocator);
     try std.testing.expectEqualStrings("path is 5 bytes; path cap is 4", bounded.diagnostic);
+
+    var physical_max_minus_one = try writeWithDiffAtPhysicalPathMax(
+        allocator,
+        std.testing.io,
+        "1234",
+        "x",
+        .{ .maximum_file_bytes = 0, .maximum_path_bytes = 4 },
+        5,
+    );
+    defer physical_max_minus_one.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "content is 1 bytes; write cap is 0",
+        physical_max_minus_one.diagnostic,
+    );
+
+    var physical_max = try writeWithDiffAtPhysicalPathMax(
+        allocator,
+        std.testing.io,
+        "12345",
+        "x",
+        .{ .maximum_path_bytes = 5 },
+        5,
+    );
+    defer physical_max.deinit(allocator);
+    try std.testing.expectEqualStrings("path is 5 bytes; path cap is 4", physical_max.diagnostic);
+
+    var zero_physical_max = try writeWithDiffAtPhysicalPathMax(
+        allocator,
+        std.testing.io,
+        "1",
+        "x",
+        .{ .maximum_path_bytes = 1 },
+        0,
+    );
+    defer zero_physical_max.deinit(allocator);
+    try std.testing.expectEqualStrings("path is 1 bytes; path cap is 0", zero_physical_max.diagnostic);
 }
 
 test "strict hax parity preserves complete existing mode including set-ID" {
@@ -665,6 +769,69 @@ test "symlink expansion obeys the configured path cap" {
             path,
             path.len,
         ),
+    );
+}
+
+fn exerciseExpandedPathCapAllocations(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    physical_max_path_bytes: usize,
+) !void {
+    var result = try writeWithDiffAtPhysicalPathMax(
+        allocator,
+        std.testing.io,
+        path,
+        "x",
+        .{ .maximum_path_bytes = physical_max_path_bytes },
+        physical_max_path_bytes,
+    );
+    result.deinit(allocator);
+}
+
+test "symlink expansion rejects the exact injected physical maximum" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(std.testing.io, "ab", "ok", .{});
+    try tmp.dir.symLink(std.testing.io, "abc", "no", .{});
+
+    const ok_path = try testPath(std.testing.allocator, &tmp, "ok");
+    defer std.testing.allocator.free(ok_path);
+    const no_path = try testPath(std.testing.allocator, &tmp, "no");
+    defer std.testing.allocator.free(no_path);
+    const physical_max_path_bytes = no_path.len + 1;
+    const maximum_path_bytes = physical_max_path_bytes - 1;
+
+    var accepted = try writeWithDiffAtPhysicalPathMax(
+        std.testing.allocator,
+        std.testing.io,
+        ok_path,
+        "x",
+        .{ .maximum_file_bytes = 0, .maximum_path_bytes = physical_max_path_bytes },
+        physical_max_path_bytes,
+    );
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("content is 1 bytes; write cap is 0", accepted.diagnostic);
+
+    var rejected = try writeWithDiffAtPhysicalPathMax(
+        std.testing.allocator,
+        std.testing.io,
+        no_path,
+        "x",
+        .{ .maximum_path_bytes = physical_max_path_bytes },
+        physical_max_path_bytes,
+    );
+    defer rejected.deinit(std.testing.allocator);
+    const expected_diagnostic = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "path is {d} bytes; path cap is {d}",
+        .{ physical_max_path_bytes, maximum_path_bytes },
+    );
+    defer std.testing.allocator.free(expected_diagnostic);
+    try std.testing.expectEqualStrings(expected_diagnostic, rejected.diagnostic);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseExpandedPathCapAllocations,
+        .{ no_path, physical_max_path_bytes },
     );
 }
 
