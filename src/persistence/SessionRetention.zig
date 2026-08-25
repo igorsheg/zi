@@ -197,6 +197,8 @@ fn runWithStampOps(
 ) Error!Outcome {
     if (days != 0) {
         if (days > maximum_days) return error.InvalidDays;
+        try validatePath(sessions_root);
+        if (sessions_root.len == 1 or sessions_root[sessions_root.len - 1] == '/') return error.InvalidPath;
         if (exclude_path) |path| try validatePath(path);
     }
     var prepared = try prepareWithStampOps(io, sessions_root, now_epoch_seconds, days, stamp_ops);
