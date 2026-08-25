@@ -903,6 +903,9 @@ pub const TaskRegistry = struct {
     pub fn collectNotes(self: *TaskRegistry) Error!?Note {
         try self.ensurePublic();
         try self.pollAll();
+        // Sweep older collected jobs before planning this notification. After
+        // the note allocation succeeds, no fallible work may precede marking.
+        try self.sweep();
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.allocator);
         var plan: std.ArrayList(usize) = .empty;
@@ -935,7 +938,6 @@ pub const TaskRegistry = struct {
             if (self.entries.items[index].total_bytes == self.entries.items[index].delivered_bytes)
                 self.entries.items[index].collected = true;
         }
-        try self.sweep();
         return .{ .text = owned };
     }
 

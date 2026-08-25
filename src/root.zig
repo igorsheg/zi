@@ -7,6 +7,7 @@ pub const text = @import("text/root.zig");
 pub const persistence = @import("persistence/root.zig");
 pub const ProviderConfig = @import("ProviderConfig.zig");
 pub const ProviderRuntime = @import("ProviderRuntime.zig");
+pub const ToolRuntime = @import("ToolRuntime.zig");
 pub const CodexAuth = @import("CodexAuth.zig");
 pub const CatalogManager = @import("CatalogManager.zig");
 pub const CatalogService = @import("CatalogService.zig");
@@ -25,6 +26,7 @@ test {
     _ = persistence;
     _ = ProviderConfig;
     _ = ProviderRuntime;
+    _ = ToolRuntime;
     _ = CodexAuth;
     _ = CatalogManager;
     _ = CatalogService;
