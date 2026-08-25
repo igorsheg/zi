@@ -137,8 +137,13 @@ pub fn loadTierFile(
     if (stat.kind != .file or stat.nlink == 0) return resultWithoutDocument(owned_path, .non_regular);
     if (stat.size > maximum_file_bytes) return resultWithoutDocument(owned_path, .oversize);
 
-    const buffer = allocator.alloc(u8, maximum_file_bytes + 1) catch return error.OutOfMemory;
-    defer allocator.free(buffer);
+    // The buffer can contain API keys, headers, and prompt text. Route its
+    // complete capacity through a wiping allocator so partial reads, read
+    // errors, and future reallocations wipe every retired allocation.
+    var wiping_allocator: Document.WipingAllocator = .{ .backing = allocator };
+    const read_allocator = wiping_allocator.allocator();
+    const buffer = read_allocator.alloc(u8, maximum_file_bytes + 1) catch return error.OutOfMemory;
+    defer read_allocator.free(buffer);
     const count = file.readPositionalAll(io, buffer, 0) catch
         return resultWithoutDocument(owned_path, .unreadable);
     if (count > maximum_file_bytes) return resultWithoutDocument(owned_path, .oversize);
@@ -201,6 +206,7 @@ const TestSecureOpen = struct {
     base: []const u8,
     fail_open_oom: bool = false,
     open_substitute: ?[]const u8 = null,
+    write_only: bool = false,
 
     fn relative(self: *TestSecureOpen, path: []const u8) SecureOpen.Error![]const u8 {
         if (!std.mem.startsWith(u8, path, self.base) or path.len <= self.base.len or
@@ -220,7 +226,9 @@ const TestSecureOpen = struct {
     pub fn openAbsolute(self: *TestSecureOpen, io: std.Io, path: []const u8) SecureOpen.Error!std.Io.File {
         if (self.fail_open_oom) return error.OutOfMemory;
         const sub_path = self.open_substitute orelse try self.relative(path);
-        return self.directory.openFile(io, sub_path, .{}) catch |err| switch (err) {
+        return self.directory.openFile(io, sub_path, .{
+            .mode = if (self.write_only) .write_only else .read_only,
+        }) catch |err| switch (err) {
             error.FileNotFound => error.FileNotFound,
             error.AccessDenied, error.PermissionDenied => error.Unreadable,
             else => error.Failed,
@@ -366,4 +374,104 @@ test "injected open OOM propagates and opened kind drift is rejected" {
     var result = try loadTierFile(std.testing.allocator, std.testing.io, secure_open, path);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(Outcome.non_regular, result.outcome);
+}
+
+const ReadBufferObserver = struct {
+    backing: std.mem.Allocator,
+    target_frees: usize = 0,
+    target_freed_zeroed: bool = true,
+
+    fn allocator(self: *ReadBufferObserver) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ReadBufferObserver = @ptrCast(@alignCast(context));
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *ReadBufferObserver = @ptrCast(@alignCast(context));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *ReadBufferObserver = @ptrCast(@alignCast(context));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        const self: *ReadBufferObserver = @ptrCast(@alignCast(context));
+        if (memory.len == maximum_file_bytes + 1) {
+            self.target_frees += 1;
+            self.target_freed_zeroed = self.target_freed_zeroed and std.mem.allEqual(u8, memory, 0);
+        }
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+fn observeTierRead(
+    bytes: []const u8,
+    write_only: bool,
+    expected: Outcome,
+) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tier", .data = bytes });
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ base, "tier" });
+    defer std.testing.allocator.free(path);
+    var access: TestSecureOpen = .{
+        .directory = tmp.dir,
+        .base = base,
+        .write_only = write_only,
+    };
+    var observer: ReadBufferObserver = .{ .backing = std.testing.allocator };
+    var result = try loadTierFile(
+        observer.allocator(),
+        std.testing.io,
+        SecureOpen.Capability.from(&access),
+        path,
+    );
+    defer result.deinit(observer.allocator());
+    try std.testing.expectEqual(expected, result.outcome);
+    try std.testing.expectEqual(@as(usize, 1), observer.target_frees);
+    try std.testing.expect(observer.target_freed_zeroed);
+}
+
+test "tier read buffer is wiped after normal parse" {
+    try observeTierRead("{\"api_key\":\"READ_SECRET\"}", false, .loaded);
+}
+
+test "tier read buffer is wiped after invalid JSON" {
+    try observeTierRead("{\"api_key\":\"READ_SECRET\"", false, .invalid);
+}
+
+test "tier read buffer is wiped after read error" {
+    try observeTierRead("{\"api_key\":\"READ_SECRET\"}", true, .unreadable);
 }
