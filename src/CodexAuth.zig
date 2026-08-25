@@ -111,8 +111,8 @@ pub const PublicationOutcome = union(enum) {
     none,
     adopted_disk,
     published,
-    not_published: CredentialStore.MutationCause,
-    uncertain: CredentialStore.MutationCause,
+    not_published: CredentialStore.MutationFailure,
+    uncertain: CredentialStore.MutationFailure,
 };
 
 pub const InitFailure = struct {
@@ -187,10 +187,24 @@ pub const ManagedSource = struct {
         return self.state.account_pin;
     }
 
+    /// Returns a by-value snapshot without allocating. This call synchronizes
+    /// with credential callbacks and must not be made from inside one because
+    /// the source mutex is intentionally non-reentrant.
     pub fn publicationOutcome(self: *const ManagedSource) PublicationOutcome {
         self.state.mutex.lockUncancelable(self.state.init_io);
         defer self.state.mutex.unlock(self.state.init_io);
         return self.state.publication;
+    }
+
+    /// Returns the retained outcome exactly once and resets it to `.none`.
+    /// This does not allocate. As with `publicationOutcome`, do not call it
+    /// from a credential callback on this source.
+    pub fn takePublicationOutcome(self: *ManagedSource) PublicationOutcome {
+        self.state.mutex.lockUncancelable(self.state.init_io);
+        defer self.state.mutex.unlock(self.state.init_io);
+        const outcome = self.state.publication;
+        self.state.publication = .none;
+        return outcome;
     }
 };
 
@@ -346,12 +360,18 @@ const State = struct {
         };
         defer result.deinit(self.allocator);
 
-        self.publication = switch (result) {
+        self.recordPublication(switch (result) {
             .unchanged => if (transaction.adopted != null) .adopted_disk else .none,
             .published => .published,
-            .not_published => |failure| .{ .not_published = failure.cause },
-            .uncertain => |failure| .{ .uncertain = failure.cause },
-        };
+            .not_published => |failure| .{ .not_published = .{
+                .cause = failure.cause,
+                .orphan_name = failure.orphan_name,
+            } },
+            .uncertain => |failure| .{ .uncertain = .{
+                .cause = failure.cause,
+                .orphan_name = failure.orphan_name,
+            } },
+        });
         if (transaction.adopted) |loaded_value| {
             var loaded = loaded_value;
             transaction.adopted = null;
@@ -362,6 +382,16 @@ const State = struct {
             return .fresh;
         }
         return transaction.outcome;
+    }
+
+    fn recordPublication(self: *State, outcome: PublicationOutcome) void {
+        switch (self.publication) {
+            .uncertain => {},
+            .not_published => {
+                if (outcome == .uncertain) self.publication = outcome;
+            },
+            else => self.publication = outcome,
+        }
     }
 };
 
@@ -643,6 +673,7 @@ const TestRotator = struct {
     calls: usize = 0,
     mode: Mode = .success,
     store: ?*CredentialStore.Store = null,
+    scripted: bool = false,
     reentry_busy: bool = false,
     saw_disk_refresh: bool = false,
 
@@ -658,7 +689,17 @@ const TestRotator = struct {
         return switch (self.mode) {
             .success => .{ .response = .{
                 .status = 200,
-                .body = try allocator.dupe(u8, "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\"}"),
+                .body = if (self.scripted)
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "{{\"access_token\":\"new-access-{d}\",\"refresh_token\":\"new-refresh-{d}\"}}",
+                        .{ self.calls, self.calls },
+                    )
+                else
+                    try allocator.dupe(
+                        u8,
+                        "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\"}",
+                    ),
             } },
             .transient => .transient,
             .terminal => .{ .response = .{
@@ -786,6 +827,19 @@ const TestCommitFailure = struct {
     ) PrivateFileStore.Error!void {
         return error.IoFailure;
     }
+
+    fn dirSync(_: std.Io, _: ?*anyopaque, _: std.Io.Dir) PrivateFileStore.Error!void {
+        return error.IoFailure;
+    }
+
+    fn deleteTemp(
+        _: std.Io,
+        _: ?*anyopaque,
+        _: std.Io.Dir,
+        _: []const u8,
+    ) (PrivateFileStore.Error || error{FileNotFound})!void {
+        return error.IoFailure;
+    }
 };
 
 const TestPublication = enum { published, not_published, uncertain };
@@ -823,6 +877,125 @@ test "successful rotation is adopted for every publication outcome" {
             .uncertain => try std.testing.expect(source.publicationOutcome() == .uncertain),
         }
     }
+}
+
+test "publication warnings retain full failures across later rotations until taken" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var nonce: TestNonce = .{};
+    var store = CredentialStore.Store.init(
+        PrivateFileStore.Store.init(io, temporary.dir),
+        .{ .context = &nonce, .fill_fn = TestNonce.fill },
+    );
+    try seedManaged(&store);
+    var cli: TestCliLoader = .{};
+    var rotator: TestRotator = .{ .scripted = true };
+    var source = try initTestSource(&store, &cli, &rotator);
+    defer source.deinit();
+
+    store.commit_ops = .{
+        .write_fn = TestCommitFailure.write,
+        .delete_temp_fn = TestCommitFailure.deleteTemp,
+    };
+    try std.testing.expect(try source.state.refresh(io, null, true) == .fresh);
+    const first = source.publicationOutcome();
+    const first_orphan = switch (first) {
+        .not_published => |failure| orphan: {
+            try std.testing.expectEqual(CredentialStore.MutationCause.io_failure, failure.cause);
+            break :orphan failure.orphan_name orelse return error.TestUnexpectedResult;
+        },
+        else => return error.TestUnexpectedResult,
+    };
+
+    try std.testing.expect(try source.state.refresh(io, null, true) == .fresh);
+    try std.testing.expectEqual(@as(usize, 1), rotator.calls);
+    try std.testing.expect(try source.state.refresh(io, null, true) == .fresh);
+    try std.testing.expectEqual(@as(usize, 2), rotator.calls);
+    switch (source.publicationOutcome()) {
+        .not_published => |failure| try std.testing.expectEqualStrings(
+            first_orphan.bytes(),
+            failure.orphan_name.?.bytes(),
+        ),
+        else => return error.TestUnexpectedResult,
+    }
+
+    store.commit_ops = .standard;
+    try std.testing.expect(try source.state.refresh(io, null, true) == .fresh);
+    try std.testing.expectEqual(@as(usize, 2), rotator.calls);
+    try std.testing.expect(try source.state.refresh(io, null, true) == .fresh);
+    try std.testing.expectEqual(@as(usize, 3), rotator.calls);
+    try std.testing.expect(source.publicationOutcome() == .not_published);
+
+    store.commit_ops = .{
+        .rename_fn = TestCommitFailure.rename,
+        .delete_temp_fn = TestCommitFailure.deleteTemp,
+    };
+    try std.testing.expect(try source.state.refresh(io, null, true) == .fresh);
+    const severe = source.publicationOutcome();
+    const severe_orphan = switch (severe) {
+        .uncertain => |failure| orphan: {
+            try std.testing.expectEqual(CredentialStore.MutationCause.io_failure, failure.cause);
+            break :orphan failure.orphan_name orelse return error.TestUnexpectedResult;
+        },
+        else => return error.TestUnexpectedResult,
+    };
+
+    try std.testing.expect(try source.state.refresh(io, null, true) == .fresh);
+    try std.testing.expectEqual(@as(usize, 4), rotator.calls);
+    try std.testing.expect(try source.state.refresh(io, null, true) == .fresh);
+    try std.testing.expectEqual(@as(usize, 5), rotator.calls);
+    switch (source.publicationOutcome()) {
+        .uncertain => |failure| try std.testing.expectEqualStrings(
+            severe_orphan.bytes(),
+            failure.orphan_name.?.bytes(),
+        ),
+        else => return error.TestUnexpectedResult,
+    }
+
+    store.commit_ops = .standard;
+    try std.testing.expect(try source.state.refresh(io, null, true) == .fresh);
+    try std.testing.expectEqual(@as(usize, 5), rotator.calls);
+    try std.testing.expect(try source.state.refresh(io, null, true) == .fresh);
+    try std.testing.expectEqual(@as(usize, 6), rotator.calls);
+    switch (source.publicationOutcome()) {
+        .uncertain => |failure| try std.testing.expectEqualStrings(
+            severe_orphan.bytes(),
+            failure.orphan_name.?.bytes(),
+        ),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(source.takePublicationOutcome() == .uncertain);
+    try std.testing.expect(source.takePublicationOutcome() == .none);
+    try std.testing.expect(source.publicationOutcome() == .none);
+}
+
+test "rejected-token delete ambiguity is a typed uncertain publication" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var nonce: TestNonce = .{};
+    var store = CredentialStore.Store.init(
+        PrivateFileStore.Store.init(io, temporary.dir),
+        .{ .context = &nonce, .fill_fn = TestNonce.fill },
+    );
+    try seedManaged(&store);
+    store.commit_ops = .{ .dir_sync_fn = TestCommitFailure.dirSync };
+    var cli: TestCliLoader = .{};
+    var rotator: TestRotator = .{ .mode = .terminal };
+    var source = try initTestSource(&store, &cli, &rotator);
+    defer source.deinit();
+
+    try std.testing.expect(try source.state.refresh(io, null, true) == .dead);
+    switch (source.publicationOutcome()) {
+        .uncertain => |failure| {
+            try std.testing.expectEqual(CredentialStore.MutationCause.io_failure, failure.cause);
+            try std.testing.expect(failure.orphan_name == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqualStrings("e.eyJleHAiOjE2MDB9.s", source.state.current.access_token);
 }
 
 test "terminal removes transient retains and same-store reentry is transient" {
