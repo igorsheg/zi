@@ -130,6 +130,20 @@ pub const Loaded = struct {
     }
 };
 
+/// Move-only result of an atomic resume open. `log` retains the exclusive
+/// lock acquired before `loaded` was read, so its append offset and high-water
+/// mark describe that exact snapshot.
+pub const ResumeLoaded = struct {
+    loaded: Loaded,
+    log: Log,
+
+    pub fn deinit(self: *ResumeLoaded) void {
+        self.log.deinit();
+        self.loaded.deinit();
+        self.* = undefined;
+    }
+};
+
 /// `state_root` and its existing parents are trusted private configuration.
 /// New descendants are created with owner-only permissions.
 pub const PrepareOptions = struct {
@@ -154,6 +168,7 @@ pub const ResumeOptions = struct {
 
 pub const TouchError = error{
     Canceled,
+    Busy,
     InvalidPath,
     NotRegular,
     Removed,
@@ -958,9 +973,9 @@ fn failEffectiveSelection(
 /// Updates both timestamps on an existing session, matching hax's
 /// `session_touch`. The absolute path and its parents are a trusted private
 /// boundary. The no-follow pre-stat prevents blocking on an existing FIFO;
-/// that boundary must prevent replacement before the no-follow open. Only an
-/// unsupported lock facility is ignored; cancellation and resource failures
-/// abort before changing timestamps.
+/// that boundary must prevent replacement before the no-follow open. Lock
+/// contention or an unsupported lock facility returns `Busy`; cancellation
+/// and resource failures abort before changing timestamps.
 pub fn touch(io: std.Io, path: []const u8) TouchError!void {
     if (!safeAbsolutePath(path)) return error.InvalidPath;
     const named_stat = std.Io.Dir.statFile(.cwd(), io, path, .{ .follow_symlinks = false }) catch
@@ -975,15 +990,13 @@ pub fn touch(io: std.Io, path: []const u8) TouchError!void {
     }) catch return error.IoFailure;
     defer file.close(io);
 
-    const locked = lock: {
-        file.lock(io, .shared) catch |err| switch (err) {
-            error.FileLocksUnsupported => break :lock false,
-            error.Canceled => return error.Canceled,
-            else => return error.IoFailure,
-        };
-        break :lock true;
+    const locked = file.tryLock(io, .shared) catch |err| switch (err) {
+        error.FileLocksUnsupported => false,
+        error.Canceled => return error.Canceled,
+        else => return error.IoFailure,
     };
-    defer if (locked) file.unlock(io);
+    if (!locked) return error.Busy;
+    defer file.unlock(io);
 
     const opened_stat = file.stat(io) catch return error.IoFailure;
     if (opened_stat.kind != .file) return error.NotRegular;
@@ -1201,6 +1214,16 @@ pub fn load(
     const locked = file.tryLock(io, .shared) catch return error.IoFailure;
     if (!locked) return error.SessionBusy;
     const stat = file.stat(io) catch return error.IoFailure;
+    return loadOpened(allocator, io, file, stat, limits);
+}
+
+fn loadOpened(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    stat: std.Io.File.Stat,
+    limits: Limits,
+) Error!Loaded {
     if (stat.kind != .file) return error.NotRegular;
     if (stat.nlink == 0) return error.Removed;
     if (stat.size > limits.max_file_bytes) return error.FileTooLarge;
@@ -1350,6 +1373,68 @@ pub fn load(
         .item_high_water = decoded.items.len,
         .recovery = recovery,
     };
+}
+
+/// Reads a resume snapshot and constructs its append log while one exclusive
+/// nonblocking lock is held on the same open file.
+pub fn loadForResume(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    limits: Limits,
+) Error!ResumeLoaded {
+    try validateLimits(limits);
+    if (!safeAbsolutePath(path)) return error.InvalidPath;
+    const file = std.Io.Dir.openFile(.cwd(), io, path, .{
+        .mode = .read_write,
+        .follow_symlinks = false,
+    }) catch return error.IoFailure;
+    var file_owned = true;
+    errdefer if (file_owned) file.close(io);
+    const locked = file.tryLock(io, .exclusive) catch return error.IoFailure;
+    if (!locked) return error.SessionBusy;
+    const stat = file.stat(io) catch return error.IoFailure;
+    var loaded = try loadOpened(allocator, io, file, stat, limits);
+    errdefer loaded.deinit();
+
+    var selection = OwnedSelection.init(allocator, loaded.meta.selection.borrow()) catch |err| return mapAlloc(err);
+    errdefer selection.deinit(allocator);
+    const session_path = allocator.dupe(u8, path) catch return error.OutOfMemory;
+    errdefer allocator.free(session_path);
+    const id = dupeOptional(allocator, loaded.meta.id) catch return error.OutOfMemory;
+    errdefer if (id) |value| allocator.free(value);
+
+    var append_offset = stat.size;
+    if (stat.size != 0) {
+        var last: [1]u8 = undefined;
+        const read = file.readPositionalAll(io, &last, stat.size - 1) catch return error.IoFailure;
+        if (read != 1) return error.IoFailure;
+        if (last[0] != '\n') {
+            if (stat.size >= limits.max_file_bytes) return error.FileTooLarge;
+            file.writePositionalAll(io, "\n", stat.size) catch return error.IoFailure;
+            append_offset += 1;
+        }
+    }
+    file.setPermissions(io, .fromMode(0o600)) catch return error.IoFailure;
+    const log: Log = .{
+        .allocator = allocator,
+        .io = io,
+        .limits = limits,
+        .state_root = null,
+        .cwd = null,
+        .path_value = session_path,
+        .id = id,
+        .timestamp = null,
+        .writer_version = null,
+        .selection = selection,
+        .git_probe = null,
+        .file = file,
+        .append_offset = append_offset,
+        .header_written = true,
+        .written_items = loaded.item_high_water,
+    };
+    file_owned = false;
+    return .{ .loaded = loaded, .log = log };
 }
 
 fn decodeHeader(
@@ -2619,4 +2704,42 @@ test "fork handles absent and nonstring old ids and ignores label-only pending" 
             try std.testing.expectEqualStrings("keep", object.get("forked_from").?.string);
         }
     }
+}
+
+test "atomic resume retains exclusive lock on the loaded file identity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const uuid = [_]u8{ 3, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 3 };
+    var source = try Log.prepare(allocator, io, .{
+        .state_root = root,
+        .cwd = "/work",
+        .selection = .{ .provider = "p" },
+        .timestamp = .{ .epoch_seconds = 0 },
+        .uuid = uuid,
+        .writer_version = "test",
+    });
+    const first = [_]ai.Item.Item{.{ .user_message = .{ .text = @constCast("first") } }};
+    try source.appendSnapshot(0, &first);
+    const path_value = try allocator.dupe(u8, source.path());
+    defer allocator.free(path_value);
+    source.deinit();
+
+    var resumed = try loadForResume(allocator, io, path_value, .{});
+    try std.testing.expectError(error.Busy, touch(io, path_value));
+    const competitor = try std.Io.Dir.openFile(.cwd(), io, path_value, .{ .mode = .read_only });
+    defer competitor.close(io);
+    try std.testing.expect(!try competitor.tryLock(io, .shared));
+    try resumed.loaded.session.addBoundary();
+    try resumed.log.appendSnapshot(resumed.log.highWater(), resumed.loaded.session.items());
+    resumed.deinit();
+
+    try std.testing.expect(try competitor.tryLock(io, .shared));
+    competitor.unlock(io);
+    var loaded = try load(allocator, io, path_value, .{});
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.session.items().len);
 }

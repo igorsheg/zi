@@ -170,6 +170,19 @@ pub const Session = struct {
         replacement.deinit(self.allocator);
     }
 
+    /// Replaces admission limits without cloning history. The existing selection
+    /// and every retained item must fit the new limits. Failure preserves the old limits.
+    pub fn reconfigureLimits(self: *Session, limits: Limits) Error!void {
+        try self.ensureMutable();
+        try validateSelection(self.currentSelection(), limits);
+        if (self.record.items.len > limits.items) return error.TooManyItems;
+        if (self.retained_bytes > limits.retained_bytes) return error.RetainedDataTooLarge;
+        if (self.image_count > limits.images) return error.TooManyImages;
+        if (self.image_base64_bytes > limits.image_base64_bytes) return error.ImageDataTooLarge;
+        for (self.record.items) |item| try validateItemLimits(item, limits);
+        self.limits = limits;
+    }
+
     /// Clears conversation items while retaining selection and vector capacity.
     pub fn reset(self: *Session) void {
         std.debug.assert(self.run_state == .idle);
@@ -752,6 +765,39 @@ fn validateSelection(selection: Selection, limits: Limits) Error!void {
     }
 }
 
+fn validateItemLimits(item: Item, limits: Limits) Error!void {
+    try validateItem(item);
+    if (item == .user_message and item.user_message.text.len > limits.user_text_bytes) {
+        return error.UserTextTooLarge;
+    }
+    const source = switch (item) {
+        .reasoning => |value| value.source,
+        .turn_usage => |value| value.source,
+        else => null,
+    };
+    if (source) |identity| {
+        if (identity.provider) |value| if (value.len > limits.provenance_value_bytes) {
+            return error.ProvenanceTooLarge;
+        };
+        if (identity.model) |value| if (value.len > limits.provenance_value_bytes) {
+            return error.ProvenanceTooLarge;
+        };
+    }
+    if (item == .turn_usage) {
+        const provenance = item.turn_usage.value.provenance;
+        inline for (.{
+            provenance.provider_label,
+            provenance.model_label,
+            provenance.effort,
+            provenance.served_model,
+            provenance.route,
+            provenance.response_id,
+        }) |value| if (value) |bytes| if (bytes.len > limits.provenance_value_bytes) {
+            return error.ProvenanceTooLarge;
+        };
+    }
+}
+
 fn validateItem(item: Item) Error!void {
     const images: []const ai.Item.Image = switch (item) {
         .user_message => |message| message.images,
@@ -1227,4 +1273,31 @@ test "boundary and usage footer admission is atomic under allocation failure" {
         }
     }
     try std.testing.expect(saw_success);
+}
+
+test "reconfigure limits validates retained history without cloning it" {
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try session.addUser("four");
+    const text_pointer = session.items()[1].user_message.text.ptr;
+
+    try std.testing.expectError(error.UserTextTooLarge, session.reconfigureLimits(.{
+        .user_text_bytes = 3,
+    }));
+    try session.addUser("still uses the old limits");
+    try session.reconfigureLimits(.{
+        .items = 16,
+        .user_text_bytes = 32,
+    });
+    try std.testing.expectEqual(text_pointer, session.items()[1].user_message.text.ptr);
+    try std.testing.expectError(error.UserTextTooLarge, session.addUser("012345678901234567890123456789012"));
+}
+
+test "reconfigure limits rejects aggregate history and preserves old limits" {
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try session.addUser("hello");
+    try std.testing.expectError(error.TooManyItems, session.reconfigureLimits(.{ .items = 1 }));
+    try session.addBoundary();
+    try std.testing.expectEqual(@as(usize, 3), session.items().len);
 }
