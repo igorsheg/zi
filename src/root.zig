@@ -10,6 +10,7 @@ pub const ProviderRuntime = @import("ProviderRuntime.zig");
 pub const ToolRuntime = @import("ToolRuntime.zig");
 pub const CodexAuth = @import("CodexAuth.zig");
 pub const CodexRefreshRotator = @import("CodexRefreshRotator.zig");
+pub const CodexRuntime = @import("CodexRuntime.zig");
 pub const CatalogManager = @import("CatalogManager.zig");
 pub const CatalogService = @import("CatalogService.zig");
 pub const PromptAssembly = @import("PromptAssembly.zig");
@@ -32,6 +33,7 @@ test {
     _ = ToolRuntime;
     _ = CodexAuth;
     _ = CodexRefreshRotator;
+    _ = CodexRuntime;
     _ = CatalogManager;
     _ = CatalogService;
     _ = PromptAssembly;
