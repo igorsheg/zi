@@ -117,6 +117,8 @@ fn cacheRoot(
     const tail_len = 1 + middle.len + "zi".len;
     if (value.len > config.Loader.maximum_path_bytes or
         tail_len > config.Loader.maximum_path_bytes - value.len) return error.PathTooLong;
+    const path_len = value.len + tail_len;
+    if (path_len >= std.fs.max_path_bytes) return error.PathTooLong;
     return std.fmt.allocPrint(allocator, "{s}/{s}zi", .{ value, middle }) catch error.OutOfMemory;
 }
 
@@ -174,17 +176,9 @@ pub fn readFile(
 
 /// Creates the final cache directory below its trusted parent and rejects a final symlink.
 pub fn ensurePrivateCacheRoot(io: std.Io, cache_root: []const u8) !void {
-    if (cache_root.len == 0 or cache_root.len > std.fs.max_path_bytes or
-        !std.fs.path.isAbsolute(cache_root) or std.mem.findScalar(u8, cache_root, 0) != null or
-        !std.unicode.utf8ValidateSlice(cache_root) or std.mem.eql(u8, cache_root, "/"))
-    {
-        return error.InvalidPath;
-    }
-    const parent_path = std.fs.path.dirname(cache_root) orelse return error.InvalidPath;
-    const name = std.fs.path.basename(cache_root);
-    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
-        return error.InvalidPath;
-    }
+    const parts = try validatePrivateCacheRoot(cache_root);
+    const parent_path = parts.parent;
+    const name = parts.name;
     try std.Io.Dir.cwd().createDirPath(io, parent_path);
     const parent = try std.Io.Dir.cwd().openDir(io, parent_path, .{});
     defer parent.close(io);
@@ -198,6 +192,26 @@ pub fn ensurePrivateCacheRoot(io: std.Io, cache_root: []const u8) !void {
     });
     defer directory.close(io);
     try directory.setPermissions(io, .fromMode(0o700));
+}
+
+const CacheRootParts = struct {
+    parent: []const u8,
+    name: []const u8,
+};
+
+fn validatePrivateCacheRoot(cache_root: []const u8) error{InvalidPath}!CacheRootParts {
+    if (cache_root.len == 0 or cache_root.len >= std.fs.max_path_bytes or
+        !std.fs.path.isAbsolute(cache_root) or std.mem.findScalar(u8, cache_root, 0) != null or
+        !std.unicode.utf8ValidateSlice(cache_root) or std.mem.eql(u8, cache_root, "/"))
+    {
+        return error.InvalidPath;
+    }
+    const parent = std.fs.path.dirname(cache_root) orelse return error.InvalidPath;
+    const name = std.fs.path.basename(cache_root);
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
+        return error.InvalidPath;
+    }
+    return .{ .parent = parent, .name = name };
 }
 
 pub const CwdError = error{ OutOfMemory, CwdTooLong, InvalidCwd, CurrentDirUnlinked, Canceled, Unexpected };
@@ -405,6 +419,38 @@ fn exerciseRuntimePathAllocations(allocator: std.mem.Allocator) !void {
         .home = "/home",
     });
     defer paths.deinit(allocator);
+}
+
+test "cache paths reserve the physical sentinel byte before allocation or I/O" {
+    const suffix_len = "/zi".len;
+    if (std.fs.max_path_bytes <= suffix_len or
+        std.fs.max_path_bytes > config.Loader.maximum_path_bytes) return;
+
+    const last_base_len = std.fs.max_path_bytes - 1 - suffix_len;
+    const last_base = try std.testing.allocator.alloc(u8, last_base_len);
+    defer std.testing.allocator.free(last_base);
+    @memset(last_base, 'x');
+    last_base[0] = '/';
+    const last_root = (try cacheRoot(std.testing.allocator, .{ .xdg_cache_home = last_base })).?;
+    defer std.testing.allocator.free(last_root);
+    try std.testing.expectEqual(std.fs.max_path_bytes - 1, last_root.len);
+    _ = try validatePrivateCacheRoot(last_root);
+
+    const boundary_base = try std.testing.allocator.alloc(u8, last_base_len + 1);
+    defer std.testing.allocator.free(boundary_base);
+    @memset(boundary_base, 'x');
+    boundary_base[0] = '/';
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.PathTooLong,
+        cacheRoot(failing.allocator(), .{ .xdg_cache_home = boundary_base }),
+    );
+
+    const boundary_root = try std.testing.allocator.alloc(u8, std.fs.max_path_bytes);
+    defer std.testing.allocator.free(boundary_root);
+    @memset(boundary_root, 'x');
+    boundary_root[0] = '/';
+    try std.testing.expectError(error.InvalidPath, validatePrivateCacheRoot(boundary_root));
 }
 
 test "runtime paths validate cache inputs bounds and allocation failures" {

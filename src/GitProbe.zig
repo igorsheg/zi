@@ -106,13 +106,7 @@ pub fn probe(
     io: std.Io,
     options: Options,
 ) Error!Result {
-    const path_valid = options.git_executable != null or options.path == null or
-        (options.path.?.len <= maximum_path_bytes and validSearchPath(options.path.?));
-    if (!canonicalAbsolute(options.cwd) or !path_valid or
-        options.timeout.nanoseconds <= 0 or options.timeout.nanoseconds > default_timeout.nanoseconds)
-    {
-        return .unavailable;
-    }
+    if (preflightOptions(options) != null) return .unavailable;
 
     var executable_buffer: [maximum_path_bytes]u8 = undefined;
     const executable = resolveExecutable(io, options, &executable_buffer) orelse return .unavailable;
@@ -202,11 +196,47 @@ pub const SessionAdapter = struct {
 
 const GitProbe = @This();
 
+const PreflightFailure = enum { invalid_path, path_too_long, invalid_timeout };
+
+fn preflightOptions(options: Options) ?PreflightFailure {
+    if (!canonicalAbsolute(options.cwd)) return .invalid_path;
+    if (options.cwd.len >= std.fs.max_path_bytes) return .path_too_long;
+    if (options.timeout.nanoseconds <= 0 or options.timeout.nanoseconds > default_timeout.nanoseconds) {
+        return .invalid_timeout;
+    }
+
+    if (options.git_executable) |executable| {
+        if (!canonicalAbsolute(executable)) return .invalid_path;
+        if (executable.len >= std.fs.max_path_bytes) return .path_too_long;
+        return null;
+    }
+    const path = options.path orelse return null;
+    // PATH is not itself passed to a pathname syscall, so its inclusive logical
+    // cap is independent of the sentinel byte required by each candidate.
+    if (path.len > maximum_path_bytes) return .path_too_long;
+    if (!validSearchPath(path)) return .invalid_path;
+    return null;
+}
+
+fn executablePathLength(directory: []const u8) ?usize {
+    if (directory.len == 1) return "git".len + 1;
+    return std.math.add(usize, directory.len, "/git".len) catch null;
+}
+
 fn resolveExecutable(io: std.Io, options: Options, buffer: []u8) ?[]const u8 {
+    return resolveExecutableChecking(io, options, buffer, regularExecutable);
+}
+
+fn resolveExecutableChecking(
+    io: std.Io,
+    options: Options,
+    buffer: []u8,
+    is_executable: *const fn (std.Io, []const u8) bool,
+) ?[]const u8 {
     if (options.git_executable) |path| {
-        if (!canonicalAbsolute(path) or path.len > buffer.len) return null;
+        if (!canonicalAbsolute(path) or path.len >= std.fs.max_path_bytes or path.len > buffer.len) return null;
         @memcpy(buffer[0..path.len], path);
-        return if (regularExecutable(io, buffer[0..path.len])) buffer[0..path.len] else null;
+        return if (is_executable(io, buffer[0..path.len])) buffer[0..path.len] else null;
     }
     var system_path_buffer: [maximum_path_bytes]u8 = undefined;
     const path = options.path orelse systemSearchPath(&system_path_buffer) orelse return null;
@@ -215,8 +245,8 @@ fn resolveExecutable(io: std.Io, options: Options, buffer: []u8) ?[]const u8 {
         // This is an intentional security narrowing from execvp: empty and
         // relative namespaces never resolve against ambient cwd.
         if (!canonicalAbsolute(directory)) continue;
-        const needed = std.math.add(usize, directory.len, 4) catch continue;
-        if (needed > buffer.len) continue;
+        const needed = executablePathLength(directory) orelse continue;
+        if (needed >= std.fs.max_path_bytes or needed > buffer.len) continue;
         @memcpy(buffer[0..directory.len], directory);
         var end = directory.len;
         if (end != 1) {
@@ -225,13 +255,13 @@ fn resolveExecutable(io: std.Io, options: Options, buffer: []u8) ?[]const u8 {
         }
         @memcpy(buffer[end .. end + 3], "git");
         end += 3;
-        if (regularExecutable(io, buffer[0..end])) return buffer[0..end];
+        if (is_executable(io, buffer[0..end])) return buffer[0..end];
     }
     return null;
 }
 
 fn regularExecutable(io: std.Io, path: []const u8) bool {
-    if (std.mem.findScalar(u8, path, 0) != null) return false;
+    if (path.len >= std.fs.max_path_bytes or std.mem.findScalar(u8, path, 0) != null) return false;
     const file = std.Io.Dir.openFile(.cwd(), io, path, .{}) catch return false;
     defer file.close(io);
     const stat = file.stat(io) catch return false;
@@ -456,6 +486,127 @@ test "canonical paths reject ambiguous components" {
     try std.testing.expect(!canonicalAbsolute("a/b"));
     try std.testing.expect(!canonicalAbsolute("/a//b"));
     try std.testing.expect(!canonicalAbsolute("/a/../b"));
+}
+
+test "syscall paths reserve the sentinel while PATH keeps its inclusive cap" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    const base: Options = .{ .cwd = "/", .environ = &environ, .git_executable = "/git" };
+
+    const cwd_last = try std.testing.allocator.alloc(u8, std.fs.max_path_bytes - 1);
+    defer std.testing.allocator.free(cwd_last);
+    @memset(cwd_last, 'a');
+    cwd_last[0] = '/';
+    var options = base;
+    options.cwd = cwd_last;
+    try std.testing.expectEqual(null, preflightOptions(options));
+
+    const cwd_max = try std.testing.allocator.alloc(u8, std.fs.max_path_bytes);
+    defer std.testing.allocator.free(cwd_max);
+    @memset(cwd_max, 'a');
+    cwd_max[0] = '/';
+    options.cwd = cwd_max;
+    try std.testing.expectEqual(.path_too_long, preflightOptions(options).?);
+
+    const executable_last = try std.testing.allocator.alloc(u8, std.fs.max_path_bytes - 1);
+    defer std.testing.allocator.free(executable_last);
+    @memset(executable_last, 'a');
+    executable_last[0] = '/';
+    options = base;
+    options.git_executable = executable_last;
+    try std.testing.expectEqual(null, preflightOptions(options));
+
+    const executable_max = try std.testing.allocator.alloc(u8, std.fs.max_path_bytes);
+    defer std.testing.allocator.free(executable_max);
+    @memset(executable_max, 'a');
+    executable_max[0] = '/';
+    options.git_executable = executable_max;
+    try std.testing.expectEqual(.path_too_long, preflightOptions(options).?);
+
+    const directory_last = try std.testing.allocator.alloc(u8, std.fs.max_path_bytes - 5);
+    defer std.testing.allocator.free(directory_last);
+    @memset(directory_last, 'a');
+    directory_last[0] = '/';
+    try std.testing.expectEqual(std.fs.max_path_bytes - 1, executablePathLength(directory_last).?);
+
+    const directory_max = try std.testing.allocator.alloc(u8, std.fs.max_path_bytes - 4);
+    defer std.testing.allocator.free(directory_max);
+    @memset(directory_max, 'a');
+    directory_max[0] = '/';
+    try std.testing.expectEqual(std.fs.max_path_bytes, executablePathLength(directory_max).?);
+
+    options = base;
+    options.git_executable = null;
+    const path_max = try std.testing.allocator.alloc(u8, maximum_path_bytes);
+    defer std.testing.allocator.free(path_max);
+    @memset(path_max, 'a');
+    path_max[0] = '/';
+    const split = path_max.len / 2;
+    path_max[split] = ':';
+    path_max[split + 1] = '/';
+    options.path = path_max;
+    try std.testing.expectEqual(null, preflightOptions(options));
+
+    const path_over = try std.testing.allocator.alloc(u8, maximum_path_bytes + 1);
+    defer std.testing.allocator.free(path_over);
+    @memcpy(path_over[0..maximum_path_bytes], path_max);
+    path_over[maximum_path_bytes] = 'a';
+    options.path = path_over;
+    try std.testing.expectEqual(.path_too_long, preflightOptions(options).?);
+}
+
+fn acceptRootGit(_: std.Io, path: []const u8) bool {
+    return std.mem.eql(u8, path, "/git");
+}
+
+test "executable search skips oversized candidates and preserves first-hit order" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    const oversized = try std.testing.allocator.alloc(u8, std.fs.max_path_bytes - 4);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'a');
+    oversized[0] = '/';
+    var buffer: [maximum_path_bytes]u8 = undefined;
+
+    const oversized_first = try std.fmt.allocPrint(std.testing.allocator, "{s}:/", .{oversized});
+    defer std.testing.allocator.free(oversized_first);
+    const after_oversized = resolveExecutableChecking(std.testing.io, .{
+        .cwd = "/",
+        .environ = &environ,
+        .path = oversized_first,
+    }, &buffer, acceptRootGit).?;
+    try std.testing.expectEqualStrings("/git", after_oversized);
+
+    const valid_first = try std.fmt.allocPrint(std.testing.allocator, "/:{s}", .{oversized});
+    defer std.testing.allocator.free(valid_first);
+    const before_oversized = resolveExecutableChecking(std.testing.io, .{
+        .cwd = "/",
+        .environ = &environ,
+        .path = valid_first,
+    }, &buffer, acceptRootGit).?;
+    try std.testing.expectEqualStrings("/git", before_oversized);
+}
+
+test "preflight reports syntax before bounds and bounds before timeout" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    const invalid_long = try std.testing.allocator.alloc(u8, std.fs.max_path_bytes);
+    defer std.testing.allocator.free(invalid_long);
+    @memset(invalid_long, 'a');
+
+    try std.testing.expectEqual(.invalid_path, preflightOptions(.{
+        .cwd = invalid_long,
+        .environ = &environ,
+        .git_executable = "/git",
+        .timeout = .fromNanoseconds(0),
+    }).?);
+    invalid_long[0] = '/';
+    try std.testing.expectEqual(.path_too_long, preflightOptions(.{
+        .cwd = invalid_long,
+        .environ = &environ,
+        .git_executable = "/git",
+        .timeout = .fromNanoseconds(0),
+    }).?);
 }
 
 fn temporaryRoot(tmp: *std.testing.TmpDir, buffer: []u8) ![]const u8 {

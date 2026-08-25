@@ -71,6 +71,9 @@ fn joinValidated(
         "zi/".len + leaf.len;
     if (base.len > maximum_path_bytes or tail_len > maximum_path_bytes - base.len)
         return error.PathTooLong;
+    const path_len = base.len + tail_len;
+    // std.fs reserves one byte for the sentinel passed to pathname syscalls.
+    if (path_len >= std.fs.max_path_bytes) return error.PathTooLong;
     return if (middle.len == 0)
         std.fmt.allocPrint(allocator, "{s}/zi/{s}", .{ base, leaf })
     else
@@ -279,6 +282,30 @@ test "path validation rejects relative NUL invalid UTF-8 and oversized paths" {
     try std.testing.expectError(error.InvalidPath, configPath(std.testing.allocator, .{ .xdg_config_home = "/\xff" }));
     const long = "/" ++ "a" ** maximum_path_bytes;
     try std.testing.expectError(error.PathTooLong, configPath(std.testing.allocator, .{ .xdg_config_home = long }));
+}
+
+test "constructed config path reserves the physical sentinel byte before allocation" {
+    const suffix_len = "/zi/config.json".len;
+    if (std.fs.max_path_bytes > maximum_path_bytes or std.fs.max_path_bytes <= suffix_len) return;
+
+    const last_base_len = std.fs.max_path_bytes - 1 - suffix_len;
+    const last_base = try std.testing.allocator.alloc(u8, last_base_len);
+    defer std.testing.allocator.free(last_base);
+    @memset(last_base, 'x');
+    last_base[0] = '/';
+    const last_path = (try configPath(std.testing.allocator, .{ .xdg_config_home = last_base })).?;
+    defer std.testing.allocator.free(last_path);
+    try std.testing.expectEqual(std.fs.max_path_bytes - 1, last_path.len);
+
+    const boundary_base = try std.testing.allocator.alloc(u8, last_base_len + 1);
+    defer std.testing.allocator.free(boundary_base);
+    @memset(boundary_base, 'x');
+    boundary_base[0] = '/';
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.PathTooLong,
+        configPath(failing.allocator(), .{ .xdg_config_home = boundary_base }),
+    );
 }
 
 test "tier file missing empty valid malformed directory and oversize" {
