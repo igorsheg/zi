@@ -7,6 +7,7 @@ pub const ProcessAdapters = @import("ProcessAdapters.zig");
 pub const OneShot = @import("OneShot.zig");
 pub const SessionStartup = @import("SessionStartup.zig");
 pub const StartupConfig = @import("StartupConfig.zig");
+pub const Stats = @import("Stats.zig");
 
 pub const Command = union(enum) {
     help,
@@ -96,6 +97,7 @@ test {
     _ = OneShot;
     _ = SessionStartup;
     _ = StartupConfig;
+    _ = Stats;
 }
 
 test "CLI parser admits only the bootstrap command surface" {
