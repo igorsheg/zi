@@ -175,7 +175,8 @@ pub const UsageObserver = struct {
 };
 
 /// Runs before every provider request and before its session snapshot. The
-/// implementation may append provider-visible bookkeeping to the session.
+/// implementation may append provider-visible bookkeeping, but must not
+/// reconfigure the session selection.
 pub const PreRequestHook = struct {
     context: *anyopaque,
     call_fn: *const fn (*anyopaque, *Session) HookError!void,
@@ -202,13 +203,18 @@ pub const PreRequestHook = struct {
 };
 
 pub const ContinuationResult = enum {
+    /// Promises that the hook left the session selection unchanged, preserving
+    /// Loop's active effort.
     unchanged,
+    /// Refreshes Loop's active effort and emits a `.compaction` durability seam.
     changed,
+    /// Refreshes Loop's active effort without claiming that context was compacted.
+    selection_changed,
     paused,
 };
 
-/// Runs only at a tool continuation point. `.changed` promises that the hook
-/// left a valid mutated session; Loop then emits a `.compaction` durability seam.
+/// Runs only at a tool continuation point. Selection refreshes make Loop read
+/// the session's live effort immediately before each later provider request.
 pub const ContinuationHook = struct {
     context: *anyopaque,
     call_fn: *const fn (*anyopaque, *Session) HookError!ContinuationResult,
@@ -556,6 +562,11 @@ pub fn run(
     if (params.maximum_request_images == 0 or params.maximum_request_image_base64_bytes == 0) {
         return error.InvalidResult;
     }
+    const initial_effort = if (params.effort) |effort|
+        try allocator.dupe(u8, effort)
+    else
+        null;
+    defer if (initial_effort) |effort| allocator.free(effort);
     const dispatch = try tool.Dispatch.Dispatch.init(params.tools, .{});
     const definitions = try dispatch.advertisedDefinitions(allocator);
     defer allocator.free(definitions);
@@ -569,6 +580,7 @@ pub fn run(
     var signals: SignalState = .{ .checkpoint = params.checkpoint };
     var turn = Turn.init(allocator, .{});
     defer turn.deinit();
+    var use_session_effort = false;
 
     while (result.turns < params.max_turns) {
         if (params.pre_request_hook) |hook| {
@@ -600,6 +612,10 @@ pub fn run(
         const owes_boundary = result.turns > 0 or params.continued;
         result.turns += 1;
         const request_image_input = try resolveImageInput(allocator, io, params);
+        const request_effort = if (use_session_effort)
+            params.session.currentSelection().effort
+        else
+            initial_effort;
         const started_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
         const stream_failure = params.provider.stream(allocator, io, .{
             .model = params.model,
@@ -607,7 +623,7 @@ pub fn run(
                 .system_prompt = params.system_prompt,
                 .items = request_items,
                 .tools = definitions,
-                .effort = params.effort,
+                .effort = request_effort,
                 .image_input = request_image_input,
             },
             .tick = ai.Provider.Tick.from(&signals),
@@ -1006,7 +1022,10 @@ pub fn run(
             params.session.endHookMutation();
             switch (continuation) {
                 .unchanged => {},
-                .changed => try callSeam(params, .compaction, true),
+                .changed, .selection_changed => {
+                    use_session_effort = true;
+                    if (continuation == .changed) try callSeam(params, .compaction, true);
+                },
                 .paused => {
                     result.outcome = .paused;
                     return result;
@@ -2417,6 +2436,202 @@ test "continuation hook runs without a seam hook before the next stream" {
     try std.testing.expectEqual(Outcome.complete, loop_result.outcome);
     try std.testing.expectEqual(@as(usize, 2), provider.rounds);
     try std.testing.expectEqual(@as(usize, 1), continuation.calls);
+}
+
+test "continuation selection results explicitly resync active effort" {
+    const Mode = enum { changed, selection_changed, unchanged };
+    const Provider = struct {
+        const Self = @This();
+        expected_second: ?[]const u8,
+        rounds: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.rounds += 1;
+            const expected: ?[]const u8 = if (self.rounds == 1) "high" else self.expected_second;
+            if (expected) |value| {
+                const actual = request.context.effort orelse return error.InvalidRequest;
+                if (!std.mem.eql(u8, value, actual)) return error.InvalidRequest;
+            } else if (request.context.effort != null) {
+                return error.InvalidRequest;
+            }
+            if (self.rounds == 1) {
+                try sink.emit(.{ .tool_call_start = .{ .id = "one", .name = "missing" } });
+                try sink.emit(.{ .tool_call_end = "one" });
+            } else {
+                try sink.emit(.{ .text_delta = "done" });
+            }
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const Continuation = struct {
+        const Self = @This();
+        mode: Mode,
+
+        pub fn call(self: *Self, session: *Session) HookError!ContinuationResult {
+            if (self.mode != .unchanged) {
+                session.reconfigureSelection(.{
+                    .effort = if (self.mode == .selection_changed) null else "low",
+                }) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.Failed,
+                };
+            }
+            return switch (self.mode) {
+                .changed => .changed,
+                .selection_changed => .selection_changed,
+                .unchanged => .unchanged,
+            };
+        }
+    };
+    const Seam = struct {
+        const Self = @This();
+        compactions: usize = 0,
+
+        pub fn call(self: *Self, _: *const Session, kind: SeamKind, _: bool) HookError!void {
+            if (kind == .compaction) self.compactions += 1;
+        }
+    };
+
+    for ([_]Mode{ .changed, .selection_changed, .unchanged }) |mode| {
+        const expected_second: ?[]const u8 = switch (mode) {
+            .changed => "low",
+            .selection_changed => null,
+            .unchanged => "high",
+        };
+        var provider: Provider = .{ .expected_second = expected_second };
+        var continuation: Continuation = .{ .mode = mode };
+        var seam: Seam = .{};
+        var session = try Session.init(std.testing.allocator, .{ .effort = "high" });
+        defer session.deinit();
+        var loop_result = try run(std.testing.allocator, std.testing.io, .{
+            .session = &session,
+            .provider = ai.Provider.Provider.from(&provider, "fake"),
+            .model = "model",
+            .system_prompt = "system",
+            .effort = "high",
+            .seam_hook = SeamHook.from(&seam),
+            .continuation_hook = ContinuationHook.from(&continuation),
+        });
+        defer loop_result.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(Outcome.complete, loop_result.outcome);
+        try std.testing.expectEqual(@as(usize, 2), provider.rounds);
+        try std.testing.expectEqual(@as(usize, if (mode == .changed) 1 else 0), seam.compactions);
+    }
+}
+
+test "initial effort survives image source catalog replacement" {
+    const Provider = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.calls += 1;
+            const effort = request.context.effort orelse return error.InvalidRequest;
+            if (!std.mem.eql(u8, "high", effort)) return error.InvalidRequest;
+            try sink.emit(.{ .text_delta = "done" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const Source = struct {
+        const Self = @This();
+        effort: ?[]u8,
+        calls: usize = 0,
+
+        pub fn resolve(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ImageInputSourceModule.CallbackError!ai.Provider.ImageInput {
+            self.calls += 1;
+            const effort = self.effort orelse return error.Failed;
+            @memset(effort, 'x');
+            allocator.free(effort);
+            self.effort = null;
+            return .unsupported;
+        }
+    };
+
+    const original_effort = try std.testing.allocator.dupe(u8, "high");
+    var source: Source = .{ .effort = original_effort };
+    errdefer if (source.effort) |effort| std.testing.allocator.free(effort);
+    var provider: Provider = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .effort = original_effort,
+        .image_input_source = ImageInputSourceModule.ImageInputSource.from(&source),
+    });
+    defer loop_result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Outcome.complete, loop_result.outcome);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expect(source.effort == null);
+}
+
+test "initial effort allocation failure precedes request effects" {
+    const Provider = struct {
+        const Self = @This();
+        called: bool = false,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ai.Provider.Request,
+            _: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.called = true;
+        }
+    };
+    const Source = struct {
+        const Self = @This();
+        called: bool = false,
+
+        pub fn resolve(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+        ) ImageInputSourceModule.CallbackError!ai.Provider.ImageInput {
+            self.called = true;
+            return .unsupported;
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var source: Source = .{};
+    var provider: Provider = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try std.testing.expectError(error.OutOfMemory, run(failing.allocator(), std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .effort = "high",
+        .image_input_source = ImageInputSourceModule.ImageInputSource.from(&source),
+    }));
+
+    try std.testing.expect(!source.called);
+    try std.testing.expect(!provider.called);
+    try std.testing.expectEqual(@as(usize, 0), session.items().len);
 }
 
 test "run lease rejects nested runs and provider or observer mutations" {
