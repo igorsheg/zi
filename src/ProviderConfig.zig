@@ -305,12 +305,7 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
 }
 
 fn validateHttpPolicy(policy: HttpPolicy) ResolveError!void {
-    if (policy.max_retries > 100 or
-        policy.retry_base_ms > 2 * 60 * 1_000 or
-        policy.idle_timeout_ms > 24 * 60 * 60 * 1_000)
-    {
-        return error.InvalidSetting;
-    }
+    if (policy.max_retries > 100) return error.InvalidSetting;
 }
 
 fn applyHttpPolicy(adapter: *Registry.AdapterPlan, policy: HttpPolicy) void {
@@ -1318,7 +1313,8 @@ fn expectHttpPolicy(
     }
 }
 
-test "the seven explicit plans resolve without probing" {
+test "all four adapter plans accept large HTTP durations" {
+    const maximum_duration_ms: u64 = @intCast(std.math.maxInt(c_long));
     const cases = [_]struct { json: []const u8, provider: []const u8 }{
         .{ .json = "{\"provider\":\"llamacpp\",\"model\":\"local\"}", .provider = "llamacpp" },
         .{ .json = "{\"provider\":\"openai\",\"model\":\"gpt\"}", .provider = "openai" },
@@ -1348,11 +1344,15 @@ test "the seven explicit plans resolve without probing" {
             .store = testStore(&document, &environment),
             .api_key_environment = .from(&environment),
             .session_cache_key = "12345678-1234-4234-8234-123456789abc",
-            .http_policy = .{ .max_retries = 100, .retry_base_ms = 17, .idle_timeout_ms = 0 },
+            .http_policy = .{
+                .max_retries = 100,
+                .retry_base_ms = maximum_duration_ms,
+                .idle_timeout_ms = maximum_duration_ms,
+            },
         });
         defer result.deinit();
         try std.testing.expectEqualStrings(case.provider, result.resolved.metadata.provider_id);
-        try expectHttpPolicy(result.resolved.adapter, 101, 17, 0);
+        try expectHttpPolicy(result.resolved.adapter, 101, maximum_duration_ms, maximum_duration_ms);
         try std.testing.expect(!result.provider_autoselected);
     }
 
@@ -1368,12 +1368,16 @@ test "the seven explicit plans resolve without probing" {
         .codex_available = true,
         .default_model = "codex-default",
         .default_effort = "high",
-        .http_policy = .{ .max_retries = 100, .retry_base_ms = 17, .idle_timeout_ms = 0 },
+        .http_policy = .{
+            .max_retries = 100,
+            .retry_base_ms = maximum_duration_ms,
+            .idle_timeout_ms = maximum_duration_ms,
+        },
     });
     defer codex.deinit();
     try std.testing.expectEqualStrings("codex", codex.resolved.metadata.provider_id);
     try std.testing.expectEqualStrings("high", codex.effort.?);
-    try expectHttpPolicy(codex.resolved.adapter, 101, 17, 0);
+    try expectHttpPolicy(codex.resolved.adapter, 101, maximum_duration_ms, maximum_duration_ms);
     try std.testing.expect(codex.provider_autoselected);
 }
 
@@ -1424,7 +1428,7 @@ test "the three remaining compiled recipe plans resolve explicitly" {
     }
 }
 
-test "HTTP policy applies to dynamic plans and rejects out-of-range inputs" {
+test "HTTP policy applies to dynamic plans and rejects too many retries" {
     const environment: TestEnvironment = .{};
     var document = try Document.parse(std.testing.allocator, "{\"model\":\"m\"}", .{});
     defer document.deinit();
@@ -1444,18 +1448,12 @@ test "HTTP policy applies to dynamic plans and rejects out-of-range inputs" {
     defer result.deinit();
     try expectHttpPolicy(result.resolved.adapter, 1, 0, 0);
 
-    inline for (.{
-        HttpPolicy{ .max_retries = 101 },
-        HttpPolicy{ .retry_base_ms = 2 * 60 * 1_000 + 1 },
-        HttpPolicy{ .idle_timeout_ms = 24 * 60 * 60 * 1_000 + 1 },
-    }) |invalid| {
-        try std.testing.expectError(error.InvalidSetting, resolve(.{
-            .allocator = std.testing.allocator,
-            .store = testStore(&document, &environment),
-            .api_key_environment = .from(&environment),
-            .http_policy = invalid,
-        }));
-    }
+    try std.testing.expectError(error.InvalidSetting, resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .http_policy = .{ .max_retries = 101 },
+    }));
 }
 
 test "compiled recipe availability and explicit failures are consistent" {
