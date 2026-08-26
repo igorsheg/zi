@@ -26,9 +26,18 @@ pub const Signal = enum {
 pub const Checkpoint = struct {
     context: *anyopaque,
     sample_fn: *const fn (*anyopaque) Signal,
+    resolve_fn: ?*const fn (*anyopaque) Signal = null,
 
+    /// Nonblocking sample used by provider ticks and running-tool cancellation.
     pub fn sample(self: Checkpoint) Signal {
         return self.sample_fn(self.context);
+    }
+
+    /// Resolves terminal-local ambiguity before an irreversible model or tool seam.
+    /// Implementations without a distinct resolver retain the sample behavior.
+    pub fn resolve(self: Checkpoint) Signal {
+        const resolve_fn = self.resolve_fn orelse return self.sample();
+        return resolve_fn(self.context);
     }
 
     pub fn from(implementation: anytype) Checkpoint {
@@ -43,10 +52,46 @@ pub const Checkpoint = struct {
                 const self: *Implementation = @ptrCast(@alignCast(context));
                 return self.sample();
             }
+
+            fn resolve(context: *anyopaque) Signal {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                if (@hasDecl(Implementation, "resolve")) return self.resolve();
+                return self.sample();
+            }
         };
-        return .{ .context = implementation, .sample_fn = Adapter.sample };
+        return .{
+            .context = implementation,
+            .sample_fn = Adapter.sample,
+            .resolve_fn = Adapter.resolve,
+        };
     }
 };
+
+test "checkpoint separates nonblocking samples from seam resolution" {
+    const Source = struct {
+        const Self = @This();
+
+        samples: usize = 0,
+        resolutions: usize = 0,
+
+        pub fn sample(self: *Self) Signal {
+            self.samples += 1;
+            return .none;
+        }
+
+        pub fn resolve(self: *Self) Signal {
+            self.resolutions += 1;
+            return .pause;
+        }
+    };
+
+    var source: Source = .{};
+    const checkpoint = Checkpoint.from(&source);
+    try std.testing.expectEqual(Signal.none, checkpoint.sample());
+    try std.testing.expectEqual(Signal.pause, checkpoint.resolve());
+    try std.testing.expectEqual(@as(usize, 1), source.samples);
+    try std.testing.expectEqual(@as(usize, 1), source.resolutions);
+}
 
 pub const Observer = struct {
     context: *anyopaque,
@@ -336,6 +381,12 @@ const SignalState = struct {
     fn sample(self: *SignalState) Signal {
         const checkpoint = self.checkpoint orelse return self.signal;
         self.record(checkpoint.sample());
+        return self.signal;
+    }
+
+    fn resolve(self: *SignalState) Signal {
+        const checkpoint = self.checkpoint orelse return self.signal;
+        self.record(checkpoint.resolve());
         return self.signal;
     }
 
@@ -695,6 +746,7 @@ pub fn run(
         var pause_preempted = false;
         if (stream_failure) |_| {} else |stream_error| {
             if (stream_error == error.OutOfMemory) return error.OutOfMemory;
+            if (stream_error == error.Cancelled) _ = signals.resolve();
             if (stream_error == error.Cancelled and signals.signal == .abort) {
                 const total_usage = turn.totalUsage();
                 const terminal_usage = turn.usage;
@@ -856,7 +908,7 @@ pub fn run(
             return result;
         }
 
-        signals.record(if (params.checkpoint) |checkpoint| checkpoint.sample() else .none);
+        _ = signals.resolve();
         if (signals.signal == .abort) {
             const total_usage = turn.totalUsage();
             const terminal_usage = turn.usage;
@@ -963,7 +1015,7 @@ pub fn run(
                 io,
                 params,
             ) catch |err| return settleToolFailure(params, &turn, err);
-            const tool_signal = signals.sample();
+            const tool_signal = signals.resolve();
             var tool_result = (if (definitions.len == 0)
                 dispatch.refused(params.session.allocator, call)
             else if (tool_signal == .abort) skipped: {
@@ -1008,7 +1060,7 @@ pub fn run(
             try callSeam(params, .interruption, false);
             return result;
         }
-        signals.record(if (params.checkpoint) |checkpoint| checkpoint.sample() else .none);
+        _ = signals.resolve();
         if (signals.signal == .abort) {
             result.outcome = .interrupted;
             result.abort_marker_placed = markInterrupt(params) catch |err| {
@@ -1387,6 +1439,51 @@ test "loop pause preempts an empty provider without leaving history" {
     try std.testing.expectEqual(Outcome.paused, loop_result.outcome);
     try std.testing.expectEqual(@as(usize, 0), session.items().len);
     try std.testing.expect(!loop_result.abort_marker_placed);
+}
+
+test "cancelled pause resolves a pending stronger abort before settlement" {
+    const Pending = struct {
+        const Self = @This();
+        resolutions: usize = 0,
+
+        pub fn sample(_: *Self) Signal {
+            return .pause;
+        }
+
+        pub fn resolve(self: *Self) Signal {
+            self.resolutions += 1;
+            return .abort;
+        }
+    };
+    const Fake = struct {
+        const Self = @This();
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            request: ai.Provider.Request,
+            _: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try request.tick.?.poll();
+        }
+    };
+
+    var pending: Pending = .{};
+    var fake: Fake = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fake, "fake"),
+        .model = "model",
+        .system_prompt = "system",
+        .checkpoint = Checkpoint.from(&pending),
+    });
+    defer loop_result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Outcome.interrupted, loop_result.outcome);
+    try std.testing.expectEqual(@as(usize, 1), pending.resolutions);
 }
 
 test "cancelled abort seams repaired assistant and banked usage exactly once" {

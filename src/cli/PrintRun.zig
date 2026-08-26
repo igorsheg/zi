@@ -5,6 +5,7 @@ const ai = @import("../ai/root.zig");
 const config = @import("../config/root.zig");
 const persistence = @import("../persistence/root.zig");
 const tool = @import("../tool/root.zig");
+const terminal_module = @import("../terminal/root.zig");
 const SecureAllocator = @import("../ai/SecureAllocator.zig");
 const SecureOpen = @import("../SecureOpen.zig");
 const CatalogService = @import("../CatalogService.zig");
@@ -678,7 +679,9 @@ pub fn run(
             };
             var stdin_buffer: [4096]u8 = undefined;
             var stdin_file = std.Io.File.Reader.initStreaming(.stdin(), io, &stdin_buffer);
-            break :interactive runInteractiveWithFinish(allocator, io, .{
+            const interactive_terminal = ProcessAdapters.isTty(io, .stdin()) and
+                ProcessAdapters.isTty(io, .stdout());
+            const interactive_inputs: Interactive.Inputs = .{
                 .session = session_run.session(),
                 .provider = provider_runtime.provider(),
                 .model = provider_runtime.model,
@@ -693,7 +696,7 @@ pub fn run(
                 .reader = &stdin_file.interface,
                 .stdout = stdout,
                 .stderr = stderr,
-                .show_prompt = ProcessAdapters.isTty(io, .stdin()) and ProcessAdapters.isTty(io, .stdout()),
+                .show_prompt = interactive_terminal,
                 .seam_hook = run_seam_hook,
                 .pre_request_hook = pre_request_hook,
                 .continuation_hook = agent.Loop.ContinuationHook.from(&compaction),
@@ -703,7 +706,18 @@ pub fn run(
                     Interactive.BeforeFirstSend.from(&interactive_catalog)
                 else
                     null,
-            }, &terminal);
+            };
+            break :interactive if (interactive_terminal)
+                runRawInteractive(
+                    allocator,
+                    io,
+                    interactive_inputs,
+                    http,
+                    &compaction,
+                    &terminal,
+                )
+            else
+                runInteractiveWithFinish(allocator, io, interactive_inputs, &terminal);
         },
     };
     const publication = if (codex_runtime) |owner| owner.takePublicationOutcome() else null;
@@ -716,6 +730,50 @@ pub fn run(
             ignoreWriterFailure(write_error);
         return run_error;
     }
+}
+
+const HttpWake = struct {
+    runtime: *ai.HttpTransport.Runtime,
+
+    pub fn wake(self: *HttpWake) void {
+        self.runtime.wakeup() catch |err| ignoreHttpWakeError(err);
+    }
+};
+
+fn ignoreHttpWakeError(err: error{ OutOfMemory, ConnectionFailed }) void {
+    _ = @errorName(err);
+}
+
+fn ignoreTerminalCleanupError(err: anyerror) void {
+    _ = @errorName(err);
+}
+
+const TerminalCheckpoint = struct {
+    interrupt: *terminal_module.GenerationInterrupt,
+
+    pub fn sample(self: *TerminalCheckpoint) agent.Loop.Signal {
+        return mapTerminalSignal(self.interrupt.sample());
+    }
+
+    pub fn resolve(self: *TerminalCheckpoint) agent.Loop.Signal {
+        return mapTerminalSignal(self.interrupt.resolve());
+    }
+};
+
+const CompactCancellation = struct {
+    interrupt: *terminal_module.GenerationInterrupt,
+
+    pub fn sample(self: *CompactCancellation) bool {
+        return self.interrupt.sample() != .none;
+    }
+};
+
+fn mapTerminalSignal(signal_value: terminal_module.GenerationInterrupt.Signal) agent.Loop.Signal {
+    return switch (signal_value) {
+        .none => .none,
+        .pause => .pause,
+        .abort => .abort,
+    };
 }
 
 const InteractiveCatalog = struct {
@@ -746,6 +804,81 @@ fn prefetchInteractiveCatalog(
             try stderr.writeByte('\n');
         },
     }
+}
+
+fn runRawInteractive(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    inputs_value: Interactive.Inputs,
+    http: *ai.HttpTransport.Runtime,
+    compaction: *AutoCompact,
+    terminal_owner: *Terminal,
+) !u8 {
+    const stdin_file: std.Io.File = .stdin();
+    const stdout_file: std.Io.File = .stdout();
+    const original = try std.posix.tcgetattr(stdin_file.handle);
+    try terminal_module.SignalRestore.install(.{
+        .terminal_fd = stdin_file.handle,
+        .output_fd = stdout_file.handle,
+        .saved_termios = original,
+        .terminal_active = true,
+        .interactive_terminal = true,
+    });
+    var restoration_owned = true;
+    errdefer if (restoration_owned) terminal_module.SignalRestore.restore() catch |err| ignoreTerminalCleanupError(err);
+
+    var http_wake: HttpWake = .{ .runtime = http };
+    var interrupt = try terminal_module.GenerationInterrupt.init(
+        allocator,
+        io,
+        stdin_file,
+        stdout_file,
+        terminal_module.GenerationInterrupt.Wake.from(&http_wake),
+    );
+    var interrupt_owned = true;
+    errdefer if (interrupt_owned) interrupt.deinit() catch |err| ignoreTerminalCleanupError(err);
+
+    var raw_input = terminal_module.RawLineInput.init(
+        allocator,
+        io,
+        stdin_file,
+        stdout_file,
+        inputs_value.stdout,
+        "> ",
+        .{ .empty_submit = true },
+    );
+    var checkpoint: TerminalCheckpoint = .{ .interrupt = &interrupt };
+    var compact_cancellation: CompactCancellation = .{ .interrupt = &interrupt };
+    compaction.cancellation = agent.CompactRunner.Cancellation.from(&compact_cancellation);
+    defer compaction.cancellation = null;
+
+    var inputs = inputs_value;
+    inputs.prompt_input = Interactive.PromptInput.from(&raw_input);
+    inputs.show_prompt = false;
+    inputs.generation = Interactive.Generation.from(&interrupt);
+    inputs.checkpoint = agent.Loop.Checkpoint.from(&checkpoint);
+
+    const exit_code = runInteractiveWithFinish(allocator, io, inputs, terminal_owner) catch |run_error| {
+        try cleanupRawTerminal(&interrupt);
+        interrupt_owned = false;
+        restoration_owned = false;
+        return run_error;
+    };
+    try cleanupRawTerminal(&interrupt);
+    interrupt_owned = false;
+    restoration_owned = false;
+    return exit_code;
+}
+
+fn cleanupRawTerminal(interrupt: *terminal_module.GenerationInterrupt) !void {
+    interrupt.deinit() catch |cleanup_error| {
+        terminal_module.SignalRestore.restore() catch |err| ignoreTerminalCleanupError(err);
+        // Signal restoration repairs the kernel state. Retry to release joined
+        // watcher storage, its wake descriptors, and any pending input flush.
+        interrupt.deinit() catch |err| ignoreTerminalCleanupError(err);
+        return cleanup_error;
+    };
+    try terminal_module.SignalRestore.restore();
 }
 
 fn runInteractiveWithFinish(
@@ -1088,6 +1221,7 @@ const AutoCompact = struct {
     context_limit: ?u64,
     enabled: bool,
     threshold: u8,
+    cancellation: ?agent.CompactRunner.Cancellation = null,
 
     pub fn call(
         self: *AutoCompact,
@@ -1110,6 +1244,7 @@ const AutoCompact = struct {
             .system_prompt = self.system_prompt,
             .tools = self.tools,
             .effort = self.effort,
+            .cancellation = self.cancellation,
             .seam_hook = self.seam_hook,
             .usage_observer = agent.Loop.UsageObserver.from(self.usage),
         }) catch |err| return switch (err) {

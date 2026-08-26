@@ -7,7 +7,7 @@ Zi follows the architecture and observable behavior of hax v0.4.0, revision
 Provider-independent item, turn, session, abort-repair, tool, read/image, output-cap,
 UTF-8 sanitation, unified-diff, atomic-write, write, edit, synchronous bash, background task registry/wait,
 task lifecycle and environment propagation, agent-context discovery and rendering, one-shot startup,
-execution and output ordering, cooked-line interactive session lifecycle and normal-buffer stream rendering,
+execution and output ordering, interactive session lifecycle, raw normal-buffer prompt editing, generation interrupt handling, and normal-buffer stream rendering,
 session resume and retention matching, catalog refresh and routing,
 compaction cadence, usage pricing and statistics, prompt-file expansion, configuration registry and typed
 parsing, Codex CLI credential behavior, configured provider-header resolution, local-provider

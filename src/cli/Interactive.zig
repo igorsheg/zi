@@ -69,6 +69,70 @@ pub const EffortSource = struct {
     }
 };
 
+pub const PromptInput = struct {
+    context: *anyopaque,
+    read_fn: *const fn (*anyopaque) anyerror!terminal.Result,
+
+    pub fn read(self: PromptInput) !terminal.Result {
+        return self.read_fn(self.context);
+    }
+
+    pub fn from(implementation: anytype) PromptInput {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("PromptInput.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn read(context: *anyopaque) anyerror!terminal.Result {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.read();
+            }
+        };
+        return .{ .context = implementation, .read_fn = Adapter.read };
+    }
+};
+
+pub const Generation = struct {
+    context: *anyopaque,
+    arm_fn: *const fn (*anyopaque) anyerror!void,
+    disarm_fn: *const fn (*anyopaque) anyerror!void,
+
+    pub fn arm(self: Generation) !void {
+        return self.arm_fn(self.context);
+    }
+
+    pub fn disarm(self: Generation) !void {
+        return self.disarm_fn(self.context);
+    }
+
+    pub fn from(implementation: anytype) Generation {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("Generation.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn arm(context: *anyopaque) anyerror!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.clearAndArm();
+            }
+
+            fn disarm(context: *anyopaque) anyerror!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.disarm();
+            }
+        };
+        return .{
+            .context = implementation,
+            .arm_fn = Adapter.arm,
+            .disarm_fn = Adapter.disarm,
+        };
+    }
+};
+
 pub const Inputs = struct {
     session: *agent.Session.Session,
     provider: ai.Provider.Provider,
@@ -82,9 +146,11 @@ pub const Inputs = struct {
     image_input: ai.Provider.ImageInput = .unknown,
     image_input_source: ?agent.ImageInputSource.ImageInputSource = null,
     reader: *std.Io.Reader,
+    prompt_input: ?PromptInput = null,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     show_prompt: bool,
+    generation: ?Generation = null,
     seam_hook: ?agent.Loop.SeamHook = null,
     checkpoint: ?agent.Loop.Checkpoint = null,
     pre_request_hook: ?agent.Loop.PreRequestHook = null,
@@ -104,7 +170,7 @@ fn resumeState(abort_marker_placed: bool) ResumeState {
     return if (abort_marker_placed) .marked else .clean;
 }
 
-/// Runs a bounded cooked-line REPL around the shared provider-independent agent loop.
+/// Runs a bounded prompt REPL around the shared provider-independent agent loop.
 /// Provider failures are turn-local and return control to the next prompt.
 pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
     var line_input = terminal.CookedLineInput.init(allocator, inputs.reader);
@@ -116,8 +182,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
             try inputs.stdout.flush();
         }
 
-        var line_result = line_input.read() catch |err| switch (err) {
-            error.LineTooLong => {
+        var line_result = (if (inputs.prompt_input) |prompt_input|
+            prompt_input.read()
+        else
+            line_input.read()) catch |err| switch (err) {
+            error.LineTooLong, error.PromptTooLong => {
                 try inputs.stderr.print(
                     "zi: prompt exceeds the {d}-byte limit\n",
                     .{terminal.max_prompt_bytes},
@@ -125,8 +194,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
                 try inputs.stderr.flush();
                 continue;
             },
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ReadFailed => return error.ReadFailed,
+            else => return err,
         };
         defer line_result.deinit(allocator);
 
@@ -171,6 +239,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
         }
 
         const effort = if (inputs.effort_source) |source| source.resolve() else inputs.effort;
+        if (inputs.generation) |generation| try generation.arm();
         var stream_renderer = render.StreamRenderer.init(inputs.stdout);
         var loop_result = agent.Loop.run(allocator, io, .{
             .session = inputs.session,
@@ -192,11 +261,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
             .pre_request_hook = inputs.pre_request_hook,
             .continuation_hook = inputs.continuation_hook,
         }) catch |loop_error| {
+            if (inputs.generation) |generation| try generation.disarm();
             stream_renderer.close(.failure);
             try stream_renderer.check();
             return loop_error;
         };
         defer loop_result.deinit(allocator);
+        if (inputs.generation) |generation| try generation.disarm();
 
         switch (loop_result.outcome) {
             .complete => stream_renderer.close(.complete),
@@ -230,10 +301,70 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
     }
 }
 
+test "interactive terminal adapters preserve prompt and generation ownership" {
+    const Prompt = struct {
+        const Self = @This();
+
+        calls: usize = 0,
+
+        pub fn read(self: *Self) !terminal.Result {
+            self.calls += 1;
+            return .eof;
+        }
+    };
+    const Control = struct {
+        const Self = @This();
+
+        arms: usize = 0,
+        disarms: usize = 0,
+
+        pub fn clearAndArm(self: *Self) !void {
+            self.arms += 1;
+        }
+
+        pub fn disarm(self: *Self) !void {
+            self.disarms += 1;
+        }
+    };
+
+    var prompt: Prompt = .{};
+    var result = try PromptInput.from(&prompt).read();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), prompt.calls);
+    try std.testing.expect(result == .eof);
+
+    var control: Control = .{};
+    const generation = Generation.from(&control);
+    try generation.arm();
+    try generation.disarm();
+    try std.testing.expectEqual(@as(usize, 1), control.arms);
+    try std.testing.expectEqual(@as(usize, 1), control.disarms);
+}
+
 test "interactive reuses one session across prompts and exits on EOF" {
+    const Control = struct {
+        const Self = @This();
+
+        active: bool = false,
+        arms: usize = 0,
+        disarms: usize = 0,
+
+        pub fn clearAndArm(self: *Self) !void {
+            if (self.active) return error.AlreadyArmed;
+            self.active = true;
+            self.arms += 1;
+        }
+
+        pub fn disarm(self: *Self) !void {
+            if (!self.active) return error.NotArmed;
+            self.active = false;
+            self.disarms += 1;
+        }
+    };
     const Provider = struct {
         const Self = @This();
         calls: usize = 0,
+        control: *Control,
 
         pub fn stream(
             _: std.mem.Allocator,
@@ -242,6 +373,7 @@ test "interactive reuses one session across prompts and exits on EOF" {
             request: ai.Provider.Request,
             sink: ai.Provider.EventSink,
         ) ai.Provider.StreamError!void {
+            if (!self.control.active) return error.InvalidRequest;
             self.calls += 1;
             const expected_user_count: usize = self.calls;
             var user_count: usize = 0;
@@ -272,7 +404,8 @@ test "interactive reuses one session across prompts and exits on EOF" {
         }
     };
 
-    var provider: Provider = .{};
+    var control: Control = .{};
+    var provider: Provider = .{ .control = &control };
     var seam: Seam = .{};
     var session = try agent.Session.Session.init(std.testing.allocator, .{});
     defer session.deinit();
@@ -291,13 +424,73 @@ test "interactive reuses one session across prompts and exits on EOF" {
         .stdout = &stdout.writer,
         .stderr = &stderr.writer,
         .show_prompt = false,
+        .generation = Generation.from(&control),
         .seam_hook = agent.Loop.SeamHook.from(&seam),
     }));
     try std.testing.expectEqual(@as(usize, 2), provider.calls);
+    try std.testing.expectEqual(@as(usize, 2), control.arms);
+    try std.testing.expectEqual(@as(usize, 2), control.disarms);
+    try std.testing.expect(!control.active);
     try std.testing.expectEqual(@as(usize, 2), seam.prompts);
     try std.testing.expectEqual(@as(usize, 2), seam.completions);
     try std.testing.expectEqualStrings("first\nsecond\n", stdout.written());
     try std.testing.expectEqualStrings("", stderr.written());
+}
+
+test "interactive disarms generation when the agent loop fails" {
+    const Control = struct {
+        const Self = @This();
+
+        active: bool = false,
+        arms: usize = 0,
+        disarms: usize = 0,
+
+        pub fn clearAndArm(self: *Self) !void {
+            self.active = true;
+            self.arms += 1;
+        }
+
+        pub fn disarm(self: *Self) !void {
+            if (!self.active) return error.NotArmed;
+            self.active = false;
+            self.disarms += 1;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            _: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            return error.OutOfMemory;
+        }
+    };
+
+    var control: Control = .{};
+    var provider: Provider = .{};
+    var session = try agent.Session.Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var reader = std.Io.Reader.fixed("prompt\n");
+    var output: std.Io.Writer.Discarding = .init(&.{});
+
+    try std.testing.expectError(error.OutOfMemory, run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "",
+        .reader = &reader,
+        .stdout = &output.writer,
+        .stderr = &output.writer,
+        .show_prompt = false,
+        .generation = Generation.from(&control),
+    }));
+    try std.testing.expectEqual(@as(usize, 1), control.arms);
+    try std.testing.expectEqual(@as(usize, 1), control.disarms);
+    try std.testing.expect(!control.active);
 }
 
 test "provider failure is turn-local and the next prompt still runs" {

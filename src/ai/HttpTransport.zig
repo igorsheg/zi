@@ -717,7 +717,7 @@ fn mapParserError(err: Sse.ParseError) Transport.StreamError {
     };
 }
 
-fn mapMultiError(code: c.CURLMcode) Transport.StreamError {
+fn mapMultiError(code: c.CURLMcode) error{ OutOfMemory, ConnectionFailed } {
     return if (code == c.CURLM_OUT_OF_MEMORY) error.OutOfMemory else error.ConnectionFailed;
 }
 
