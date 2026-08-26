@@ -670,6 +670,7 @@ pub fn run(
             );
             result.final_items_from = repaired.items_from;
             result.final_items_to = repaired.items_to;
+            result.abort_marker_placed = repaired.marker_placed;
             appendUsage(
                 params,
                 &model_metadata,
@@ -789,6 +790,7 @@ pub fn run(
                 );
                 result.final_items_from = repaired.items_from;
                 result.final_items_to = repaired.items_to;
+                result.abort_marker_placed = repaired.marker_placed;
                 appendUsage(
                     params,
                     &model_metadata,
@@ -832,6 +834,7 @@ pub fn run(
             );
             result.final_items_from = repaired.items_from;
             result.final_items_to = repaired.items_to;
+            result.abort_marker_placed = repaired.marker_placed;
             appendUsage(
                 params,
                 &model_metadata,
@@ -1247,6 +1250,7 @@ test "loop provider failure copies diagnostics and keeps reported usage" {
     });
     defer loop_result.deinit(std.testing.allocator);
     try std.testing.expectEqual(Outcome.provider_error, loop_result.outcome);
+    try std.testing.expect(loop_result.abort_marker_placed);
     try std.testing.expectEqual(@as(usize, 1), source.calls);
     try std.testing.expectEqualStrings("boom", loop_result.diagnostic.?);
     try std.testing.expectEqual(@as(?u64, 8), loop_result.last_context_tokens);
@@ -1899,6 +1903,7 @@ fn exerciseProviderFailureAllocations(allocator: std.mem.Allocator) !void {
         return err;
     };
     try std.testing.expectEqual(Outcome.provider_error, result.outcome);
+    try std.testing.expect(result.abort_marker_placed);
     try std.testing.expectEqual(@as(usize, 1), seam.calls);
     result.deinit(allocator);
 }
@@ -3781,4 +3786,34 @@ test "image input source runs under the session lease" {
     });
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(source.mutation_busy);
+}
+
+test "incomplete provider response exposes a repaired partial marker" {
+    const Provider = struct {
+        const Self = @This();
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .text_delta = "partial" });
+        }
+    };
+
+    var provider: Provider = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "",
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.provider_error, result.outcome);
+    try std.testing.expect(result.abort_marker_placed);
+    try std.testing.expectEqualStrings("InvalidProviderResponse", result.diagnostic.?);
 }

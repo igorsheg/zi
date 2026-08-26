@@ -7,6 +7,99 @@ pub const Error = error{
     ResultTooLarge,
 };
 
+/// Incrementally sanitizes borrowed chunks as RFC 3629 UTF-8.
+///
+/// `feed` and `finish` call `emit` synchronously. The callback must not retain
+/// its borrowed payload. Each malformed input byte and each NUL emits one
+/// U+FFFD. The sanitizer retains at most one incomplete UTF-8 sequence.
+pub const Sanitizer = struct {
+    bytes: [4]u8 = undefined,
+    len: u3 = 0,
+    want: u3 = 0,
+
+    pub fn feed(
+        self: *Sanitizer,
+        comptime emit: anytype,
+        context: anytype,
+        input: []const u8,
+    ) void {
+        for (input) |byte| self.feedByte(emit, context, byte);
+    }
+
+    pub fn finish(
+        self: *Sanitizer,
+        comptime emit: anytype,
+        context: anytype,
+    ) void {
+        if (self.len != 0) self.emitInvalid(emit, context);
+    }
+
+    fn feedByte(
+        self: *Sanitizer,
+        comptime emit: anytype,
+        context: anytype,
+        byte: u8,
+    ) void {
+        if (self.len == 0) {
+            if (byte == 0) {
+                emit(context, replacement);
+            } else if (byte < 0x80) {
+                emit(context, &.{byte});
+            } else if (utf8SequenceLength(byte)) |want| {
+                self.bytes[0] = byte;
+                self.len = 1;
+                self.want = @intCast(want);
+            } else {
+                emit(context, replacement);
+            }
+            return;
+        }
+
+        if (!isContinuation(byte)) {
+            self.emitInvalid(emit, context);
+            self.feedByte(emit, context, byte);
+            return;
+        }
+        self.bytes[self.len] = byte;
+        self.len += 1;
+        if (self.len != self.want) return;
+
+        const sequence = self.bytes[0..self.len];
+        if (validSequence(sequence)) {
+            emit(context, sequence);
+            self.reset();
+        } else {
+            self.emitInvalid(emit, context);
+        }
+    }
+
+    fn emitInvalid(
+        self: *Sanitizer,
+        comptime emit: anytype,
+        context: anytype,
+    ) void {
+        for (0..self.len) |_| emit(context, replacement);
+        self.reset();
+    }
+
+    fn reset(self: *Sanitizer) void {
+        self.len = 0;
+        self.want = 0;
+    }
+};
+
+/// Returns whether a valid Unicode scalar can affect terminal display or
+/// text direction without a visible glyph.
+pub fn isTerminalUnsafeScalar(scalar: u21) bool {
+    return (scalar >= 0x80 and scalar <= 0x9f) or
+        scalar == 0x061c or
+        (scalar >= 0x200b and scalar <= 0x200f) or
+        scalar == 0x2028 or scalar == 0x2029 or
+        (scalar >= 0x202a and scalar <= 0x202e) or
+        (scalar >= 0x2060 and scalar <= 0x2069) or
+        scalar == 0xfeff;
+}
+
 /// Returns an owned RFC 3629 UTF-8 copy. Each malformed input byte and each NUL
 /// becomes one U+FFFD, matching hax's incremental sanitizer.
 pub fn sanitize(
@@ -135,5 +228,31 @@ test "sanitizer frees partial output on every allocation failure" {
         std.testing.allocator,
         exerciseSanitizeAllocations,
         .{},
+    );
+}
+
+const TestSink = struct {
+    bytes: [64]u8 = undefined,
+    len: usize = 0,
+
+    fn emit(self: *TestSink, value: []const u8) void {
+        @memcpy(self.bytes[self.len..][0..value.len], value);
+        self.len += value.len;
+    }
+};
+
+test "incremental sanitizer handles borrowed split chunks without allocation" {
+    var sanitizer: Sanitizer = .{};
+    var sink: TestSink = .{};
+    var first = [_]u8{ 'a', 0xe2 };
+
+    sanitizer.feed(TestSink.emit, &sink, &first);
+    first = .{ 'x', 'x' };
+    sanitizer.feed(TestSink.emit, &sink, "\x82\xac\x00\xed\xa0\x80\xc2");
+    sanitizer.finish(TestSink.emit, &sink);
+
+    try std.testing.expectEqualStrings(
+        "a€" ++ replacement ++ replacement ** 3 ++ replacement,
+        sink.bytes[0..sink.len],
     );
 }

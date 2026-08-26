@@ -1,4 +1,5 @@
 const std = @import("std");
+const text = @import("../text/root.zig");
 
 /// Writes untrusted text without allowing terminal control characters or invalid UTF-8.
 pub fn write(writer: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
@@ -33,23 +34,13 @@ pub fn write(writer: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void
             offset += 1;
             continue;
         };
-        if (isUnsafeScalar(scalar)) {
+        if (text.Utf8.isTerminalUnsafeScalar(scalar)) {
             try writer.print("\\u{{{x}}}", .{scalar});
         } else {
             try writer.writeAll(bytes[offset .. offset + sequence_len]);
         }
         offset += sequence_len;
     }
-}
-
-fn isUnsafeScalar(scalar: u21) bool {
-    return (scalar >= 0x80 and scalar <= 0x9f) or
-        scalar == 0x061c or
-        (scalar >= 0x200b and scalar <= 0x200f) or
-        scalar == 0x2028 or scalar == 0x2029 or
-        (scalar >= 0x202a and scalar <= 0x202e) or
-        (scalar >= 0x2060 and scalar <= 0x2069) or
-        scalar == 0xfeff;
 }
 
 fn decode(bytes: []const u8, sequence_len: u3) !u21 {

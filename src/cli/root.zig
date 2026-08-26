@@ -7,6 +7,7 @@ pub const CodexFiles = @import("CodexFiles.zig");
 pub const ProcessAdapters = @import("ProcessAdapters.zig");
 pub const ProcessFacts = @import("ProcessFacts.zig");
 pub const OneShot = @import("OneShot.zig");
+pub const Interactive = @import("Interactive.zig");
 pub const PrintRun = @import("PrintRun.zig");
 pub const SessionStartup = @import("SessionStartup.zig");
 pub const StartupConfig = @import("StartupConfig.zig");
@@ -73,39 +74,42 @@ pub fn run(init: std.process.Init) !u8 {
         try stderr.print("zi: {s}\n", .{SubagentDepth.diagnostic});
         return 1;
     };
-    if (options.mode == .interactive) {
-        try stderr.writeAll("zi: interactive mode is not implemented yet; use -p / --print\n");
-        return 1;
-    }
-
     var stdin_result: ?ProcessAdapters.StdinResult = null;
     defer if (stdin_result) |*value| value.deinit(allocator);
-    const stdin_is_tty = ProcessAdapters.isTty(init.io, .stdin());
-    if (options.prompt_fragment_count == 0 and !stdin_is_tty) {
-        stdin_result = ProcessAdapters.readStdin(allocator, init.io, Args.max_prompt_bytes) catch |err| {
-            try stderr.print("zi: could not read prompt from stdin: {s}\n", .{@errorName(err)});
-            return 1;
-        };
-    }
-    const chosen = try Args.choosePrompt(allocator, &options, .{
-        .stdin_is_tty = stdin_is_tty,
-        .bytes = if (stdin_result) |value| value.bytes else "",
-    });
-    var prompt: ?Args.OwnedPrompt = switch (chosen) {
-        .none => null,
-        .prompt => |value| value,
-        .err => |problem| {
-            try stderr.writeAll(switch (problem) {
-                .missing => "zi: -p / --print requires a prompt argument or piped stdin\n",
-                .empty => "zi: prompt is empty\n",
-                .too_large => "zi: prompt exceeds the 1048576-byte limit\n",
-            });
-            return 1;
-        },
-    };
+    var prompt: ?Args.OwnedPrompt = null;
     defer if (prompt) |*value| value.deinit(allocator);
 
-    const exit_code = PrintRun.run(init, &options, prompt.?.bytes, parent_subagent_depth, stdout, stderr) catch |err|
+    const mode: PrintRun.Mode = switch (options.mode) {
+        .interactive => .interactive,
+        .print => mode: {
+            const stdin_is_tty = ProcessAdapters.isTty(init.io, .stdin());
+            if (options.prompt_fragment_count == 0 and !stdin_is_tty) {
+                stdin_result = ProcessAdapters.readStdin(allocator, init.io, Args.max_prompt_bytes) catch |err| {
+                    try stderr.print("zi: could not read prompt from stdin: {s}\n", .{@errorName(err)});
+                    return 1;
+                };
+            }
+            const chosen = try Args.choosePrompt(allocator, &options, .{
+                .stdin_is_tty = stdin_is_tty,
+                .bytes = if (stdin_result) |value| value.bytes else "",
+            });
+            prompt = switch (chosen) {
+                .none => null,
+                .prompt => |value| value,
+                .err => |problem| {
+                    try stderr.writeAll(switch (problem) {
+                        .missing => "zi: -p / --print requires a prompt argument or piped stdin\n",
+                        .empty => "zi: prompt is empty\n",
+                        .too_large => "zi: prompt exceeds the 1048576-byte limit\n",
+                    });
+                    return 1;
+                },
+            };
+            break :mode .{ .print = prompt.?.bytes };
+        },
+    };
+
+    const exit_code = PrintRun.run(init, &options, mode, parent_subagent_depth, stdout, stderr) catch |err|
         return reportRunError(stdout, stderr, err);
     try stdout.flush();
     try stderr.flush();
@@ -167,7 +171,8 @@ fn friendlyError(err: anyerror) []const u8 {
 
 fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\Usage: zi [OPTIONS] [PROMPT...]
+        \\Usage: zi [OPTIONS]
+        \\       zi --print [OPTIONS] [PROMPT...]
         \\
         \\A terminal-native coding agent.
         \\
@@ -185,6 +190,7 @@ fn writeHelp(writer: *std.Io.Writer) !void {
         \\  -h, --help           Show this help
         \\  -v, --version        Show the version
         \\
+        \\Without --print, Zi reads repeated bounded prompts and exits on EOF.
         \\PROMPT fragments are joined with spaces. Without fragments, --print reads
         \\bounded input from stdin when stdin is not a terminal.
         \\
@@ -197,6 +203,7 @@ test {
     _ = ProcessAdapters;
     _ = ProcessFacts;
     _ = OneShot;
+    _ = Interactive;
     _ = PrintRun;
     _ = SessionStartup;
     _ = StartupConfig;

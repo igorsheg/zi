@@ -26,16 +26,22 @@ const SessionStartup = @import("SessionStartup.zig");
 const StartupConfig = @import("StartupConfig.zig");
 const LocalStartup = @import("LocalStartup.zig");
 const OneShot = @import("OneShot.zig");
+const Interactive = @import("Interactive.zig");
 const Stats = @import("Stats.zig");
 
 pub const version = "0.1.0-dev";
 
-/// Runs the production non-interactive slice. All process snapshots are taken
-/// once here and then passed explicitly to lower layers.
+pub const Mode = union(enum) {
+    print: []const u8,
+    interactive,
+};
+
+/// Runs the production CLI. All process snapshots are taken once here and then
+/// passed explicitly to lower layers.
 pub fn run(
     init: std.process.Init,
     options: *const Args.Options,
-    prompt: []const u8,
+    mode: Mode,
     parent_subagent_depth: u8,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
@@ -66,7 +72,7 @@ pub fn run(
         },
         .environment = &environment,
         .selection = options.selection,
-        .strict_one_shot = true,
+        .strict_one_shot = options.mode == .print,
         .provider_canonicalizer = config.Store.ProviderCanonicalizer.from(&canonicalizer),
     });
     var prepared_owned = true;
@@ -590,7 +596,13 @@ pub fn run(
     var model_metadata_source: DynamicModelMetadata = .{
         .catalog_runtime = &catalog_runtime,
     };
+    var effort_source: DynamicEffort = .{ .runtime = &provider_runtime };
     const compact_enabled = (try config.Settings.getBool(store, allocator, "compact.auto")).value;
+    const configured_max_turns = (try config.Settings.getInt(store, allocator, "max_turns")).value;
+    const interactive_max_turns: usize = if (configured_max_turns <= 0)
+        agent.Loop.maximum_max_turns
+    else
+        @min(@as(usize, @intCast(configured_max_turns)), agent.Loop.maximum_max_turns);
     const compact_threshold: u8 = @intCast((try config.Settings.getInt(store, allocator, "compact.threshold")).value);
     var compaction: AutoCompact = .{
         .allocator = allocator,
@@ -630,33 +642,70 @@ pub fn run(
     model_metadata_source.effects = &catalog_hook;
     compaction.effects = &catalog_hook;
 
-    const run_result = OneShot.run(allocator, io, .{
-        .session = session_run.session(),
-        .provider = provider_runtime.provider(),
-        .model = provider_runtime.model,
-        .model_metadata = provider_runtime.metadata.model,
-        .model_metadata_source = agent.ModelMetadataSource.ModelMetadataSource.from(&model_metadata_source),
-        .system_prompt = if (system_prompt) |value| value.bytes else "",
-        .tools = tools.tools(),
-        .effort = provider_runtime.effort,
-        .image_input = image_input,
-        .image_input_source = agent.ImageInputSource.ImageInputSource.from(&image_source),
-        .prompt = prompt,
-        .stdout = stdout,
-        .stderr = stderr,
-        .seam_hook = run_seam_hook,
-        .pre_request_hook = pre_request_hook,
-        .continuation_hook = agent.Loop.ContinuationHook.from(&compaction),
-        .usage_stats = &usage,
-        .session_info_hook = OneShot.SessionInfoHook.from(&session_info),
-        .catalog_hook = if (catalog != null and provider_runtime.metadata.catalog_id != null)
-            OneShot.CatalogHook.from(&catalog_hook)
-        else
-            null,
-        .terminal_hook = OneShot.TerminalHook.from(&terminal),
-        .stats_renderer = stats.renderer(),
-        .style_diagnostics = ProcessAdapters.isTty(io, .stderr()),
-    });
+    const run_result = switch (mode) {
+        .print => |prompt| OneShot.run(allocator, io, .{
+            .session = session_run.session(),
+            .provider = provider_runtime.provider(),
+            .model = provider_runtime.model,
+            .model_metadata = provider_runtime.metadata.model,
+            .model_metadata_source = agent.ModelMetadataSource.ModelMetadataSource.from(&model_metadata_source),
+            .system_prompt = if (system_prompt) |value| value.bytes else "",
+            .tools = tools.tools(),
+            .effort = provider_runtime.effort,
+            .image_input = image_input,
+            .image_input_source = agent.ImageInputSource.ImageInputSource.from(&image_source),
+            .prompt = prompt,
+            .stdout = stdout,
+            .stderr = stderr,
+            .seam_hook = run_seam_hook,
+            .pre_request_hook = pre_request_hook,
+            .continuation_hook = agent.Loop.ContinuationHook.from(&compaction),
+            .usage_stats = &usage,
+            .session_info_hook = OneShot.SessionInfoHook.from(&session_info),
+            .catalog_hook = if (catalog != null and provider_runtime.metadata.catalog_id != null)
+                OneShot.CatalogHook.from(&catalog_hook)
+            else
+                null,
+            .terminal_hook = OneShot.TerminalHook.from(&terminal),
+            .stats_renderer = stats.renderer(),
+            .style_diagnostics = ProcessAdapters.isTty(io, .stderr()),
+        }),
+        .interactive => interactive: {
+            try stderr.flush();
+            var interactive_catalog: InteractiveCatalog = .{
+                .catalog_hook = &catalog_hook,
+                .stderr = stderr,
+            };
+            var stdin_buffer: [4096]u8 = undefined;
+            var stdin_file = std.Io.File.Reader.initStreaming(.stdin(), io, &stdin_buffer);
+            break :interactive runInteractiveWithFinish(allocator, io, .{
+                .session = session_run.session(),
+                .provider = provider_runtime.provider(),
+                .model = provider_runtime.model,
+                .model_metadata = provider_runtime.metadata.model,
+                .model_metadata_source = agent.ModelMetadataSource.ModelMetadataSource.from(&model_metadata_source),
+                .system_prompt = if (system_prompt) |value| value.bytes else "",
+                .tools = tools.tools(),
+                .effort = provider_runtime.effort,
+                .effort_source = Interactive.EffortSource.from(&effort_source),
+                .image_input = image_input,
+                .image_input_source = agent.ImageInputSource.ImageInputSource.from(&image_source),
+                .reader = &stdin_file.interface,
+                .stdout = stdout,
+                .stderr = stderr,
+                .show_prompt = ProcessAdapters.isTty(io, .stdin()) and ProcessAdapters.isTty(io, .stdout()),
+                .seam_hook = run_seam_hook,
+                .pre_request_hook = pre_request_hook,
+                .continuation_hook = agent.Loop.ContinuationHook.from(&compaction),
+                .usage_observer = agent.Loop.UsageObserver.from(&usage),
+                .max_turns = interactive_max_turns,
+                .before_first_send = if (catalog != null and provider_runtime.metadata.catalog_id != null)
+                    Interactive.BeforeFirstSend.from(&interactive_catalog)
+                else
+                    null,
+            }, &terminal);
+        },
+    };
     const publication = if (codex_runtime) |owner| owner.takePublicationOutcome() else null;
     if (run_result) |exit_code| {
         if (publication) |outcome| try renderPublicationWarning(stderr, outcome);
@@ -667,6 +716,52 @@ pub fn run(
             ignoreWriterFailure(write_error);
         return run_error;
     }
+}
+
+const InteractiveCatalog = struct {
+    catalog_hook: *CatalogHook,
+    stderr: *std.Io.Writer,
+
+    pub fn call(self: *InteractiveCatalog) Interactive.BeforeFirstSendError!void {
+        try prefetchInteractiveCatalog(self.catalog_hook, self.stderr);
+        try self.stderr.flush();
+    }
+};
+
+fn prefetchInteractiveCatalog(
+    catalog_hook: *CatalogHook,
+    stderr: *std.Io.Writer,
+) Interactive.BeforeFirstSendError!void {
+    const outcome = catalog_hook.prefetch() catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Indeterminate => error.Indeterminate,
+        error.InvalidPlan => error.InvalidPlan,
+        error.Failed => {},
+    };
+    switch (outcome) {
+        .started, .unavailable => {},
+        .warning => |warning| {
+            try stderr.writeAll("zi: warning: ");
+            try DiagnosticText.write(stderr, warning);
+            try stderr.writeByte('\n');
+        },
+    }
+}
+
+fn runInteractiveWithFinish(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    inputs: Interactive.Inputs,
+    terminal_owner: *Terminal,
+) !u8 {
+    const exit_code = Interactive.run(allocator, io, inputs) catch |original_error| {
+        terminal_owner.finish(inputs.session, inputs.seam_hook) catch |finish_error| {
+            if (finish_error == error.Indeterminate) return error.Indeterminate;
+        };
+        return original_error;
+    };
+    try terminal_owner.finish(inputs.session, inputs.seam_hook);
+    return exit_code;
 }
 
 const LazyGit = struct {
@@ -905,6 +1000,14 @@ const Terminal = struct {
             error.HookIndeterminate => error.Indeterminate,
             else => error.Failed,
         };
+    }
+};
+
+const DynamicEffort = struct {
+    runtime: *ProviderRuntime.Owned,
+
+    pub fn resolve(self: *DynamicEffort) ?[]const u8 {
+        return self.runtime.effort;
     }
 };
 
