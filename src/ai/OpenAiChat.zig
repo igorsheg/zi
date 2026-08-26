@@ -27,6 +27,7 @@ const ConfigData = struct {
     maximum_api_key_bytes: usize = default_maximum_api_key_bytes,
     body: Body.Options = .{},
     events: Events.Options = .{},
+    privileged_header_policy: Transport.PrivilegedHeaderPolicy = .https_only,
     limits: Transport.Limits = default_limits,
     retry: StreamRetry.Options = .{},
 };
@@ -82,6 +83,7 @@ pub const OpenAiChat = struct {
                 .url = self.config.endpoint,
                 .json_body = body,
                 .tick = request.tick,
+                .privileged_header_policy = self.config.privileged_header_policy,
                 .limits = self.config.limits,
             },
             sink,
@@ -138,7 +140,7 @@ fn validateConfig(config: ConfigData) error{InvalidRequest}!void {
     if (header_bytes > config.limits.max_header_bytes) return error.InvalidRequest;
     for (config.extra_headers, 0..) |header, index| {
         if (!validHeaderName(header.name) or !headerValueSafe(header.value) or
-            standardHeader(header.name)) return error.InvalidRequest;
+            standardHeader(header.name, config.api_key != null)) return error.InvalidRequest;
         header_bytes = std.math.add(usize, header_bytes, header.name.len) catch
             return error.InvalidRequest;
         header_bytes = std.math.add(usize, header_bytes, header.value.len) catch
@@ -163,8 +165,8 @@ fn validEndpoint(value: []const u8) bool {
     return true;
 }
 
-fn standardHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "authorization") or
+fn standardHeader(name: []const u8, authorization_fixed: bool) bool {
+    return (authorization_fixed and std.ascii.eqlIgnoreCase(name, "authorization")) or
         std.ascii.eqlIgnoreCase(name, "accept") or
         std.ascii.eqlIgnoreCase(name, "content-type");
 }
@@ -313,6 +315,7 @@ const TestTransport = struct {
         self.valid = self.valid and request.headers[0].isPrivileged();
         self.valid = self.valid and std.mem.eql(u8, request.headers[0].value, "Bearer secret");
         self.valid = self.valid and std.mem.eql(u8, request.headers[3].name, "X-Title");
+        self.valid = self.valid and request.privileged_header_policy == .https_or_loopback_http;
         self.valid = self.valid and std.mem.find(u8, request.json_body, "\"stream_options\":") != null;
         if (self.incomplete_once and self.calls == 1) {
             try sink.emit(.{
@@ -366,6 +369,7 @@ fn testConfig() OpenAiChat.Config {
         .endpoint = "https://chat.test/v1/chat/completions",
         .api_key = "secret",
         .extra_headers = &.{.{ .name = "X-Title", .value = "Zi" }},
+        .privileged_header_policy = .https_or_loopback_http,
         .retry = .{ .policy = .{ .max_attempts = 2, .base_delay_ms = 0 } },
     };
 }

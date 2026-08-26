@@ -7,6 +7,7 @@ pub const Usage = @import("Usage.zig");
 pub const UsagePricing = @import("UsagePricing.zig");
 pub const Transport = @import("Transport.zig");
 pub const JsonTransport = @import("JsonTransport.zig");
+pub const LocalDiscovery = @import("LocalDiscovery.zig");
 pub const HttpTransport = @import("HttpTransport.zig");
 pub const OpenAiResponses = @import("OpenAiResponses.zig").OpenAiResponses;
 pub const OpenAiChat = @import("OpenAiChat.zig").OpenAiChat;
@@ -67,6 +68,7 @@ test {
     _ = Wire;
     _ = Effort;
     _ = JsonTransport;
+    _ = LocalDiscovery;
     _ = HttpTransport;
     _ = ModelMeta;
     _ = ModelCatalog;

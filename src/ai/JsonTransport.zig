@@ -5,6 +5,7 @@ const SecureAllocator = @import("SecureAllocator.zig");
 const StreamingTransport = @import("Transport.zig");
 
 pub const Header = StreamingTransport.Header;
+pub const PrivilegedHeaderPolicy = StreamingTransport.PrivilegedHeaderPolicy;
 
 pub const maximum_request_body_bytes: usize = 16 * 1024 * 1024;
 pub const maximum_response_body_bytes: usize = 32 * 1024 * 1024;
@@ -42,6 +43,7 @@ pub const Request = struct {
     headers: []const Header,
     json_body: ?[]const u8 = null,
     tick: ?Provider.Tick = null,
+    privileged_header_policy: PrivilegedHeaderPolicy = .https_only,
     limits: Limits = default_limits,
 };
 
@@ -131,30 +133,24 @@ fn poll(tick: ?Provider.Tick) error{Cancelled}!void {
 
 fn validateRequest(value: Request) Error!void {
     try validateLimits(value.limits);
-    if (value.url.len > maximum_url_bytes or !validUrl(value.url)) return error.InvalidRequest;
+    if (value.url.len > maximum_url_bytes) return error.InvalidRequest;
+    try StreamingTransport.validateRequestSecurity(
+        value.url,
+        value.headers,
+        value.privileged_header_policy,
+    );
     if (value.headers.len > maximum_headers) return error.InvalidRequest;
     if (value.json_body) |body| {
         if (body.len > value.limits.max_request_body_bytes) return error.InvalidRequest;
     }
 
     var header_bytes: usize = 0;
-    var has_privileged_header = false;
-    for (value.headers, 0..) |header, index| {
-        has_privileged_header = has_privileged_header or header.isPrivileged();
-        if (!validHeaderName(header.name) or !validHeaderValue(header.value)) {
-            return error.InvalidRequest;
-        }
-        for (value.headers[index + 1 ..]) |other| {
-            if (std.ascii.eqlIgnoreCase(header.name, other.name)) return error.InvalidRequest;
-        }
+    for (value.headers) |header| {
         header_bytes = std.math.add(usize, header_bytes, header.name.len) catch
             return error.InvalidRequest;
         header_bytes = std.math.add(usize, header_bytes, header.value.len) catch
             return error.InvalidRequest;
         if (header_bytes > value.limits.max_header_bytes) return error.InvalidRequest;
-    }
-    if (has_privileged_header and !std.mem.startsWith(u8, value.url, "https://")) {
-        return error.InvalidRequest;
     }
 }
 
@@ -182,40 +178,6 @@ fn validateResponse(response: Response, limits: Limits) Error!void {
     if (response.retry_after_ms) |delay| {
         if (delay > Retry.retry_after_max_ms) return error.InvalidResponse;
     }
-}
-
-fn validUrl(value: []const u8) bool {
-    if (value.len == 0) return false;
-    for (value) |byte| {
-        if (byte <= 0x20 or byte == 0x7f or byte == '\\') return false;
-    }
-
-    const uri = std.Uri.parse(value) catch return false;
-    if (!std.mem.eql(u8, uri.scheme, "https") and !std.mem.eql(u8, uri.scheme, "http")) return false;
-    if (uri.host == null or uri.user != null or uri.password != null or uri.fragment != null) return false;
-    return !uri.host.?.isEmpty();
-}
-
-fn validHeaderName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    for (name) |byte| {
-        if (!isTokenByte(byte)) return false;
-    }
-    return true;
-}
-
-fn isTokenByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or switch (byte) {
-        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
-        else => false,
-    };
-}
-
-fn validHeaderValue(value: []const u8) bool {
-    for (value) |byte| {
-        if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return false;
-    }
-    return true;
 }
 
 fn testRequest() Request {
@@ -522,8 +484,14 @@ test "privileged headers require HTTPS and URLs are bounded" {
         request_value,
     ));
 
-    request_value.headers = &.{.{ .name = "Accept", .value = "application/json" }};
+    request_value.url = "http://127.0.0.1:8080/models";
+    request_value.privileged_header_policy = .https_or_loopback_http;
     var response = try erased.request(std.testing.allocator, std.testing.io, request_value);
+    response.deinit(std.testing.allocator);
+
+    request_value.url = "http://example.test/models";
+    request_value.headers = &.{.{ .name = "Accept", .value = "application/json" }};
+    response = try erased.request(std.testing.allocator, std.testing.io, request_value);
     response.deinit(std.testing.allocator);
 
     const oversized_url = "https://example.test/" ++ ("x" ** maximum_url_bytes);

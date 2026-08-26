@@ -23,6 +23,7 @@ const ProcessFacts = @import("ProcessFacts.zig");
 const CodexFiles = @import("CodexFiles.zig");
 const SessionStartup = @import("SessionStartup.zig");
 const StartupConfig = @import("StartupConfig.zig");
+const LocalStartup = @import("LocalStartup.zig");
 const OneShot = @import("OneShot.zig");
 const Stats = @import("Stats.zig");
 
@@ -167,6 +168,122 @@ pub fn run(
         return 1;
     };
 
+    var llama_outcome: ?LocalStartup.LlamaOutcome = null;
+    defer if (llama_outcome) |*outcome| outcome.deinit();
+    var llama_headers: ?LocalStartup.ResolvedHeaders = null;
+    defer if (llama_headers) |*headers| headers.deinit();
+    var ollama_headers: ?LocalStartup.ResolvedHeaders = null;
+    defer if (ollama_headers) |*headers| headers.deinit();
+    var ollama_available = false;
+    if (isExplicitLlama(selected_provider.value)) {
+        llama_headers = try LocalStartup.resolveHeaders(
+            allocator,
+            startup.providerDefinitions(),
+            "llamacpp",
+            environment.apiKey(),
+        );
+        try llama_headers.?.renderWarnings(stderr, "llamacpp");
+        var prepared_llama = try LocalStartup.PreparedLlama.init(
+            allocator,
+            startup.store(),
+            llama_headers.?.values,
+            null,
+        );
+        defer prepared_llama.deinit();
+        llama_outcome = try LocalStartup.executeLlama(
+            allocator,
+            io,
+            http_transport.json(),
+            &prepared_llama,
+        );
+        try llama_outcome.?.renderWarnings(stderr);
+        if (llama_outcome.?.fatalForExplicit()) {
+            try renderLlamaDiscoveryDiagnostic(stderr, prepared_llama.probe.base_url);
+            return 1;
+        }
+    } else if (isExplicitOllama(selected_provider.value)) {
+        ollama_headers = try LocalStartup.resolveHeaders(
+            allocator,
+            startup.providerDefinitions(),
+            "ollama",
+            environment.apiKey(),
+        );
+        try ollama_headers.?.renderWarnings(stderr, "ollama");
+    } else if (!hasExplicitProvider(selected_provider.value) and codex_runtime == null) {
+        llama_headers = try LocalStartup.resolveHeaders(
+            allocator,
+            startup.providerDefinitions(),
+            "llamacpp",
+            environment.apiKey(),
+        );
+        try llama_headers.?.renderWarnings(stderr, "llamacpp");
+        ollama_headers = try LocalStartup.resolveHeaders(
+            allocator,
+            startup.providerDefinitions(),
+            "ollama",
+            environment.apiKey(),
+        );
+        try ollama_headers.?.renderWarnings(stderr, "ollama");
+        var prepared_llama = try LocalStartup.PreparedLlama.init(
+            allocator,
+            startup.store(),
+            llama_headers.?.values,
+            null,
+        );
+        defer prepared_llama.deinit();
+        var prepared_ollama = try LocalStartup.prepareOllama(
+            allocator,
+            startup.providerDefinitions(),
+            ollama_headers.?.values,
+            null,
+        );
+        defer if (prepared_ollama) |*probe| probe.deinit();
+
+        if (prepared_ollama) |*ollama_probe| {
+            var llama_future = io.async(LocalStartup.executeReachability, .{
+                allocator,
+                io,
+                http_transport.json(),
+                &prepared_llama.probe,
+            });
+            var ollama_future = io.async(LocalStartup.executeReachability, .{
+                allocator,
+                io,
+                http_transport.json(),
+                ollama_probe,
+            });
+            // Future cancellation also joins the task. Keep both borrowed probes
+            // alive even when either await reports cancellation or allocation failure.
+            defer {
+                _ = llama_future.cancel(io) catch false;
+                _ = ollama_future.cancel(io) catch false;
+            }
+            const llama_reachable = try llama_future.await(io);
+            ollama_available = try ollama_future.await(io);
+            if (llama_reachable) {
+                llama_outcome = try LocalStartup.executeLlama(
+                    allocator,
+                    io,
+                    http_transport.json(),
+                    &prepared_llama,
+                );
+            }
+        } else if (try LocalStartup.executeReachability(
+            allocator,
+            io,
+            http_transport.json(),
+            &prepared_llama.probe,
+        )) {
+            llama_outcome = try LocalStartup.executeLlama(
+                allocator,
+                io,
+                http_transport.json(),
+                &prepared_llama,
+            );
+        }
+        if (llama_outcome) |*outcome| try outcome.renderWarnings(stderr);
+    }
+
     var catalog: ?*CatalogService.Owner = null;
     defer if (catalog) |value| {
         _ = value.cancelAndDrain();
@@ -217,8 +334,11 @@ pub fn run(
         .codex_source = if (codex_runtime) |owner| owner.credentialSource() else null,
         .default_model = codex_settings.model,
         .default_effort = codex_settings.model_reasoning_effort,
-        .llamacpp_available = false,
-        .ollama_available = false,
+        .llamacpp_available = if (llama_outcome) |*outcome| outcome.constructible() else false,
+        .ollama_available = ollama_available,
+        .llama_reconciliation = if (llama_outcome) |*outcome| outcome.reconciliation() else null,
+        .llama_extra_headers = if (llama_headers) |*headers| headers.values else &.{},
+        .ollama_extra_headers = if (ollama_headers) |*headers| headers.values else &.{},
         .session_cache_key = &session_cache_key,
         .hints_source = if (catalog != null) ProviderConfig.ModelHintsSource.from(&hints) else null,
         .http_policy = .{
@@ -1028,6 +1148,30 @@ fn isExplicitCodex(provider: ?[]const u8) bool {
     return if (provider) |value| std.mem.eql(u8, value, "codex") else false;
 }
 
+fn isExplicitLlama(provider: ?[]const u8) bool {
+    const value = provider orelse return false;
+    return std.mem.eql(u8, value, "llamacpp") or std.mem.eql(u8, value, "llama.cpp");
+}
+
+fn isExplicitOllama(provider: ?[]const u8) bool {
+    return if (provider) |value| std.mem.eql(u8, value, "ollama") else false;
+}
+
+fn hasExplicitProvider(provider: ?[]const u8) bool {
+    const value = provider orelse return false;
+    return value.len != 0;
+}
+
+fn renderLlamaDiscoveryDiagnostic(writer: *std.Io.Writer, base_url: []const u8) !void {
+    try writer.writeAll("zi: llama.cpp: failed to auto-discover model from ");
+    try DiagnosticText.write(writer, base_url);
+    try writer.writeAll(
+        "/models\nzi: is llama-server running? " ++
+            "(set HAX_MODEL to tolerate an unreachable server, or adjust " ++
+            "HAX_LLAMACPP_PORT / HAX_LLAMACPP_BASE_URL)\n",
+    );
+}
+
 fn renderCodexAuthDiagnostic(
     writer: *std.Io.Writer,
     auth_path: ?[]const u8,
@@ -1379,10 +1523,31 @@ test "provider warnings use actionable safe prose" {
     );
 }
 
-test "explicit Codex detection matches provider canonicalization semantics" {
+test "explicit provider detection matches canonical local spellings" {
     try std.testing.expect(isExplicitCodex("codex"));
     try std.testing.expect(!isExplicitCodex("Codex"));
     try std.testing.expect(!isExplicitCodex(null));
+    try std.testing.expect(isExplicitLlama("llamacpp"));
+    try std.testing.expect(isExplicitLlama("llama.cpp"));
+    try std.testing.expect(!isExplicitLlama("Llama.cpp"));
+    try std.testing.expect(isExplicitOllama("ollama"));
+    try std.testing.expect(!isExplicitOllama("Ollama"));
+    try std.testing.expect(hasExplicitProvider("ollama"));
+    try std.testing.expect(!hasExplicitProvider(""));
+    try std.testing.expect(!hasExplicitProvider(null));
+}
+
+test "llama discovery diagnostic escapes the configured endpoint" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try renderLlamaDiscoveryDiagnostic(&output.writer, "http://127.0.0.1:8080/v1\nspoof");
+    try std.testing.expectEqualStrings(
+        "zi: llama.cpp: failed to auto-discover model from " ++
+            "http://127.0.0.1:8080/v1\\nspoof/models\n" ++
+            "zi: is llama-server running? (set HAX_MODEL to tolerate an unreachable server, " ++
+            "or adjust HAX_LLAMACPP_PORT / HAX_LLAMACPP_BASE_URL)\n",
+        output.written(),
+    );
 }
 
 test "Codex settings defaults are empty when explicit HOME has no config" {

@@ -236,6 +236,11 @@ pub const HttpTransport = struct {
         stream_request: Transport.Request,
         sink: Transport.EventSink,
     ) Transport.StreamError!Transport.Result {
+        try Transport.validateRequestSecurity(
+            stream_request.url,
+            stream_request.headers,
+            stream_request.privileged_header_policy,
+        );
         var adapter: SseAdapter = .{ .sink = sink };
         var parser = Sse.Parser.init(allocator, .{
             .max_line_bytes = stream_request.limits.header_buffer_bytes,
@@ -290,6 +295,11 @@ pub const HttpTransport = struct {
         self: *HttpTransport,
         request_value: JsonTransport.Request,
     ) JsonTransport.Error!JsonTransport.Response {
+        try Transport.validateRequestSecurity(
+            request_value.url,
+            request_value.headers,
+            request_value.privileged_header_policy,
+        );
         var state: TransferState = .{
             .allocator = allocator,
             .io = io,
@@ -1398,4 +1408,18 @@ test "loopback non-success SSE supplies bounded no-response-body literal" {
     }, Transport.EventSink.from(&ignore));
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("(no resp", result.error_body.?);
+}
+
+test "direct concrete JSON calls retain transport credential validation" {
+    var concrete: HttpTransport = .{ .runtime = undefined };
+    try std.testing.expectError(error.InvalidRequest, HttpTransport.request(
+        std.testing.allocator,
+        std.testing.io,
+        &concrete,
+        .{
+            .method = .get,
+            .url = "http://example.test/models",
+            .headers = &.{.{ .name = "Authorization", .value = "Bearer secret" }},
+        },
+    ));
 }

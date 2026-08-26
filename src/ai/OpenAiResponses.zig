@@ -30,6 +30,7 @@ const ConfigData = struct {
     endpoint: []const u8 = default_endpoint,
     api_key: ?[]const u8 = null,
     extra_headers: []const Transport.Header = &.{},
+    privileged_header_policy: Transport.PrivilegedHeaderPolicy = .https_only,
     session_cache_key: ?[]const u8 = null,
     maximum_api_key_bytes: usize = default_maximum_api_key_bytes,
     limits: Transport.Limits = default_limits,
@@ -91,6 +92,7 @@ pub const OpenAiResponses = struct {
                 .json_body = body,
                 .tick = request.tick,
                 .limits = self.config.limits,
+                .privileged_header_policy = self.config.privileged_header_policy,
             },
             sink,
             self.config.retry,
@@ -145,7 +147,7 @@ fn validateConfig(config: ConfigData) error{InvalidRequest}!void {
     if (header_bytes > config.limits.max_header_bytes) return error.InvalidRequest;
     for (config.extra_headers, 0..) |header, index| {
         if (!validHeaderName(header.name) or !headerValueSafe(header.value) or
-            fixedHeader(header.name)) return error.InvalidRequest;
+            fixedHeader(header.name, config.api_key != null)) return error.InvalidRequest;
         header_bytes = std.math.add(usize, header_bytes, header.name.len) catch
             return error.InvalidRequest;
         header_bytes = std.math.add(usize, header_bytes, header.value.len) catch
@@ -201,8 +203,8 @@ fn validEndpoint(value: []const u8) bool {
     return true;
 }
 
-fn fixedHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "authorization") or
+fn fixedHeader(name: []const u8, authorization_fixed: bool) bool {
+    return (authorization_fixed and std.ascii.eqlIgnoreCase(name, "authorization")) or
         std.ascii.eqlIgnoreCase(name, "accept") or
         std.ascii.eqlIgnoreCase(name, "content-type");
 }
@@ -504,6 +506,7 @@ test "adapter rejects malformed endpoints and injected or conflicting extra head
     ));
 
     const conflicting = [_]Transport.Header{.{ .name = "authorization", .value = "other" }};
+    adapter.config.api_key = "secret";
     adapter.config.extra_headers = &conflicting;
     try std.testing.expectError(error.InvalidRequest, adapter.provider().stream(
         std.testing.allocator,

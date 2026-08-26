@@ -181,6 +181,7 @@ pub const Request = struct {
     json_body: []const u8,
     tick: ?Provider.Tick = null,
     unauthorized_recovery: ?UnauthorizedRecovery = null,
+    privileged_header_policy: Transport.PrivilegedHeaderPolicy = .https_only,
     limits: Transport.Limits,
 };
 
@@ -227,6 +228,7 @@ pub fn run(
             .headers = parser.headers(),
             .json_body = request.json_body,
             .tick = request.tick,
+            .privileged_header_policy = request.privileged_header_policy,
             .limits = request.limits,
         }, Transport.EventSink.from(&adapter)) catch |transport_error| {
             if (adapter.parse_error) |parse_error| return parseErrorToDriver(parse_error);

@@ -9,8 +9,9 @@ UTF-8 sanitation, unified-diff, atomic-write, write, edit, synchronous bash, bac
 task lifecycle and environment propagation, agent-context discovery and rendering, one-shot startup,
 execution, and output ordering, session resume and retention matching, catalog refresh and routing,
 compaction cadence, usage pricing and statistics, prompt-file expansion, configuration registry and typed
-parsing, Codex CLI credential behavior, and libcurl HTTP, CA discovery, SSE, and retry behavior are adapted
-from hax sources at that revision.
+parsing, Codex CLI credential behavior, configured provider-header resolution, local-provider
+reachability and llama.cpp model reconciliation, and libcurl HTTP, CA discovery, SSE, and retry behavior
+are adapted from hax sources at that revision.
 
 hax is licensed under the MIT License. Its license text is reproduced below.
 

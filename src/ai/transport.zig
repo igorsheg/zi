@@ -1,6 +1,13 @@
 const std = @import("std");
 const Provider = @import("Provider.zig");
 
+/// Controls where a request may carry privileged origin headers. The default
+/// keeps them on HTTPS; the relaxed policy admits them only on loopback HTTP.
+pub const PrivilegedHeaderPolicy = enum {
+    https_only,
+    https_or_loopback_http,
+};
+
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
@@ -33,6 +40,7 @@ pub const Request = struct {
     headers: []const Header,
     json_body: []const u8,
     tick: ?Provider.Tick = null,
+    privileged_header_policy: PrivilegedHeaderPolicy = .https_only,
     limits: Limits,
 };
 
@@ -210,29 +218,18 @@ fn validateRequest(request: Request) StreamError!void {
     {
         return error.InvalidRequest;
     }
-    if (!validUrl(request.url)) return error.InvalidRequest;
+    try validateRequestSecurity(request.url, request.headers, request.privileged_header_policy);
     if (request.json_body.len == 0 or request.json_body.len > limits.max_request_body_bytes) {
         return error.InvalidRequest;
     }
 
     var header_bytes: usize = 0;
-    var has_privileged_header = false;
-    for (request.headers, 0..) |header, index| {
-        has_privileged_header = has_privileged_header or header.isPrivileged();
-        if (!validHeaderName(header.name) or !validHeaderValue(header.value)) {
-            return error.InvalidRequest;
-        }
-        for (request.headers[index + 1 ..]) |other| {
-            if (std.ascii.eqlIgnoreCase(header.name, other.name)) return error.InvalidRequest;
-        }
+    for (request.headers) |header| {
         header_bytes = std.math.add(usize, header_bytes, header.name.len) catch
             return error.InvalidRequest;
         header_bytes = std.math.add(usize, header_bytes, header.value.len) catch
             return error.InvalidRequest;
         if (header_bytes > limits.max_header_bytes) return error.InvalidRequest;
-    }
-    if (has_privileged_header and !std.mem.startsWith(u8, request.url, "https://")) {
-        return error.InvalidRequest;
     }
 }
 
@@ -252,6 +249,95 @@ fn validateResult(result: Result, limits: Limits) StreamError!void {
     {
         return error.InvalidResponse;
     }
+}
+
+/// Validates URL syntax, header syntax, duplicate names, and privileged-header
+/// placement without allocating. Concrete transports must call this too because
+/// callers can bypass the erased transport seam.
+pub fn validateRequestSecurity(
+    url: []const u8,
+    headers: []const Header,
+    privileged_header_policy: PrivilegedHeaderPolicy,
+) error{InvalidRequest}!void {
+    if (!validUrl(url)) return error.InvalidRequest;
+    for (headers, 0..) |header, index| {
+        if (!validHeaderName(header.name) or !validHeaderValue(header.value)) {
+            return error.InvalidRequest;
+        }
+        for (headers[index + 1 ..]) |other| {
+            if (std.ascii.eqlIgnoreCase(header.name, other.name)) return error.InvalidRequest;
+        }
+    }
+
+    if (std.mem.startsWith(u8, url, "https://")) return;
+    for (headers) |header| {
+        if (!header.isPrivileged()) continue;
+        const loopback_privileged = privileged_header_policy == .https_or_loopback_http and
+            !std.ascii.eqlIgnoreCase(header.name, "proxy-authorization") and
+            validCanonicalLoopbackHttp(url);
+        if (!loopback_privileged) return error.InvalidRequest;
+    }
+}
+
+fn validCanonicalLoopbackHttp(url: []const u8) bool {
+    const prefix = "http://";
+    if (!std.mem.startsWith(u8, url, prefix)) return false;
+    const remainder = url[prefix.len..];
+    const authority_end = std.mem.indexOfAny(u8, remainder, "/?#") orelse remainder.len;
+    const authority = remainder[0..authority_end];
+    if (authority.len == 0 or
+        std.mem.indexOfScalar(u8, authority, '%') != null or
+        std.mem.indexOfScalar(u8, authority, '@') != null)
+    {
+        return false;
+    }
+
+    if (std.mem.startsWith(u8, authority, "[")) {
+        const host = "[::1]";
+        if (!std.mem.startsWith(u8, authority, host)) return false;
+        if (authority.len == host.len) return true;
+        if (authority[host.len] != ':') return false;
+        return validPort(authority[host.len + 1 ..]);
+    }
+
+    const colon = std.mem.findScalar(u8, authority, ':');
+    const host = if (colon) |index| authority[0..index] else authority;
+    if (colon) |index| {
+        if (!validPort(authority[index + 1 ..])) return false;
+    }
+    return validCanonicalIpv4Loopback(host);
+}
+
+fn validCanonicalIpv4Loopback(host: []const u8) bool {
+    var octets: usize = 0;
+    var remaining = host;
+    while (true) {
+        const dot = std.mem.findScalar(u8, remaining, '.');
+        const octet = if (dot) |index| remaining[0..index] else remaining;
+        if (octet.len == 0 or (octet.len > 1 and octet[0] == '0')) return false;
+        var value: u16 = 0;
+        for (octet) |byte| {
+            if (!std.ascii.isDigit(byte)) return false;
+            value = value * 10 + (byte - '0');
+            if (value > 255) return false;
+        }
+        if (octets == 0 and value != 127) return false;
+        octets += 1;
+        if (dot == null) break;
+        remaining = remaining[dot.? + 1 ..];
+    }
+    return octets == 4;
+}
+
+fn validPort(port: []const u8) bool {
+    if (port.len == 0) return false;
+    var value: u32 = 0;
+    for (port) |byte| {
+        if (!std.ascii.isDigit(byte)) return false;
+        value = value * 10 + (byte - '0');
+        if (value > 65_535) return false;
+    }
+    return value != 0;
 }
 
 fn validUrl(url: []const u8) bool {
@@ -693,4 +779,49 @@ test "streaming URL userinfo and privileged cleartext headers are rejected" {
         EventSink.from(&ignore),
     ));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "loopback HTTP policy admits privileged origin headers only on canonical addresses" {
+    const authorization = &.{Header{ .name = "Authorization", .value = "Bearer secret" }};
+    inline for (.{
+        "http://127.0.0.1/v1/models",
+        "http://127.255.2.3:8080/v1/models",
+        "http://[::1]/v1/models",
+        "http://[::1]:11434/v1/models",
+    }) |url| {
+        try validateRequestSecurity(url, authorization, .https_or_loopback_http);
+    }
+
+    inline for (.{
+        "http://localhost:8080/v1/models",
+        "http://127.0.0.1.evil.test/v1/models",
+        "http://127.0.0.1@evil.test/v1/models",
+        "http://127%2e0%2e0%2e1/v1/models",
+        "http://127.1/v1/models",
+        "http://127.00.0.1/v1/models",
+        "http://127.0.0.1:0/v1/models",
+        "http://[::1]:65536/v1/models",
+    }) |url| {
+        try std.testing.expectError(error.InvalidRequest, validateRequestSecurity(
+            url,
+            authorization,
+            .https_or_loopback_http,
+        ));
+    }
+
+    try validateRequestSecurity(
+        "http://127.0.0.1/v1/models",
+        &.{.{ .name = "X-Token", .value = "secret", .privileged = true }},
+        .https_or_loopback_http,
+    );
+    try std.testing.expectError(error.InvalidRequest, validateRequestSecurity(
+        "http://127.0.0.1/v1/models",
+        &.{.{ .name = "Proxy-Authorization", .value = "secret" }},
+        .https_or_loopback_http,
+    ));
+    try std.testing.expectError(error.InvalidRequest, validateRequestSecurity(
+        "http://127.0.0.1/v1/models",
+        authorization,
+        .https_only,
+    ));
 }

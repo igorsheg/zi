@@ -174,6 +174,7 @@ pub const Overrides = struct {
     reasoning_format: ?OpenAiChat.ReasoningFormat = null,
     reasoning_roundtrip: ?ModelMeta.ReasoningRoundtrip = null,
     reasoning_roundtrip_field: ?[]const u8 = null,
+    extra_headers: []const Transport.Header = &.{},
 };
 
 pub const WireHint = union(enum) {
@@ -275,6 +276,19 @@ const openrouter_headers = [_]Transport.Header{
     .{ .name = "HTTP-Referer", .value = "https://github.com/igorsheg/zi" },
     .{ .name = "X-OpenRouter-Categories", .value = "cli-agent" },
 };
+
+fn mergeHeaders(
+    allocator: std.mem.Allocator,
+    fixed: []const Transport.Header,
+    configured: []const Transport.Header,
+) error{OutOfMemory}![]const Transport.Header {
+    if (fixed.len == 0) return configured;
+    if (configured.len == 0) return fixed;
+    const headers = try allocator.alloc(Transport.Header, fixed.len + configured.len);
+    @memcpy(headers[0..fixed.len], fixed);
+    @memcpy(headers[fixed.len..], configured);
+    return headers;
+}
 
 pub fn resolve(
     allocator: std.mem.Allocator,
@@ -388,6 +402,17 @@ pub fn resolveDescriptor(
     else
         reasoningField(merged.reasoning_roundtrip);
 
+    const adapter_headers = try mergeHeaders(
+        allocator,
+        if (std.mem.eql(u8, descriptor.id, "openrouter")) &openrouter_headers else &.{},
+        overrides.extra_headers,
+    );
+    const local_privileged_headers = std.mem.eql(u8, descriptor.id, "llamacpp") or
+        std.mem.eql(u8, descriptor.id, "ollama");
+    const privileged_header_policy: Transport.PrivilegedHeaderPolicy = if (local_privileged_headers)
+        .https_or_loopback_http
+    else
+        .https_only;
     const adapter: AdapterPlan = switch (wire) {
         .openai_responses => if (std.mem.eql(u8, descriptor.id, "codex"))
             .{ .codex = .{
@@ -399,10 +424,8 @@ pub fn resolveDescriptor(
                 .provider_id = descriptor.id,
                 .endpoint = endpoint,
                 .api_key = key,
-                .extra_headers = if (std.mem.eql(u8, descriptor.id, "openrouter"))
-                    &openrouter_headers
-                else
-                    &.{},
+                .extra_headers = adapter_headers,
+                .privileged_header_policy = privileged_header_policy,
                 .session_cache_key = if (send_cache_key) overrides.session_cache_key else null,
             } },
         .openai_chat => blk: {
@@ -411,7 +434,8 @@ pub fn resolveDescriptor(
                 .provider_id = descriptor.id,
                 .endpoint = endpoint,
                 .api_key = key,
-                .extra_headers = if (std.mem.eql(u8, descriptor.id, "openrouter")) &openrouter_headers else &.{},
+                .extra_headers = adapter_headers,
+                .privileged_header_policy = privileged_header_policy,
                 .body = .{
                     .reasoning_field = reasoning_field,
                     .reasoning_format = overrides.reasoning_format orelse
@@ -432,7 +456,8 @@ pub fn resolveDescriptor(
                 // AnthropicMessages emits x-api-key. This intentionally maps an OpenCode bearer
                 // credential to x-api-key when its catalog routes a model to Messages.
                 .api_key = key,
-                .extra_headers = if (std.mem.eql(u8, descriptor.id, "openrouter")) &openrouter_headers else &.{},
+                .extra_headers = adapter_headers,
+                .privileged_header_policy = privileged_header_policy,
                 .body = .{
                     .thinking_mode = if (std.mem.eql(u8, descriptor.id, "anthropic")) .adaptive else .budget,
                     .cache_markers = overrides.cache != .off and
@@ -935,6 +960,10 @@ test "resolver allocation failures are clean" {
             var result = try resolve(allocator, "ollama", "qwen", .none, .{}, .{}, .{});
             defer result.deinit();
             try std.testing.expectEqual(@as(u8, 0), result.metadata.efforts.count);
+            try std.testing.expectEqual(
+                Transport.PrivilegedHeaderPolicy.https_or_loopback_http,
+                result.adapter.openai_chat.privileged_header_policy,
+            );
         }
     }.run, .{});
 }

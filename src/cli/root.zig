@@ -10,6 +10,7 @@ pub const OneShot = @import("OneShot.zig");
 pub const PrintRun = @import("PrintRun.zig");
 pub const SessionStartup = @import("SessionStartup.zig");
 pub const StartupConfig = @import("StartupConfig.zig");
+pub const LocalStartup = @import("LocalStartup.zig");
 pub const Stats = @import("Stats.zig");
 pub const SubagentDepth = @import("SubagentDepth.zig");
 
@@ -199,6 +200,7 @@ test {
     _ = PrintRun;
     _ = SessionStartup;
     _ = StartupConfig;
+    _ = LocalStartup;
     _ = Stats;
     _ = SubagentDepth;
 }
