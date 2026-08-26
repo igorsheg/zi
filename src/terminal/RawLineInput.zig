@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const RawLineInput = @This();
 const LineEditor = @import("LineEditor.zig");
 const EditLayout = @import("EditLayout.zig");
+const DisplayColumns = @import("DisplayColumns.zig");
+const Size = @import("Size.zig");
 const PosixMode = @import("PosixMode.zig");
 const CookedLineInput = @import("CookedLineInput.zig");
 
@@ -14,6 +16,10 @@ const paste_enable = "\x1b[?2004h";
 const paste_disable = "\x1b[?2004l";
 const cursor_show = "\x1b[?25h";
 const cursor_hide = "\x1b[?25l";
+const sync_begin = "\x1b[?2026h";
+const sync_end = "\x1b[?2026l";
+const submission_marker_default = "▌ ";
+const submission_body_column = 2;
 const ctrl_c_notice = "ctrl+c again to exit";
 const paste_end_marker_len = "\x1b[201~".len;
 
@@ -24,6 +30,9 @@ stdout: std.Io.File,
 writer: *std.Io.Writer,
 prompt: []const u8,
 empty_submit: bool = false,
+submission_style_open: []const u8 = "",
+submission_style_close: []const u8 = "",
+display_columns: DisplayColumns.Policy = .terminal,
 mode: PosixMode,
 screen_cursor_row: usize = 0,
 screen_rows: usize = 1,
@@ -36,9 +45,13 @@ active: bool = false,
 
 pub const Options = struct {
     empty_submit: bool = false,
+    /// Borrowed terminal bytes. The caller keeps them valid for the input's lifetime.
+    submission_style_open: []const u8 = "",
+    submission_style_close: []const u8 = "",
+    display_columns: DisplayColumns.Policy = .terminal,
 };
 
-/// The files and writer remain owned by the caller. `prompt` is borrowed for each read call.
+/// The files and writer remain owned by the caller. `prompt` and submission style bytes are borrowed.
 pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -56,8 +69,16 @@ pub fn init(
         .writer = writer,
         .prompt = prompt,
         .empty_submit = options.empty_submit,
+        .submission_style_open = options.submission_style_open,
+        .submission_style_close = options.submission_style_close,
+        .display_columns = options.display_columns,
         .mode = PosixMode.init(stdin),
     };
+}
+
+/// Controls whether bare Enter can submit an empty line for a resumable turn.
+pub fn setEmptySubmit(input: *RawLineInput, enabled: bool) void {
+    input.empty_submit = enabled;
 }
 
 /// Reads directly from the stdin descriptor. A submitted result owns its bytes.
@@ -78,7 +99,7 @@ pub fn read(input: *RawLineInput) !Result {
                 return .eof;
             },
             .timeout => {
-                const size = terminalSize(input.stdout.handle);
+                const size = input.querySize();
                 if (size.columns != input.columns or size.rows != input.rows)
                     try input.repaint(&editor, editor.exit_armed, false);
                 continue;
@@ -144,9 +165,22 @@ fn finish(input: *RawLineInput) !void {
 }
 
 fn submitAndFinish(input: *RawLineInput, editor: *LineEditor) !Result {
+    const nonempty = editor.bytes().len != 0;
+    if (nonempty) {
+        const size = input.querySize();
+        if (size.columns != input.columns or size.rows != input.rows)
+            try input.repaint(editor, editor.exit_armed, false);
+        try input.renderSubmitted(editor.bytes());
+    }
+
     var result = takeSubmitted(editor);
     errdefer result.deinit(input.allocator);
-    try input.finish();
+    if (!nonempty) {
+        try input.finish();
+    } else {
+        // renderSubmitted already placed the cursor on the next transcript row.
+        try input.cleanup();
+    }
     return result;
 }
 
@@ -186,7 +220,7 @@ fn cleanupIgnoringErrors(input: *RawLineInput) void {
 }
 
 fn leaveFreshRow(input: *RawLineInput) !void {
-    const size = terminalSize(input.stdout.handle);
+    const size = input.querySize();
     if (input.geometry_valid and (size.columns != input.columns or size.rows != input.rows)) {
         try input.writer.writeAll("\r\x1b[999B\r\n\x1b[J");
         try input.writer.flush();
@@ -205,6 +239,79 @@ fn leaveFreshRow(input: *RawLineInput) !void {
     input.screen_cursor_row = 0;
     input.screen_rows = 1;
 }
+
+fn renderSubmitted(input: *RawLineInput, text: []const u8) !void {
+    try input.writer.writeAll(sync_begin);
+    errdefer {
+        input.writer.writeAll(input.submission_style_close) catch {};
+        input.writer.writeAll("\x1b[0m") catch {};
+        input.writer.writeAll(sync_end) catch {};
+        input.writer.flush() catch {};
+    }
+    if (input.screen_cursor_row != 0)
+        try writeCursorMove(input.writer, input.screen_cursor_row, 'A');
+    try input.writer.writeByte('\r');
+    try input.writer.writeAll(input.submission_style_open);
+    try input.writer.writeAll(submission_marker_default);
+
+    var sink_context: SubmittedPaintSink = .{
+        .writer = input.writer,
+        .style_open = input.submission_style_open,
+        .style_close = input.submission_style_close,
+    };
+    _ = EditLayout.render(text, text.len, .{
+        .prompt_width = submission_body_column,
+        .continuation_column = submission_body_column,
+        .columns = input.columns,
+    }, sink_context.sink());
+    if (sink_context.failed) return error.WriteFailed;
+
+    try input.writer.writeAll(input.submission_style_close);
+    try input.writer.writeAll("\x1b[K\r\n\x1b[J");
+    try input.writer.writeAll(sync_end);
+    try input.writer.flush();
+    input.screen_cursor_row = 0;
+    input.screen_rows = 1;
+    input.geometry_valid = false;
+}
+
+const SubmittedPaintSink = struct {
+    writer: *std.Io.Writer,
+    style_open: []const u8,
+    style_close: []const u8,
+    failed: bool = false,
+
+    fn sink(context: *SubmittedPaintSink) EditLayout.Sink {
+        return .{ .context = context, .emit_fn = emit };
+    }
+
+    fn emit(raw_context: *anyopaque, event: EditLayout.Event) void {
+        const context: *SubmittedPaintSink = @ptrCast(@alignCast(raw_context));
+        if (context.failed) return;
+        switch (event) {
+            .glyph => |glyph| context.writer.writeAll(glyph.bytes) catch {
+                context.failed = true;
+            },
+            .row_break => {
+                context.writer.writeAll(context.style_close) catch {
+                    context.failed = true;
+                    return;
+                };
+                context.writer.writeAll("\x1b[K\r\n") catch {
+                    context.failed = true;
+                    return;
+                };
+                context.writer.writeAll(context.style_open) catch {
+                    context.failed = true;
+                    return;
+                };
+                context.writer.writeAll(submission_marker_default) catch {
+                    context.failed = true;
+                };
+            },
+        }
+    }
+};
 
 fn suspendEditing(input: *RawLineInput, editor: *const LineEditor) !void {
     try input.leaveFreshRow();
@@ -387,7 +494,7 @@ fn repaint(
     show_notice: bool,
     clear_screen: bool,
 ) !void {
-    const size = terminalSize(input.stdout.handle);
+    const size = input.querySize();
     const geometry_changed = input.geometry_valid and
         (size.columns != input.columns or size.rows != input.rows);
     input.columns = size.columns;
@@ -542,23 +649,10 @@ fn takeSubmitted(editor: *LineEditor) Result {
     } };
 }
 
-const TerminalSize = struct {
-    columns: usize,
-    rows: usize,
-};
-
-fn terminalSize(fd: std.posix.fd_t) TerminalSize {
-    var size: std.posix.winsize = std.mem.zeroes(std.posix.winsize);
-    const request: c_ulong = switch (builtin.os.tag) {
-        .linux => 0x5413,
-        .macos, .ios, .tvos, .watchos, .visionos => 0x40087468,
-        else => return .{ .columns = 80, .rows = 24 },
-    };
-    if (ioctl(fd, request, &size) != 0) return .{ .columns = 80, .rows = 24 };
-    return .{
-        .columns = if (size.col == 0) 80 else @min(@as(usize, size.col), EditLayout.max_terminal_columns),
-        .rows = if (size.row == 0) 24 else @min(@as(usize, size.row), EditLayout.max_terminal_columns),
-    };
+fn querySize(input: *const RawLineInput) Size {
+    var size = Size.query(input.stdout.handle);
+    size.columns = @min(size.columns, input.display_columns.resolve(size.columns));
+    return size;
 }
 
 fn flushInput(fd: std.posix.fd_t) !void {
@@ -572,7 +666,27 @@ fn flushInput(fd: std.posix.fd_t) !void {
 
 extern "c" fn tcflush(fd: c_int, queue: c_int) c_int;
 
-extern "c" fn ioctl(fd: c_int, request: c_ulong, size: *std.posix.winsize) c_int;
+test "input display policy bounds editor columns independently of physical fallback" {
+    var output: [1]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    const invalid_file: std.Io.File = .{
+        .handle = -1,
+        .flags = .{ .nonblocking = false },
+    };
+    const input = init(
+        std.testing.allocator,
+        std.testing.io,
+        invalid_file,
+        invalid_file,
+        &writer,
+        "> ",
+        .{ .display_columns = .{ .fixed = 40 } },
+    );
+
+    const size = input.querySize();
+    try std.testing.expectEqual(@as(usize, 40), size.columns);
+    try std.testing.expectEqual(@as(usize, 24), size.rows);
+}
 
 test "meta word actions classify and unknown input stays inert" {
     try std.testing.expectEqual(LineEditor.EscapeAction.move_word_left, metaAction('b'));
@@ -736,11 +850,97 @@ test "paint sink emits explicit CRLF and continuation indentation" {
     try std.testing.expectEqualStrings("ab\r\n  cd", writer.buffered());
 }
 
+test "submitted message replaces edit area with full styled transcript" {
+    var output: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    const invalid_file: std.Io.File = .{
+        .handle = -1,
+        .flags = .{ .nonblocking = false },
+    };
+    var input = init(
+        std.testing.allocator,
+        std.testing.io,
+        invalid_file,
+        invalid_file,
+        &writer,
+        "> ",
+        .{
+            .submission_style_open = "<open>",
+            .submission_style_close = "<close>",
+        },
+    );
+    input.columns = 80;
+    input.rows = 1;
+    input.screen_cursor_row = 2;
+    input.screen_rows = 3;
+    input.geometry_valid = true;
+
+    try input.renderSubmitted("ab\ncd");
+    try std.testing.expectEqualStrings(
+        sync_begin ++ "\x1b[2A\r<open>▌ ab<close>\x1b[K\r\n" ++
+            "<open>▌ cd<close>\x1b[K\r\n\x1b[J" ++ sync_end,
+        writer.buffered(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), input.screen_cursor_row);
+    try std.testing.expectEqual(@as(usize, 1), input.screen_rows);
+    try std.testing.expect(!input.geometry_valid);
+}
+
+test "submitted message renders rows beyond the editor viewport" {
+    var output: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    const invalid_file: std.Io.File = .{
+        .handle = -1,
+        .flags = .{ .nonblocking = false },
+    };
+    var input = init(
+        std.testing.allocator,
+        std.testing.io,
+        invalid_file,
+        invalid_file,
+        &writer,
+        "> ",
+        .{},
+    );
+    input.columns = 80;
+    input.rows = 1;
+
+    try input.renderSubmitted("zero\none\ntwo");
+    try std.testing.expectEqualStrings(
+        sync_begin ++ "\r▌ zero\x1b[K\r\n▌ one\x1b[K\r\n" ++
+            "▌ two\x1b[K\r\n\x1b[J" ++ sync_end,
+        writer.buffered(),
+    );
+}
+
+test "submitted rendering needs no allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var output: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    const invalid_file: std.Io.File = .{
+        .handle = -1,
+        .flags = .{ .nonblocking = false },
+    };
+    var input = init(
+        failing.allocator(),
+        std.testing.io,
+        invalid_file,
+        invalid_file,
+        &writer,
+        "> ",
+        .{},
+    );
+
+    try input.renderSubmitted("owned elsewhere");
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
 test "submit cleanup failure frees the transferred line" {
     var editor = LineEditor.init(std.testing.allocator, true);
     defer editor.deinit();
     try editor.setBuffer("owned");
-    var output: [0]u8 = .{};
+    const rendered = sync_begin ++ "\r▌ owned\x1b[K\r\n\x1b[J" ++ sync_end;
+    var output: [rendered.len]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output);
     const invalid_file: std.Io.File = .{
         .handle = -1,
@@ -756,6 +956,32 @@ test "submit cleanup failure frees the transferred line" {
         .{},
     );
     input.active = true;
+    try std.testing.expectError(error.WriteFailed, input.submitAndFinish(&editor));
+    try std.testing.expectEqual(@as(usize, 0), editor.bytes().len);
+}
+
+test "empty submit finish failure frees retained editor allocation" {
+    var editor = LineEditor.init(std.testing.allocator, true);
+    defer editor.deinit();
+    try editor.setBuffer("retained capacity");
+    try editor.setBuffer("");
+    var output: [0]u8 = .{};
+    var writer = std.Io.Writer.fixed(&output);
+    const invalid_file: std.Io.File = .{
+        .handle = -1,
+        .flags = .{ .nonblocking = false },
+    };
+    var input = init(
+        std.testing.allocator,
+        std.testing.io,
+        invalid_file,
+        invalid_file,
+        &writer,
+        "> ",
+        .{ .empty_submit = true },
+    );
+    input.active = true;
+
     try std.testing.expectError(error.WriteFailed, input.submitAndFinish(&editor));
     try std.testing.expectEqual(@as(usize, 0), editor.bytes().len);
 }

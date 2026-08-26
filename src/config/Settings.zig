@@ -178,7 +178,7 @@ const registry = [_]Setting{
         .keep_empty = false,
         .kind = .int,
         .min = 20,
-        .max = null,
+        .max = 4096,
         .description = "Content width: auto uses full width through 110 columns and 100 beyond that; terminal " ++
             "always uses full width; a number sets an exact width",
     },

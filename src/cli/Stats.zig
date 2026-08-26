@@ -30,25 +30,122 @@ pub const Renderer = struct {
         elapsed_ms: u64,
         style_diagnostics: bool,
     ) OneShot.RenderError!void {
-        if (style_diagnostics) try writer.writeAll(ansi_dim);
+        return self.renderTurnSummary(
+            writer,
+            stats,
+            stats.last_ordinary_context_tokens,
+            elapsed_ms,
+            style_diagnostics,
+            0,
+        );
+    }
 
-        try formatDuration(writer, elapsed_ms);
-        if (stats.last_ordinary_context_tokens) |context_tokens| {
-            try writer.writeAll(separator);
-            try formatContext(writer, context_tokens, self.context_limit);
+    /// Renders an interactive turn summary without allocation. The explicit
+    /// context snapshot belongs to the latest turn; spend remains cumulative.
+    /// A zero column bound disables wrapping. Otherwise wrapping occurs only
+    /// between complete segments, matching hax's `display_stats_line`.
+    pub fn renderTurnSummary(
+        self: *Renderer,
+        writer: *std.Io.Writer,
+        stats: *const agent.UsageStats.UsageStats,
+        latest_context_tokens: ?u64,
+        elapsed_ms: u64,
+        style_diagnostics: bool,
+        display_columns: usize,
+    ) OneShot.RenderError!void {
+        errdefer if (style_diagnostics) {
+            writer.writeAll(ansi_reset) catch {};
+            writer.flush() catch {};
+        };
+        var segments: Segments = .{};
+        segments.addDuration(elapsed_ms);
+        if (latest_context_tokens) |context_tokens| {
+            segments.addContext(context_tokens, self.context_limit);
         }
-
         const spend = sanitizeSpend(stats.spend_usd);
         if (spend > 0) {
-            try writer.writeAll(separator);
-            if (stats.spend_estimated or stats.has_unpriced or stats.spend_unreliable) {
-                try writer.writeByte('~');
-            }
-            try formatCostBounded(writer, spend);
+            segments.addSpend(
+                spend,
+                stats.spend_estimated or stats.has_unpriced or stats.spend_unreliable,
+            );
         }
 
+        if (style_diagnostics) try writer.writeAll(ansi_dim);
+        var column: usize = 0;
+        for (segments.slice(), 0..) |segment_value, index| {
+            const segment = segment_value.slice();
+            if (index > 0) {
+                const joined_width = column +| separator.len +| segment.len;
+                if (display_columns != 0 and joined_width > display_columns) {
+                    try writer.writeByte('\n');
+                    column = 0;
+                } else {
+                    try writer.writeAll(separator);
+                    column +|= separator.len;
+                }
+            }
+            try writer.writeAll(segment);
+            column +|= segment.len;
+        }
         if (style_diagnostics) try writer.writeAll(ansi_reset);
         try writer.writeByte('\n');
+    }
+};
+
+const segment_count_max = 3;
+const segment_len = 64;
+
+const Segment = struct {
+    bytes: [segment_len]u8 = undefined,
+    len: usize = 0,
+
+    fn writer(self: *Segment) std.Io.Writer {
+        return .fixed(&self.bytes);
+    }
+
+    fn finish(self: *Segment, output_writer: *const std.Io.Writer) void {
+        self.len = output_writer.buffered().len;
+    }
+
+    fn slice(self: *const Segment) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+const Segments = struct {
+    values: [segment_count_max]Segment = .{ .{}, .{}, .{} },
+    len: usize = 0,
+
+    fn next(self: *Segments) *Segment {
+        const segment = &self.values[self.len];
+        self.len += 1;
+        return segment;
+    }
+
+    fn addDuration(self: *Segments, elapsed_ms: u64) void {
+        const segment = self.next();
+        var writer = segment.writer();
+        formatDuration(&writer, elapsed_ms) catch unreachable;
+        segment.finish(&writer);
+    }
+
+    fn addContext(self: *Segments, context_tokens: u64, context_limit: ?u64) void {
+        const segment = self.next();
+        var writer = segment.writer();
+        formatContext(&writer, context_tokens, context_limit) catch unreachable;
+        segment.finish(&writer);
+    }
+
+    fn addSpend(self: *Segments, spend: f64, estimated: bool) void {
+        const segment = self.next();
+        var writer = segment.writer();
+        if (estimated) writer.writeByte('~') catch unreachable;
+        formatCostBounded(&writer, spend) catch unreachable;
+        segment.finish(&writer);
+    }
+
+    fn slice(self: *const Segments) []const Segment {
+        return self.values[0..self.len];
     }
 };
 
@@ -132,6 +229,27 @@ fn renderForTest(
 ) ![]const u8 {
     var writer: std.Io.Writer = .fixed(output);
     try renderer_value.render(&writer, stats, elapsed_ms, styled);
+    return writer.buffered();
+}
+
+fn renderTurnForTest(
+    renderer_value: *Renderer,
+    stats: *const agent.UsageStats.UsageStats,
+    latest_context_tokens: ?u64,
+    elapsed_ms: u64,
+    styled: bool,
+    display_columns: usize,
+    output: []u8,
+) ![]const u8 {
+    var writer: std.Io.Writer = .fixed(output);
+    try renderer_value.renderTurnSummary(
+        &writer,
+        stats,
+        latest_context_tokens,
+        elapsed_ms,
+        styled,
+        display_columns,
+    );
     return writer.buffered();
 }
 
@@ -319,4 +437,88 @@ test "writer failures propagate and OneShot owns reset recovery" {
         renderer_value.render(&style_writer, &stats, 0, true),
     );
     try std.testing.expectEqualStrings(ansi_dim, style_writer.buffered());
+}
+
+test "interactive summary wraps only beyond segment boundaries" {
+    var stats = try agent.UsageStats.UsageStats.init(std.testing.allocator, 1);
+    defer stats.deinit();
+    var renderer_value: Renderer = .{ .context_limit = 262_144 };
+    var output: [160]u8 = undefined;
+
+    const exact = "42s · 8.9k / 256k (3%)";
+    try std.testing.expectEqualStrings(
+        exact ++ "\n",
+        try renderTurnForTest(&renderer_value, &stats, 9_113, 42_000, false, exact.len, &output),
+    );
+    try std.testing.expectEqualStrings(
+        "42s\n8.9k / 256k (3%)\n",
+        try renderTurnForTest(&renderer_value, &stats, 9_113, 42_000, false, exact.len - 1, &output),
+    );
+
+    // The first segment is wider than the terminal but remains intact. The
+    // following segment starts on a new line without a leading separator.
+    renderer_value.context_limit = null;
+    try std.testing.expectEqualStrings(
+        "42s\ncontext 1\n",
+        try renderTurnForTest(&renderer_value, &stats, 1, 42_000, false, 2, &output),
+    );
+}
+
+test "interactive summary zero and extreme widths are unbounded" {
+    var stats = try agent.UsageStats.UsageStats.init(std.testing.allocator, 1);
+    defer stats.deinit();
+    stats.spend_usd = 0.042;
+    var renderer_value: Renderer = .{};
+    var output: [128]u8 = undefined;
+    const expected = "0s · context 1 · $0.042\n";
+
+    try std.testing.expectEqualStrings(
+        expected,
+        try renderTurnForTest(&renderer_value, &stats, 1, 0, false, 0, &output),
+    );
+    try std.testing.expectEqualStrings(
+        expected,
+        try renderTurnForTest(
+            &renderer_value,
+            &stats,
+            1,
+            0,
+            false,
+            std.math.maxInt(usize),
+            &output,
+        ),
+    );
+}
+
+test "interactive summary uses explicit context and cumulative approximate spend" {
+    var stats = try agent.UsageStats.UsageStats.init(std.testing.allocator, 1);
+    defer stats.deinit();
+    stats.last_ordinary_context_tokens = 999;
+    stats.spend_usd = 0.042;
+    stats.has_unpriced = true;
+    var renderer_value: Renderer = .{};
+    var output: [128]u8 = undefined;
+
+    try std.testing.expectEqualStrings(
+        "\x1b[2m0s · ~$0.042\x1b[0m\n",
+        try renderTurnForTest(&renderer_value, &stats, null, 0, true, 80, &output),
+    );
+    stats.has_unpriced = false;
+    stats.spend_estimated = true;
+    try std.testing.expectEqualStrings(
+        "0s · context 7 · ~$0.042\n",
+        try renderTurnForTest(&renderer_value, &stats, 7, 0, false, 80, &output),
+    );
+}
+
+test "interactive summary propagates writer failures" {
+    var stats = try agent.UsageStats.UsageStats.init(std.testing.allocator, 1);
+    defer stats.deinit();
+    var renderer_value: Renderer = .{};
+    var output: [2]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&output);
+    try std.testing.expectError(
+        error.WriteFailed,
+        renderer_value.renderTurnSummary(&writer, &stats, null, 0, false, 0),
+    );
 }

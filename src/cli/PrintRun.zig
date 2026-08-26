@@ -3,6 +3,7 @@ const DiagnosticText = @import("DiagnosticText.zig");
 const agent = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const config = @import("../config/root.zig");
+const render = @import("../render/root.zig");
 const persistence = @import("../persistence/root.zig");
 const tool = @import("../tool/root.zig");
 const terminal_module = @import("../terminal/root.zig");
@@ -677,8 +678,10 @@ pub fn run(
                 .catalog_hook = &catalog_hook,
                 .stderr = stderr,
             };
+            const stdin_terminal_file: std.Io.File = .stdin();
+            const stdout_terminal_file: std.Io.File = .stdout();
             var stdin_buffer: [4096]u8 = undefined;
-            var stdin_file = std.Io.File.Reader.initStreaming(.stdin(), io, &stdin_buffer);
+            var stdin_file = std.Io.File.Reader.initStreaming(stdin_terminal_file, io, &stdin_buffer);
             const interactive_terminal = ProcessAdapters.isTty(io, .stdin()) and
                 ProcessAdapters.isTty(io, .stdout());
             const interactive_inputs: Interactive.Inputs = .{
@@ -707,17 +710,47 @@ pub fn run(
                 else
                     null,
             };
-            break :interactive if (interactive_terminal)
-                runRawInteractive(
-                    allocator,
-                    io,
-                    interactive_inputs,
-                    http,
-                    &compaction,
-                    &terminal,
-                )
-            else
-                runInteractiveWithFinish(allocator, io, interactive_inputs, &terminal);
+            if (!interactive_terminal)
+                break :interactive runInteractiveWithFinish(allocator, io, interactive_inputs, &terminal);
+
+            var configured_theme = try config.Settings.getString(store, allocator, "theme");
+            defer configured_theme.deinit(allocator);
+            var configured_tint = try config.Settings.getString(store, allocator, "tint");
+            defer configured_tint.deinit(allocator);
+            var configured_display_width = try config.Settings.getString(store, allocator, "display_width");
+            defer configured_display_width.deinit(allocator);
+            const display_columns = try terminal_module.DisplayColumns.Policy.parse(
+                configured_display_width.value orelse "auto",
+            );
+            const theme = try render.Theme.resolve(.{
+                .configured_theme = configured_theme.value orelse "auto",
+                .configured_tint = configured_tint.value orelse "teal",
+                .no_color = environment.get("NO_COLOR"),
+                .term = environment.get("TERM"),
+                .colorterm = environment.get("COLORTERM"),
+                .colorfgbg = environment.get("COLORFGBG"),
+            });
+            break :interactive runRawInteractive(
+                allocator,
+                io,
+                stdin_terminal_file,
+                stdout_terminal_file,
+                interactive_inputs,
+                http,
+                &compaction,
+                &terminal,
+                theme,
+                display_columns,
+                .{
+                    .provider = provider_runtime.metadata.display_name,
+                    .model = provider_runtime.model,
+                    .effort = provider_runtime.effort,
+                    .preset = nonEmpty(selected_preset.value),
+                },
+                &stats,
+                &usage,
+                if (catalog != null and provider_runtime.metadata.catalog_id != null) &catalog_hook else null,
+            );
         },
     };
     const publication = if (codex_runtime) |owner| owner.takePublicationOutcome() else null;
@@ -806,16 +839,115 @@ fn prefetchInteractiveCatalog(
     }
 }
 
+const RawBannerFallbacks = struct {
+    provider: ?[]const u8,
+    model: ?[]const u8,
+    effort: ?[]const u8,
+    preset: ?[]const u8,
+};
+
+fn rawBannerIdentity(
+    session: *const agent.Session.Session,
+    fallbacks: RawBannerFallbacks,
+) render.Banner.Identity {
+    const selection = session.currentSelection();
+    return .{
+        .preset = nonEmpty(selection.preset) orelse nonEmpty(fallbacks.preset),
+        .provider = nonEmpty(fallbacks.provider) orelse nonEmpty(selection.provider_id),
+        .model_label = nonEmpty(selection.model_label),
+        .model = nonEmpty(selection.model) orelse nonEmpty(fallbacks.model),
+        .effort = nonEmpty(selection.effort) orelse nonEmpty(fallbacks.effort),
+    };
+}
+
+const RawPresentation = struct {
+    frame: *render.Frame,
+    theme: render.Theme,
+    display_columns: terminal_module.DisplayColumns.Policy,
+    stats: *Stats.Renderer,
+    usage: *agent.UsageStats.UsageStats,
+    catalog_hook: ?*CatalogHook,
+    stdout_fd: std.posix.fd_t,
+
+    pub fn beforePrompt(self: *RawPresentation, reason: Interactive.ResumeReason) !void {
+        try self.frame.openBlock();
+        const hint: ?[]const u8 = switch (reason) {
+            .none => null,
+            .paused => "[paused — enter to continue]",
+            .interrupted => "[interrupted — enter to continue]",
+            .max_turns => "[max turns reached — enter to continue]",
+            .provider_error => "[provider error — enter to retry]",
+        };
+        if (hint) |text| {
+            try self.frame.writeAll(self.theme.chrome_dim.open);
+            try self.frame.writeAll(text);
+            try self.frame.writeAll("\x1b[0m\n\n");
+        }
+        try self.frame.flush();
+    }
+
+    pub fn beforeGeneration(self: *RawPresentation) !void {
+        self.frame.syncExternal(1);
+        try self.frame.openBlock();
+        try self.frame.flush();
+    }
+
+    pub fn afterTurn(self: *RawPresentation, summary: Interactive.TurnSummary) !void {
+        if (summary.wrote_assistant_text) self.frame.syncExternal(1);
+        if (self.catalog_hook) |hook| {
+            const maximum_wait_ms: u64 = if (self.usage.has_unpriced) 5_000 else 0;
+            const refreshed = hook.drain(maximum_wait_ms) catch null;
+            if (refreshed) |metadata| self.usage.reprice(&metadata);
+        }
+        if (summary.outcome == .provider_error) {
+            errdefer {
+                self.frame.writer.writeAll("\x1b[0m") catch {};
+                self.frame.writer.flush() catch {};
+            }
+            try self.frame.openBlock();
+            try self.frame.writeAll(self.theme.error_style.open);
+            try self.frame.writeAll("[error: ");
+            try DiagnosticText.write(
+                self.frame.writer,
+                summary.diagnostic orelse "(no message)",
+            );
+            try self.frame.writeAll("]");
+            try self.frame.writeAll(self.theme.error_style.close);
+            try self.frame.writeByte('\n');
+            try self.frame.flush();
+            return;
+        }
+
+        try self.frame.openBlock();
+        try self.stats.renderTurnSummary(
+            self.frame.writer,
+            self.usage,
+            summary.context_tokens,
+            summary.elapsed_ms,
+            true,
+            self.display_columns.resolve(terminal_module.Size.presentationColumns(self.stdout_fd)),
+        );
+        self.frame.syncExternal(1);
+        try self.frame.flush();
+    }
+};
+
 fn runRawInteractive(
     allocator: std.mem.Allocator,
     io: std.Io,
+    stdin_file: std.Io.File,
+    stdout_file: std.Io.File,
     inputs_value: Interactive.Inputs,
     http: *ai.HttpTransport.Runtime,
     compaction: *AutoCompact,
     terminal_owner: *Terminal,
+    theme: render.Theme,
+    display_columns: terminal_module.DisplayColumns.Policy,
+    banner_fallbacks: RawBannerFallbacks,
+    stats: *Stats.Renderer,
+    usage: *agent.UsageStats.UsageStats,
+    catalog_hook: ?*CatalogHook,
 ) !u8 {
-    const stdin_file: std.Io.File = .stdin();
-    const stdout_file: std.Io.File = .stdout();
     const original = try std.posix.tcgetattr(stdin_file.handle);
     try terminal_module.SignalRestore.install(.{
         .terminal_fd = stdin_file.handle,
@@ -838,15 +970,45 @@ fn runRawInteractive(
     var interrupt_owned = true;
     errdefer if (interrupt_owned) interrupt.deinit() catch |err| ignoreTerminalCleanupError(err);
 
+    var frame = render.Frame.init(inputs_value.stdout);
+    try frame.writeByte('\n');
+    try render.Banner.render(
+        inputs_value.stdout,
+        theme,
+        display_columns.resolve(terminal_module.Size.presentationColumns(stdout_file.handle)),
+        rawBannerIdentity(inputs_value.session, banner_fallbacks),
+    );
+    frame.syncExternal(1);
+    try frame.flush();
+
+    var prompt_buffer: [128]u8 = undefined;
+    const prompt = try std.fmt.bufPrint(
+        &prompt_buffer,
+        "{s}\x1b[1m❯\x1b[22m{s} ",
+        .{ theme.accent.open, theme.accent.close },
+    );
     var raw_input = terminal_module.RawLineInput.init(
         allocator,
         io,
         stdin_file,
         stdout_file,
         inputs_value.stdout,
-        "> ",
-        .{ .empty_submit = true },
+        prompt,
+        .{
+            .submission_style_open = theme.accent.open,
+            .submission_style_close = theme.accent.close,
+            .display_columns = display_columns,
+        },
     );
+    var presentation: RawPresentation = .{
+        .frame = &frame,
+        .theme = theme,
+        .display_columns = display_columns,
+        .stats = stats,
+        .usage = usage,
+        .catalog_hook = catalog_hook,
+        .stdout_fd = stdout_file.handle,
+    };
     var checkpoint: TerminalCheckpoint = .{ .interrupt = &interrupt };
     var compact_cancellation: CompactCancellation = .{ .interrupt = &interrupt };
     compaction.cancellation = agent.CompactRunner.Cancellation.from(&compact_cancellation);
@@ -857,6 +1019,7 @@ fn runRawInteractive(
     inputs.show_prompt = false;
     inputs.generation = Interactive.Generation.from(&interrupt);
     inputs.checkpoint = agent.Loop.Checkpoint.from(&checkpoint);
+    inputs.presentation = Interactive.Presentation.from(&presentation);
 
     const exit_code = runInteractiveWithFinish(allocator, io, inputs, terminal_owner) catch |run_error| {
         try cleanupRawTerminal(&interrupt);
@@ -1885,6 +2048,91 @@ test "Codex publication warnings distinguish certainty and escape orphan names" 
         "zi: warning: Codex credential update may or may not have been published: " ++
             "the credential file operation failed; temporary file 'tmp\\n\\x1b' may need removal; " ++
             "retry authentication if the next Codex request fails\n",
+        output.written(),
+    );
+}
+
+test "raw banner identity follows the live resumed selection" {
+    var session = try agent.Session.Session.init(std.testing.allocator, .{
+        .provider_id = "resumed-provider",
+        .model = "resumed-model",
+        .model_label = "Resumed Model",
+        .effort = "high",
+        .preset = "focused",
+    });
+    defer session.deinit();
+
+    const fallbacks: RawBannerFallbacks = .{
+        .provider = "Provider Display",
+        .model = "runtime-model",
+        .effort = "medium",
+        .preset = "default",
+    };
+    var identity = rawBannerIdentity(&session, fallbacks);
+    try std.testing.expectEqualStrings("Provider Display", identity.provider.?);
+    try std.testing.expectEqualStrings("resumed-model", identity.model.?);
+    try std.testing.expectEqualStrings("Resumed Model", identity.model_label.?);
+    try std.testing.expectEqualStrings("high", identity.effort.?);
+    try std.testing.expectEqualStrings("focused", identity.preset.?);
+
+    try session.reconfigureSelection(.{
+        .provider_id = "changed-provider",
+        .model = "changed-model",
+        .effort = null,
+        .preset = null,
+    });
+    identity = rawBannerIdentity(&session, .{
+        .provider = null,
+        .model = "runtime-model",
+        .effort = "medium",
+        .preset = "default",
+    });
+    try std.testing.expectEqualStrings("changed-provider", identity.provider.?);
+    try std.testing.expectEqualStrings("changed-model", identity.model.?);
+    try std.testing.expect(identity.model_label == null);
+    try std.testing.expectEqualStrings("medium", identity.effort.?);
+    try std.testing.expectEqualStrings("default", identity.preset.?);
+}
+
+test "raw presentation spaces blocks renders policy and suppresses provider error stats" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var frame = render.Frame.init(&output.writer);
+    const theme = try render.Theme.resolve(.{ .configured_theme = "off", .configured_tint = "teal" });
+    var stats_renderer: Stats.Renderer = .{};
+    var usage = try agent.UsageStats.UsageStats.init(std.testing.allocator, 1);
+    defer usage.deinit();
+    var presentation: RawPresentation = .{
+        .frame = &frame,
+        .theme = theme,
+        .display_columns = .auto,
+        .stats = &stats_renderer,
+        .usage = &usage,
+        .catalog_hook = null,
+        .stdout_fd = -1,
+    };
+
+    try presentation.beforePrompt(.none);
+    try presentation.beforeGeneration();
+    try presentation.afterTurn(.{
+        .outcome = .complete,
+        .elapsed_ms = 0,
+        .context_tokens = null,
+        .wrote_assistant_text = false,
+    });
+    try presentation.afterTurn(.{
+        .outcome = .provider_error,
+        .elapsed_ms = 99_000,
+        .context_tokens = 42,
+        .wrote_assistant_text = false,
+        .diagnostic = "temporary",
+    });
+    try presentation.beforePrompt(.provider_error);
+
+    try std.testing.expectEqualStrings(
+        "\n\n\n\x1b[2m0s\x1b[0m\n\n" ++
+            "[error: temporary]\n\n" ++
+            "\x1b[2m[provider error — enter to retry]\x1b[0m\n\n",
         output.written(),
     );
 }

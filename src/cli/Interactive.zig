@@ -72,9 +72,14 @@ pub const EffortSource = struct {
 pub const PromptInput = struct {
     context: *anyopaque,
     read_fn: *const fn (*anyopaque) anyerror!terminal.Result,
+    set_empty_submit_fn: *const fn (*anyopaque, bool) void,
 
     pub fn read(self: PromptInput) !terminal.Result {
         return self.read_fn(self.context);
+    }
+
+    pub fn setEmptySubmit(self: PromptInput, resumable: bool) void {
+        self.set_empty_submit_fn(self.context, resumable);
     }
 
     pub fn from(implementation: anytype) PromptInput {
@@ -89,8 +94,19 @@ pub const PromptInput = struct {
                 const self: *Implementation = @ptrCast(@alignCast(context));
                 return self.read();
             }
+
+            fn setEmptySubmit(context: *anyopaque, resumable: bool) void {
+                if (comptime @hasDecl(Implementation, "setEmptySubmit")) {
+                    const self: *Implementation = @ptrCast(@alignCast(context));
+                    self.setEmptySubmit(resumable);
+                }
+            }
         };
-        return .{ .context = implementation, .read_fn = Adapter.read };
+        return .{
+            .context = implementation,
+            .read_fn = Adapter.read,
+            .set_empty_submit_fn = Adapter.setEmptySubmit,
+        };
     }
 };
 
@@ -133,6 +149,73 @@ pub const Generation = struct {
     }
 };
 
+pub const ResumeReason = enum {
+    none,
+    paused,
+    interrupted,
+    max_turns,
+    provider_error,
+};
+
+pub const TurnSummary = struct {
+    outcome: agent.Loop.Outcome,
+    elapsed_ms: u64,
+    context_tokens: ?u64,
+    wrote_assistant_text: bool,
+    /// Borrowed only for the synchronous `afterTurn` call.
+    diagnostic: ?[]const u8 = null,
+};
+
+pub const Presentation = struct {
+    context: *anyopaque,
+    before_prompt_fn: *const fn (*anyopaque, ResumeReason) anyerror!void,
+    before_generation_fn: *const fn (*anyopaque) anyerror!void,
+    after_turn_fn: *const fn (*anyopaque, TurnSummary) anyerror!void,
+
+    pub fn beforePrompt(self: Presentation, reason: ResumeReason) !void {
+        return self.before_prompt_fn(self.context, reason);
+    }
+
+    pub fn beforeGeneration(self: Presentation) !void {
+        return self.before_generation_fn(self.context);
+    }
+
+    pub fn afterTurn(self: Presentation, summary: TurnSummary) !void {
+        return self.after_turn_fn(self.context, summary);
+    }
+
+    pub fn from(implementation: anytype) Presentation {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("Presentation.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn beforePrompt(context: *anyopaque, reason: ResumeReason) anyerror!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.beforePrompt(reason);
+            }
+
+            fn beforeGeneration(context: *anyopaque) anyerror!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.beforeGeneration();
+            }
+
+            fn afterTurn(context: *anyopaque, summary: TurnSummary) anyerror!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.afterTurn(summary);
+            }
+        };
+        return .{
+            .context = implementation,
+            .before_prompt_fn = Adapter.beforePrompt,
+            .before_generation_fn = Adapter.beforeGeneration,
+            .after_turn_fn = Adapter.afterTurn,
+        };
+    }
+};
+
 pub const Inputs = struct {
     session: *agent.Session.Session,
     provider: ai.Provider.Provider,
@@ -151,6 +234,7 @@ pub const Inputs = struct {
     stderr: *std.Io.Writer,
     show_prompt: bool,
     generation: ?Generation = null,
+    presentation: ?Presentation = null,
     seam_hook: ?agent.Loop.SeamHook = null,
     checkpoint: ?agent.Loop.Checkpoint = null,
     pre_request_hook: ?agent.Loop.PreRequestHook = null,
@@ -160,28 +244,21 @@ pub const Inputs = struct {
     before_first_send: ?BeforeFirstSend = null,
 };
 
-const ResumeState = enum {
-    none,
-    clean,
-    marked,
-};
-
-fn resumeState(abort_marker_placed: bool) ResumeState {
-    return if (abort_marker_placed) .marked else .clean;
-}
-
 /// Runs a bounded prompt REPL around the shared provider-independent agent loop.
 /// Provider failures are turn-local and return control to the next prompt.
 pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
     var line_input = terminal.CookedLineInput.init(allocator, inputs.reader);
-    var resume_state: ResumeState = .none;
+    var resume_reason: ResumeReason = .none;
+    var abort_marker_placed = false;
     var first_send = true;
     while (true) {
+        if (inputs.presentation) |presentation| try presentation.beforePrompt(resume_reason);
         if (inputs.show_prompt) {
             try inputs.stdout.writeAll("> ");
             try inputs.stdout.flush();
         }
 
+        if (inputs.prompt_input) |prompt_input| prompt_input.setEmptySubmit(resume_reason != .none);
         var line_result = (if (inputs.prompt_input) |prompt_input|
             prompt_input.read()
         else
@@ -208,13 +285,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
             },
             .submit => |line| line.bytes,
         };
-        const resuming = submitted.len == 0 and resume_state != .none;
+        const resuming = submitted.len == 0 and resume_reason != .none;
         if (submitted.len == 0 and !resuming) continue;
-        const continuing = resuming and resume_state == .clean;
+        const continuing = resuming and !abort_marker_placed;
 
         var sanitized: ?[]u8 = null;
         defer if (sanitized) |bytes| allocator.free(bytes);
-        if (resuming and resume_state == .marked) {
+        if (resuming and abort_marker_placed) {
             try inputs.session.addContinuation();
             if (inputs.seam_hook) |seam| try seam.call(inputs.session, .prompt, false);
         } else if (!resuming) {
@@ -232,13 +309,16 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
             try inputs.session.addUser(sanitized.?);
             if (inputs.seam_hook) |seam| try seam.call(inputs.session, .prompt, false);
         }
-        resume_state = .none;
+        resume_reason = .none;
+        abort_marker_placed = false;
         if (first_send) {
             if (inputs.before_first_send) |hook| try hook.call();
             first_send = false;
         }
 
         const effort = if (inputs.effort_source) |source| source.resolve() else inputs.effort;
+        if (inputs.presentation) |presentation| try presentation.beforeGeneration();
+        const started_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
         if (inputs.generation) |generation| try generation.arm();
         var stream_renderer = render.StreamRenderer.init(inputs.stdout);
         var loop_result = agent.Loop.run(allocator, io, .{
@@ -273,31 +353,47 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
             .complete => stream_renderer.close(.complete),
             .provider_error => {
                 stream_renderer.close(.failure);
-                try inputs.stderr.writeAll("zi: provider error: ");
-                try DiagnosticText.write(inputs.stderr, loop_result.diagnostic orelse "(no message)");
-                try inputs.stderr.writeByte('\n');
-                try inputs.stderr.flush();
-                resume_state = resumeState(loop_result.abort_marker_placed);
+                if (inputs.presentation == null) {
+                    try inputs.stderr.writeAll("zi: provider error: ");
+                    try DiagnosticText.write(inputs.stderr, loop_result.diagnostic orelse "(no message)");
+                    try inputs.stderr.writeByte('\n');
+                    try inputs.stderr.flush();
+                }
+                resume_reason = .provider_error;
+                abort_marker_placed = loop_result.abort_marker_placed;
             },
             .max_turns => {
                 stream_renderer.close(.failure);
-                try inputs.stderr.print(
-                    "zi: max turns ({d}) exceeded; submit an empty prompt to continue\n",
-                    .{inputs.max_turns},
-                );
-                try inputs.stderr.flush();
-                resume_state = .clean;
+                if (inputs.presentation == null) {
+                    try inputs.stderr.print(
+                        "zi: max turns ({d}) exceeded; submit an empty prompt to continue\n",
+                        .{inputs.max_turns},
+                    );
+                    try inputs.stderr.flush();
+                }
+                resume_reason = .max_turns;
             },
             .paused => {
                 stream_renderer.close(.interrupted);
-                resume_state = .clean;
+                resume_reason = .paused;
             },
             .interrupted => {
                 stream_renderer.close(.interrupted);
-                resume_state = resumeState(loop_result.abort_marker_placed);
+                resume_reason = .interrupted;
+                abort_marker_placed = loop_result.abort_marker_placed;
             },
         }
         try stream_renderer.check();
+
+        const finished_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+        const elapsed_ms: u64 = @intCast(@max(0, finished_ns - started_ns) / std.time.ns_per_ms);
+        if (inputs.presentation) |presentation| try presentation.afterTurn(.{
+            .outcome = loop_result.outcome,
+            .elapsed_ms = elapsed_ms,
+            .context_tokens = loop_result.last_context_tokens,
+            .wrote_assistant_text = stream_renderer.wroteAssistantText(),
+            .diagnostic = loop_result.diagnostic,
+        });
     }
 }
 
@@ -306,10 +402,15 @@ test "interactive terminal adapters preserve prompt and generation ownership" {
         const Self = @This();
 
         calls: usize = 0,
+        empty_submit: bool = false,
 
         pub fn read(self: *Self) !terminal.Result {
             self.calls += 1;
             return .eof;
+        }
+
+        pub fn setEmptySubmit(self: *Self, resumable: bool) void {
+            self.empty_submit = resumable;
         }
     };
     const Control = struct {
@@ -328,9 +429,12 @@ test "interactive terminal adapters preserve prompt and generation ownership" {
     };
 
     var prompt: Prompt = .{};
-    var result = try PromptInput.from(&prompt).read();
+    const prompt_input = PromptInput.from(&prompt);
+    prompt_input.setEmptySubmit(true);
+    var result = try prompt_input.read();
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), prompt.calls);
+    try std.testing.expect(prompt.empty_submit);
     try std.testing.expect(result == .eof);
 
     var control: Control = .{};
@@ -884,4 +988,222 @@ test "effort source resolves after the lazy first-send hook" {
         .show_prompt = false,
         .before_first_send = BeforeFirstSend.from(&state),
     });
+}
+
+test "presentation callbacks report ordered turns and precise resume reasons" {
+    const Event = enum { before_prompt, before_generation, after_turn };
+    const Control = struct {
+        const Self = @This();
+        active: bool = false,
+
+        pub fn clearAndArm(self: *Self) !void {
+            self.active = true;
+        }
+
+        pub fn disarm(self: *Self) !void {
+            self.active = false;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.calls += 1;
+            if (self.calls == 1) {
+                try sink.emit(.{ .text_delta = "answer" });
+                try sink.emit(.{ .done = .{ .usage = .{ .input_tokens = 2, .output_tokens = 1 } } });
+            } else {
+                try sink.emit(.{ .failure = .{ .message = "temporary" } });
+            }
+        }
+    };
+    const Recorder = struct {
+        const Self = @This();
+        events: [7]Event = undefined,
+        event_count: usize = 0,
+        reasons: [3]ResumeReason = undefined,
+        reason_count: usize = 0,
+        summaries: [2]TurnSummary = undefined,
+        summary_count: usize = 0,
+        control: *Control,
+        stdout: *std.Io.Writer.Allocating,
+
+        pub fn beforePrompt(self: *Self, reason: ResumeReason) !void {
+            self.events[self.event_count] = .before_prompt;
+            self.event_count += 1;
+            self.reasons[self.reason_count] = reason;
+            self.reason_count += 1;
+        }
+
+        pub fn beforeGeneration(self: *Self) !void {
+            self.events[self.event_count] = .before_generation;
+            self.event_count += 1;
+        }
+
+        pub fn afterTurn(self: *Self, summary: TurnSummary) !void {
+            if (self.control.active) return error.GenerationStillArmed;
+            if (summary.outcome == .complete and !std.mem.eql(u8, self.stdout.written(), "answer\n")) {
+                return error.RendererNotClosed;
+            }
+            if (summary.outcome == .provider_error and
+                !std.mem.eql(u8, summary.diagnostic orelse "", "temporary"))
+            {
+                return error.DiagnosticNotReported;
+            }
+            self.events[self.event_count] = .after_turn;
+            self.event_count += 1;
+            self.summaries[self.summary_count] = summary;
+            self.summary_count += 1;
+        }
+    };
+
+    var control: Control = .{};
+    var provider: Provider = .{};
+    var session = try agent.Session.Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var reader = std.Io.Reader.fixed("one\ntwo\n");
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+    var recorder: Recorder = .{ .control = &control, .stdout = &stdout };
+
+    try std.testing.expectEqual(@as(u8, 0), try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "",
+        .reader = &reader,
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .show_prompt = false,
+        .generation = Generation.from(&control),
+        .presentation = Presentation.from(&recorder),
+    }));
+
+    try std.testing.expectEqualSlices(Event, &.{
+        .before_prompt,
+        .before_generation,
+        .after_turn,
+        .before_prompt,
+        .before_generation,
+        .after_turn,
+        .before_prompt,
+    }, recorder.events[0..recorder.event_count]);
+    try std.testing.expectEqualSlices(
+        ResumeReason,
+        &.{ .none, .none, .provider_error },
+        recorder.reasons[0..recorder.reason_count],
+    );
+    try std.testing.expectEqual(agent.Loop.Outcome.complete, recorder.summaries[0].outcome);
+    try std.testing.expectEqual(@as(?u64, 3), recorder.summaries[0].context_tokens);
+    try std.testing.expect(recorder.summaries[0].wrote_assistant_text);
+    try std.testing.expectEqual(agent.Loop.Outcome.provider_error, recorder.summaries[1].outcome);
+    try std.testing.expectEqual(@as(?u64, null), recorder.summaries[1].context_tokens);
+    try std.testing.expect(!recorder.summaries[1].wrote_assistant_text);
+}
+
+test "presentation callback errors propagate after generation and rendering close" {
+    const Control = struct {
+        const Self = @This();
+        active: bool = false,
+
+        pub fn clearAndArm(self: *Self) !void {
+            self.active = true;
+        }
+
+        pub fn disarm(self: *Self) !void {
+            self.active = false;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .text_delta = "answer" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const FailingPresentation = struct {
+        const Self = @This();
+        control: *Control,
+        stdout: *std.Io.Writer.Allocating,
+
+        pub fn beforePrompt(_: *Self, _: ResumeReason) !void {}
+        pub fn beforeGeneration(_: *Self) !void {}
+
+        pub fn afterTurn(self: *Self, _: TurnSummary) !void {
+            if (self.control.active) return error.GenerationStillArmed;
+            if (!std.mem.eql(u8, self.stdout.written(), "answer\n")) return error.RendererNotClosed;
+            return error.PresentationFailed;
+        }
+    };
+
+    var control: Control = .{};
+    var provider: Provider = .{};
+    var session = try agent.Session.Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var reader = std.Io.Reader.fixed("one\n");
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+    var presentation: FailingPresentation = .{ .control = &control, .stdout = &stdout };
+
+    try std.testing.expectError(error.PresentationFailed, run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "",
+        .reader = &reader,
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .show_prompt = false,
+        .generation = Generation.from(&control),
+        .presentation = Presentation.from(&presentation),
+    }));
+    try std.testing.expect(!control.active);
+    try std.testing.expectEqualStrings("answer\n", stdout.written());
+}
+
+test "presentation adapter propagates every callback error" {
+    const Failing = struct {
+        const Self = @This();
+
+        pub fn beforePrompt(_: *Self, _: ResumeReason) !void {
+            return error.BeforePromptFailed;
+        }
+
+        pub fn beforeGeneration(_: *Self) !void {
+            return error.BeforeGenerationFailed;
+        }
+
+        pub fn afterTurn(_: *Self, _: TurnSummary) !void {
+            return error.AfterTurnFailed;
+        }
+    };
+
+    var failing: Failing = .{};
+    const presentation = Presentation.from(&failing);
+    try std.testing.expectError(error.BeforePromptFailed, presentation.beforePrompt(.none));
+    try std.testing.expectError(error.BeforeGenerationFailed, presentation.beforeGeneration());
+    try std.testing.expectError(error.AfterTurnFailed, presentation.afterTurn(.{
+        .outcome = .complete,
+        .elapsed_ms = 0,
+        .context_tokens = null,
+        .wrote_assistant_text = false,
+    }));
 }

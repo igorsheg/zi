@@ -19,6 +19,7 @@ pub const StreamRenderer = struct {
     write_error: ?std.Io.Writer.Error = null,
     terminal: bool = false,
     stream_wrote_text: bool = false,
+    wrote_assistant_text: bool = false,
     trailing_newlines: usize = 0,
     control_state: ControlState = .text,
     utf8: text.Utf8Sanitizer = .{},
@@ -33,6 +34,11 @@ pub const StreamRenderer = struct {
 
     pub fn check(self: *const StreamRenderer) std.Io.Writer.Error!void {
         if (self.write_error) |err| return err;
+    }
+
+    /// Whether sanitized assistant text has been written during this run.
+    pub fn wroteAssistantText(self: *const StreamRenderer) bool {
+        return self.wrote_assistant_text;
     }
 
     pub fn emit(self: *StreamRenderer, event: ai.StreamEvent.StreamEvent) void {
@@ -165,13 +171,17 @@ pub const StreamRenderer = struct {
             self.flushTrailingNewlines();
             self.write(&.{byte});
             self.stream_wrote_text = true;
+            self.wrote_assistant_text = true;
         }
     }
 
     fn output(self: *StreamRenderer, bytes: []const u8) void {
         self.flushTrailingNewlines();
         self.write(bytes);
-        if (bytes.len != 0) self.stream_wrote_text = true;
+        if (bytes.len != 0) {
+            self.stream_wrote_text = true;
+            self.wrote_assistant_text = true;
+        }
     }
 
     fn flushTrailingNewlines(self: *StreamRenderer) void {
@@ -277,6 +287,54 @@ test "provider done events do not close a multi-request loop" {
     try std.testing.expectEqualStrings("before \nafter\n", output.written());
     renderer.close(.complete);
     try std.testing.expectEqualStrings("before \nafter\n", output.written());
+}
+
+test "assistant text query persists across provider requests" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var renderer: StreamRenderer = .init(&output.writer);
+
+    try std.testing.expect(!renderer.wroteAssistantText());
+    renderer.emit(.{ .text_delta = "first" });
+    renderer.emit(.{ .done = .{} });
+    try std.testing.expect(renderer.wroteAssistantText());
+
+    renderer.emit(.{ .text_delta = "" });
+    renderer.emit(.{ .done = .{} });
+    try std.testing.expect(renderer.wroteAssistantText());
+    renderer.close(.complete);
+    try std.testing.expect(renderer.wroteAssistantText());
+}
+
+test "empty and control-only streams do not count as assistant text" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var renderer: StreamRenderer = .init(&output.writer);
+
+    renderer.emit(.{ .text_delta = "" });
+    renderer.emit(.{ .done = .{} });
+    renderer.emit(.{ .text_delta = "\x1b[?1049h\x1b[?1049l" });
+    renderer.emit(.{ .done = .{} });
+    renderer.close(.complete);
+
+    try std.testing.expect(!renderer.wroteAssistantText());
+    try std.testing.expectEqualStrings("", output.written());
+}
+
+test "visible sanitizer substitutions count as assistant text" {
+    var invalid_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer invalid_output.deinit();
+    var invalid_renderer: StreamRenderer = .init(&invalid_output.writer);
+    invalid_renderer.emit(.{ .text_delta = "\xff" });
+    invalid_renderer.emit(.{ .done = .{} });
+    try std.testing.expect(invalid_renderer.wroteAssistantText());
+
+    var unsafe_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer unsafe_output.deinit();
+    var unsafe_renderer: StreamRenderer = .init(&unsafe_output.writer);
+    unsafe_renderer.emit(.{ .text_delta = "\xc2\x9b" });
+    unsafe_renderer.emit(.{ .done = .{} });
+    try std.testing.expect(unsafe_renderer.wroteAssistantText());
 }
 
 test "failure and interruption close partial text once" {
