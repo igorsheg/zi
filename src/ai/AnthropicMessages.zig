@@ -136,7 +136,7 @@ fn validateConfig(config: ConfigData) error{InvalidRequest}!void {
     }
     for (config.extra_headers, 0..) |header, index| {
         if (!validHeaderName(header.name) or !headerValueSafe(header.value) or
-            fixedHeader(header.name)) return error.InvalidRequest;
+            fixedHeader(header.name, config.api_key != null)) return error.InvalidRequest;
         header_bytes = std.math.add(usize, header_bytes, header.name.len) catch
             return error.InvalidRequest;
         header_bytes = std.math.add(usize, header_bytes, header.value.len) catch
@@ -211,8 +211,8 @@ fn validVersion(value: []const u8) bool {
     return day <= days;
 }
 
-fn fixedHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "x-api-key") or
+fn fixedHeader(name: []const u8, api_key_fixed: bool) bool {
+    return (api_key_fixed and std.ascii.eqlIgnoreCase(name, "x-api-key")) or
         std.ascii.eqlIgnoreCase(name, "anthropic-version") or
         std.ascii.eqlIgnoreCase(name, "accept") or
         std.ascii.eqlIgnoreCase(name, "content-type");

@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("ai/root.zig");
 const ProviderConfig = @import("ProviderConfig.zig");
+const ProviderHeaders = @import("ProviderHeaders.zig");
 
 const Factory = ai.ProviderFactory;
 const Provider = ai.Provider;
@@ -37,6 +38,10 @@ pub const Owned = struct {
 
     pub fn setInputTokens(self: *Owned, io: std.Io, input_tokens: u64) void {
         self.factory.setInputTokens(io, input_tokens);
+    }
+
+    pub fn headerWarnings(self: *const Owned) []const ProviderHeaders.Warning {
+        return self.config.header_warnings;
     }
 
     pub fn catalogWirePending(self: *Owned, io: std.Io) bool {

@@ -228,6 +228,7 @@ pub const Resolved = struct {
     metadata: StableMetadata,
     adapter: AdapterPlan,
     cache_setting: CacheSetting,
+    owned_headers: ?[]Transport.Header = null,
 
     /// Returns a request-specific adapter plan. Callers must use this instead of
     /// copying `adapter` directly so AUTO cache policy observes the active pricing tier.
@@ -252,6 +253,7 @@ pub const Resolved = struct {
 
     pub fn deinit(self: *Resolved) void {
         self.allocator.free(self.endpoint);
+        if (self.owned_headers) |headers| self.allocator.free(headers);
         self.* = undefined;
     }
 };
@@ -269,6 +271,7 @@ pub const Error = error{
     ProviderUnavailable,
     UnsupportedWire,
     MissingSessionCacheKey,
+    InvalidHeaderValue,
 };
 
 const openrouter_headers = [_]Transport.Header{
@@ -277,17 +280,111 @@ const openrouter_headers = [_]Transport.Header{
     .{ .name = "X-OpenRouter-Categories", .value = "cli-agent" },
 };
 
+const MergedHeaders = struct {
+    values: []const Transport.Header,
+    owned: ?[]Transport.Header = null,
+};
+
 fn mergeHeaders(
     allocator: std.mem.Allocator,
     fixed: []const Transport.Header,
     configured: []const Transport.Header,
-) error{OutOfMemory}![]const Transport.Header {
-    if (fixed.len == 0) return configured;
-    if (configured.len == 0) return fixed;
-    const headers = try allocator.alloc(Transport.Header, fixed.len + configured.len);
-    @memcpy(headers[0..fixed.len], fixed);
-    @memcpy(headers[fixed.len..], configured);
-    return headers;
+) error{OutOfMemory}!MergedHeaders {
+    if (fixed.len == 0) return .{ .values = configured };
+    if (configured.len == 0) return .{ .values = fixed };
+    var retained_fixed: usize = 0;
+    for (fixed) |header| {
+        var replaced = false;
+        for (configured) |replacement| {
+            if (std.ascii.eqlIgnoreCase(header.name, replacement.name)) {
+                replaced = true;
+                break;
+            }
+        }
+        retained_fixed += @intFromBool(!replaced);
+    }
+    if (retained_fixed == 0) return .{ .values = configured };
+    const headers = try allocator.alloc(Transport.Header, retained_fixed + configured.len);
+    var next: usize = 0;
+    for (fixed) |header| {
+        var replaced = false;
+        for (configured) |replacement| {
+            if (std.ascii.eqlIgnoreCase(header.name, replacement.name)) {
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            headers[next] = header;
+            next += 1;
+        }
+    }
+    @memcpy(headers[next..], configured);
+    return .{ .values = headers, .owned = headers };
+}
+
+fn validateAdapterHeaders(
+    descriptor_id: []const u8,
+    wire: Wire,
+    api_key: ?[]const u8,
+    headers: []const Transport.Header,
+) Error!void {
+    if (headers.len > 64) return error.InvalidHeaderValue;
+    var header_bytes: usize = switch (wire) {
+        .openai_chat, .openai_responses => "Accept".len + "text/event-stream".len +
+            "Content-Type".len + "application/json".len,
+        .anthropic_messages => "anthropic-version".len + "2023-06-01".len +
+            "Accept".len + "text/event-stream".len +
+            "Content-Type".len + "application/json".len,
+    };
+    if (api_key) |key| {
+        const auth_bytes = switch (wire) {
+            .openai_chat, .openai_responses => "Authorization".len + "Bearer ".len + key.len,
+            .anthropic_messages => "x-api-key".len + key.len,
+        };
+        header_bytes = std.math.add(usize, header_bytes, auth_bytes) catch
+            return error.InvalidHeaderValue;
+    }
+    for (headers, 0..) |header, index| {
+        if (!Transport.headerSyntaxValid(header) or Transport.headerIsProtocolOwned(header.name))
+            return error.InvalidHeaderValue;
+        if (fixedHeaderCollision(descriptor_id, wire, api_key != null, header.name))
+            return error.InvalidHeaderValue;
+        header_bytes = std.math.add(usize, header_bytes, header.name.len) catch
+            return error.InvalidHeaderValue;
+        header_bytes = std.math.add(usize, header_bytes, header.value.len) catch
+            return error.InvalidHeaderValue;
+        if (header_bytes > 16 * 1024) return error.InvalidHeaderValue;
+        for (headers[index + 1 ..]) |other| {
+            if (std.ascii.eqlIgnoreCase(header.name, other.name)) return error.InvalidHeaderValue;
+        }
+    }
+}
+
+fn fixedHeaderCollision(
+    descriptor_id: []const u8,
+    wire: Wire,
+    has_api_key: bool,
+    name: []const u8,
+) bool {
+    if (std.mem.eql(u8, descriptor_id, "codex")) {
+        inline for (.{
+            "authorization",
+            "chatgpt-account-id",
+            "originator",
+            "user-agent",
+            "session-id",
+            "x-client-request-id",
+            "openai-beta",
+            "accept",
+            "content-type",
+        }) |fixed| if (std.ascii.eqlIgnoreCase(name, fixed)) return true;
+    }
+    return switch (wire) {
+        .openai_chat, .openai_responses => has_api_key and std.ascii.eqlIgnoreCase(name, "authorization"),
+        .anthropic_messages => std.ascii.eqlIgnoreCase(name, "anthropic-version") or
+            (has_api_key and std.ascii.eqlIgnoreCase(name, "x-api-key")),
+    };
 }
 
 pub fn resolve(
@@ -402,22 +499,23 @@ pub fn resolveDescriptor(
     else
         reasoningField(merged.reasoning_roundtrip);
 
-    const adapter_headers = try mergeHeaders(
+    const merged_headers = try mergeHeaders(
         allocator,
         if (std.mem.eql(u8, descriptor.id, "openrouter")) &openrouter_headers else &.{},
         overrides.extra_headers,
     );
-    const local_privileged_headers = std.mem.eql(u8, descriptor.id, "llamacpp") or
-        std.mem.eql(u8, descriptor.id, "ollama");
-    const privileged_header_policy: Transport.PrivilegedHeaderPolicy = if (local_privileged_headers)
-        .https_or_loopback_http
-    else
-        .https_only;
+    errdefer if (merged_headers.owned) |headers| allocator.free(headers);
+    const adapter_headers = merged_headers.values;
+    try validateAdapterHeaders(descriptor.id, wire, key, adapter_headers);
+    // HTTPS remains unrestricted. The relaxed policy additionally admits
+    // privileged configured headers on canonical loopback HTTP only.
+    const privileged_header_policy: Transport.PrivilegedHeaderPolicy = .https_or_loopback_http;
     const adapter: AdapterPlan = switch (wire) {
         .openai_responses => if (std.mem.eql(u8, descriptor.id, "codex"))
             .{ .codex = .{
                 .source = codex_source.?,
                 .session_id = overrides.session_cache_key.?,
+                .extra_headers = adapter_headers,
             } }
         else
             .{ .openai_responses = .{
@@ -483,6 +581,7 @@ pub fn resolveDescriptor(
         },
         .adapter = adapter,
         .cache_setting = overrides.cache,
+        .owned_headers = merged_headers.owned,
     };
 }
 
@@ -1432,7 +1531,10 @@ test "Codex registry plan requires typed credentials and a canonical session ID"
         "codex",
         "gpt-5.4",
         auth,
-        .{ .session_cache_key = "12345678-1234-4234-8234-123456789abc" },
+        .{
+            .session_cache_key = "12345678-1234-4234-8234-123456789abc",
+            .extra_headers = &.{.{ .name = "X-Test", .value = "value" }},
+        },
         .{},
         .{},
     );
@@ -1443,6 +1545,7 @@ test "Codex registry plan requires typed credentials and a canonical session ID"
         result.adapter.codex.session_id,
     );
     try std.testing.expectEqualStrings("openai", result.metadata.catalog_id.?);
+    try std.testing.expectEqualStrings("X-Test", result.adapter.codex.extra_headers[0].name);
     try std.testing.expectEqual(@as(u8, 6), result.metadata.efforts.count);
 }
 
@@ -1518,4 +1621,98 @@ test "rule validation is allocation-free and enforces aggregate bounds" {
     try validateRules(.{ .values = &rules }, "model");
     rules[maximum_rules - 1].pattern = pattern ++ "x";
     try std.testing.expectError(error.InvalidRule, validateRules(.{ .values = &rules }, "model"));
+}
+
+test "adapter header validation covers aggregate bounds and wire-specific collisions" {
+    var too_many: [65]Transport.Header = undefined;
+    for (&too_many) |*header| header.* = .{ .name = "X-Test", .value = "value" };
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        validateAdapterHeaders("openai", .openai_chat, null, &too_many),
+    );
+
+    const version = &.{Transport.Header{ .name = "anthropic-version", .value = "custom" }};
+    try validateAdapterHeaders("gateway", .openai_chat, null, version);
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        validateAdapterHeaders("gateway", .anthropic_messages, null, version),
+    );
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        validateAdapterHeaders(
+            "gateway",
+            .openai_chat,
+            null,
+            &.{.{ .name = "Host", .value = "other.test" }},
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        validateAdapterHeaders(
+            "gateway",
+            .openai_chat,
+            null,
+            &.{.{ .name = "Bad Name", .value = "value" }},
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidHeaderValue,
+        validateAdapterHeaders(
+            "codex",
+            .openai_responses,
+            null,
+            &.{.{ .name = "User-Agent", .value = "custom" }},
+        ),
+    );
+}
+
+test "OpenRouter configured attribution headers replace defaults" {
+    var result = try resolve(
+        std.testing.allocator,
+        "openrouter",
+        "model",
+        .{ .bearer = "secret" },
+        .{
+            .extra_headers = &.{.{ .name = "x-title", .value = "custom" }},
+            .session_cache_key = "session",
+        },
+        .{},
+        .{},
+    );
+    defer result.deinit();
+    const headers = result.adapter.openai_chat.extra_headers;
+    try std.testing.expectEqual(@as(usize, 3), headers.len);
+    try std.testing.expectEqualStrings("x-title", headers[2].name);
+    try std.testing.expectEqualStrings("custom", headers[2].value);
+}
+
+test "configured headers reach every generic HTTP adapter" {
+    inline for (.{ Wire.openai_chat, Wire.openai_responses, Wire.anthropic_messages }) |wire| {
+        const descriptor: Descriptor = .{
+            .id = "gateway",
+            .display_name = "gateway",
+            .kind = .recipe,
+            .selectable = true,
+            .default_wire = wire,
+            .base_url = "https://gateway.test/v1",
+        };
+        var result = try resolveDescriptor(
+            std.testing.allocator,
+            &descriptor,
+            "model",
+            .none,
+            .{ .extra_headers = &.{.{ .name = "X-Test", .value = "value" }} },
+            .{},
+            .{},
+        );
+        defer result.deinit();
+        const headers = switch (result.adapter) {
+            .openai_chat => |config| config.extra_headers,
+            .openai_responses => |config| config.extra_headers,
+            .anthropic_messages => |config| config.extra_headers,
+            .codex => unreachable,
+        };
+        try std.testing.expectEqual(@as(usize, 1), headers.len);
+        try std.testing.expectEqualStrings("X-Test", headers[0].name);
+    }
 }

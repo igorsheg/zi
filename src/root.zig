@@ -6,6 +6,7 @@ pub const tool = @import("tool/root.zig");
 pub const text = @import("text/root.zig");
 pub const persistence = @import("persistence/root.zig");
 pub const ProviderConfig = @import("ProviderConfig.zig");
+pub const ProviderHeaders = @import("ProviderHeaders.zig");
 pub const ProviderRuntime = @import("ProviderRuntime.zig");
 pub const ToolRuntime = @import("ToolRuntime.zig");
 pub const CodexAuth = @import("CodexAuth.zig");
@@ -29,6 +30,7 @@ test {
     _ = text;
     _ = persistence;
     _ = ProviderConfig;
+    _ = ProviderHeaders;
     _ = ProviderRuntime;
     _ = ToolRuntime;
     _ = CodexAuth;

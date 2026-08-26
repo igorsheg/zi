@@ -17,7 +17,9 @@ pub const Header = struct {
     pub fn isPrivileged(self: Header) bool {
         return self.privileged or
             std.ascii.eqlIgnoreCase(self.name, "authorization") or
-            std.ascii.eqlIgnoreCase(self.name, "proxy-authorization");
+            std.ascii.eqlIgnoreCase(self.name, "proxy-authorization") or
+            std.ascii.eqlIgnoreCase(self.name, "x-api-key") or
+            std.ascii.eqlIgnoreCase(self.name, "api-key");
     }
 };
 
@@ -254,6 +256,30 @@ fn validateResult(result: Result, limits: Limits) StreamError!void {
 /// Validates URL syntax, header syntax, duplicate names, and privileged-header
 /// placement without allocating. Concrete transports must call this too because
 /// callers can bypass the erased transport seam.
+pub fn headerSyntaxValid(header: Header) bool {
+    return validHeaderName(header.name) and validHeaderValue(header.value);
+}
+
+/// Headers owned by HTTP routing, framing, or the selected wire adapter. They
+/// may not be supplied through provider `extra_headers`.
+pub fn headerIsProtocolOwned(name: []const u8) bool {
+    inline for (.{
+        "proxy-authorization",
+        "accept",
+        "content-type",
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "te",
+        "trailer",
+        "upgrade",
+    }) |owned| {
+        if (std.ascii.eqlIgnoreCase(name, owned)) return true;
+    }
+    return false;
+}
+
 pub fn validateRequestSecurity(
     url: []const u8,
     headers: []const Header,
@@ -261,7 +287,7 @@ pub fn validateRequestSecurity(
 ) error{InvalidRequest}!void {
     if (!validUrl(url)) return error.InvalidRequest;
     for (headers, 0..) |header, index| {
-        if (!validHeaderName(header.name) or !validHeaderValue(header.value)) {
+        if (!headerSyntaxValid(header)) {
             return error.InvalidRequest;
         }
         for (headers[index + 1 ..]) |other| {
@@ -531,6 +557,7 @@ test "request bounds and header syntax are validated before dispatch" {
         EventSink.from(&ignore),
     ));
     try std.testing.expect((Header{ .name = "AUTHORIZATION", .value = "secret" }).isPrivileged());
+    try std.testing.expect((Header{ .name = "X-Api-Key", .value = "secret" }).isPrivileged());
     request = testRequest();
     request.limits.max_request_body_bytes = 1;
     try std.testing.expectError(error.InvalidRequest, Transport.from(&fake).ssePost(
@@ -814,6 +841,11 @@ test "loopback HTTP policy admits privileged origin headers only on canonical ad
         &.{.{ .name = "X-Token", .value = "secret", .privileged = true }},
         .https_or_loopback_http,
     );
+    try std.testing.expectError(error.InvalidRequest, validateRequestSecurity(
+        "http://gateway.test/v1/models",
+        &.{.{ .name = "X-Api-Key", .value = "secret" }},
+        .https_or_loopback_http,
+    ));
     try std.testing.expectError(error.InvalidRequest, validateRequestSecurity(
         "http://127.0.0.1/v1/models",
         &.{.{ .name = "Proxy-Authorization", .value = "secret" }},

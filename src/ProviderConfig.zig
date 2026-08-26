@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("ai/root.zig");
 const config = @import("config/root.zig");
+const ProviderHeaders = @import("ProviderHeaders.zig");
 
 const ApiKey = config.ApiKey;
 const Settings = config.Settings;
@@ -69,6 +70,11 @@ pub const HttpPolicy = struct {
     idle_timeout_ms: u64 = 10 * 60 * 1_000,
 };
 
+pub const PreparedHeaders = struct {
+    provider_id: []const u8,
+    headers: []const ai.Transport.Header,
+};
+
 pub const Inputs = struct {
     allocator: std.mem.Allocator,
     store: Store,
@@ -92,10 +98,11 @@ pub const Inputs = struct {
     llama_reconciliation: ?LlamaModelReconciliation = null,
     llama_discovered_model: ?[]const u8 = null,
     ollama_discovered_model: ?[]const u8 = null,
-    /// Resolved, header-safe local-provider values. Resolution and warnings
-    /// stay in CLI startup; this layer copies every retained byte.
-    llama_extra_headers: []const ai.Transport.Header = &.{},
-    ollama_extra_headers: []const ai.Transport.Header = &.{},
+    /// Optional foreground-resolved snapshot, used when availability probing
+    /// already needed this provider's headers. A matching snapshot is copied;
+    /// its warnings remain the caller's responsibility. Every other selected
+    /// provider is resolved here and exposes warnings through `Owned`.
+    prepared_headers: ?PreparedHeaders = null,
     /// Optional cache-only catalog lookup. It is called once, after provider
     /// and model selection, with the effective catalog provider ID (or the
     /// selected provider ID when catalog metadata is disabled). `hints.reported`
@@ -208,6 +215,7 @@ pub const Owned = struct {
     rules: Registry.Rules,
     http_policy: HttpPolicy,
     reported_metadata: ai.ModelMeta.Metadata,
+    header_warnings: []const ProviderHeaders.Warning,
     explicit_catalog_metadata: ai.ModelCatalog.Contribution,
     catalog_contribution: ai.ModelCatalog.Contribution,
     catalog_authoritative: bool,
@@ -320,11 +328,18 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
         }
         try applyDefinition(allocator, descriptor.id, definition, &overrides);
     }
-    if (std.mem.eql(u8, descriptor.id, "llamacpp")) {
-        overrides.extra_headers = try copyHeaders(allocator, inputs.llama_extra_headers);
-    } else if (std.mem.eql(u8, descriptor.id, "ollama")) {
-        overrides.extra_headers = try copyHeaders(allocator, inputs.ollama_extra_headers);
-    }
+    const header_resolution: ProviderHeaders.Resolution = if (inputs.prepared_headers) |prepared|
+        if (std.mem.eql(u8, prepared.provider_id, descriptor.id))
+            .{
+                .headers = try copyHeaders(allocator, prepared.headers),
+                .warnings = &.{},
+            }
+        else
+            try ProviderHeaders.resolve(allocator, definition, inputs.api_key_environment)
+    else
+        try ProviderHeaders.resolve(allocator, definition, inputs.api_key_environment);
+    overrides.extra_headers = header_resolution.headers;
+    owned.header_warnings = header_resolution.warnings;
     const auth = if (dynamic) blk: {
         const value = definition orelse unreachable;
         break :blk try definitionAuth(allocator, inputs, &value, null, false, false);
@@ -477,7 +492,14 @@ fn selectProvider(allocator: std.mem.Allocator, inputs: Inputs) !ProviderSelecti
 
 fn providerAvailable(allocator: std.mem.Allocator, inputs: Inputs, provider: []const u8) !bool {
     if (std.mem.eql(u8, provider, "codex")) {
-        try validateProviderFields(inputs.store, "providers.codex", &.{});
+        try validateProviderFields(
+            inputs.store,
+            "providers.codex",
+            if (findDefinition(inputs.provider_definitions, provider) != null)
+                &.{"extra_headers"}
+            else
+                &.{},
+        );
         return inputs.codex_available and inputs.codex_source != null;
     }
     if (std.mem.eql(u8, provider, "llamacpp")) return inputs.llamacpp_available;
@@ -613,7 +635,7 @@ fn findDefinition(definitions: []const Definition, provider: []const u8) ?Defini
 fn copyHeaders(
     allocator: std.mem.Allocator,
     source: []const ai.Transport.Header,
-) error{OutOfMemory}![]const ai.Transport.Header {
+) error{OutOfMemory}![]ai.Transport.Header {
     const headers = try allocator.alloc(ai.Transport.Header, source.len);
     for (source, 0..) |header, index| {
         headers[index] = .{
@@ -814,12 +836,9 @@ fn validateRecipeDefinition(provider: []const u8, definition: *const Definition)
     if ((definition.request_cost != null or definition.reasoning_format != null or
         definition.reasoning_roundtrip != null) and !chat)
         return error.UnsupportedSetting;
-    const local_headers = std.mem.eql(u8, provider, "llamacpp") or
-        std.mem.eql(u8, provider, "ollama");
     if (definition.max_tokens != null or definition.thinking_mode != null or
         definition.thinking_budget != null or definition.version != null or
-        definition.extra_body_json != null or
-        (!local_headers and (definition.extra_headers != null or definition.extra_headers_json != null)))
+        definition.extra_body_json != null)
     {
         return error.UnsupportedSetting;
     }
@@ -966,14 +985,21 @@ fn configure(
     require_available_auth: bool,
 ) ResolveError!Registry.Auth {
     if (std.mem.eql(u8, provider, "codex")) {
-        try validateProviderFields(inputs.store, "providers.codex", &.{});
+        try validateProviderFields(
+            inputs.store,
+            "providers.codex",
+            if (definition != null) &.{"extra_headers"} else &.{},
+        );
         return .{ .codex = inputs.codex_source orelse return error.InvalidAuth };
     }
     if (std.mem.eql(u8, provider, "llamacpp")) {
         try validateProviderFields(
             inputs.store,
             "providers.llamacpp",
-            &.{ "base_url", "api_key", "port", "extra_headers" },
+            if (definition != null)
+                &.{ "base_url", "api_key", "port", "extra_headers" }
+            else
+                &.{ "base_url", "api_key", "port" },
         );
         try configureLlama(allocator, inputs.store, overrides);
         return keyAuth(allocator, inputs, "providers.llamacpp.api_key", null, false, false);
@@ -1018,7 +1044,7 @@ fn configure(
                 "base_url",            "api_key",        "api_key_env",  "display_name",
                 "catalog_id",          "sort_models",    "model_apis",   "cache",
                 "cache_ttl",           "send_cache_key", "request_cost", "reasoning_format",
-                "reasoning_roundtrip",
+                "reasoning_roundtrip", "extra_headers",
             });
         } else try validateProviderFields(inputs.store, prefix, &.{"api_key"});
         if (definition) |value| {
@@ -1047,12 +1073,20 @@ fn configure(
         return keyAuth(allocator, inputs, "providers.ollama.api_key", null, false, false);
     }
     if (std.mem.eql(u8, provider, "openai")) {
-        try validateProviderFields(inputs.store, "providers.openai", &.{"api_key"});
+        try validateProviderFields(
+            inputs.store,
+            "providers.openai",
+            if (definition != null) &.{ "api_key", "extra_headers" } else &.{"api_key"},
+        );
         try rejectFirstPartyBase(allocator, inputs.store, provider);
         return keyAuth(allocator, inputs, "providers.openai.api_key", "OPENAI_API_KEY", false, require_available_auth);
     }
     if (std.mem.eql(u8, provider, "anthropic")) {
-        try validateProviderFields(inputs.store, "providers.anthropic", &.{"api_key"});
+        try validateProviderFields(
+            inputs.store,
+            "providers.anthropic",
+            if (definition != null) &.{ "api_key", "extra_headers" } else &.{"api_key"},
+        );
         try rejectFirstPartyBase(allocator, inputs.store, provider);
         return keyAuth(
             allocator,
@@ -1064,7 +1098,14 @@ fn configure(
         );
     }
     if (std.mem.eql(u8, provider, "openrouter")) {
-        try validateProviderFields(inputs.store, "providers.openrouter", &.{ "api_key", "title", "referer" });
+        try validateProviderFields(
+            inputs.store,
+            "providers.openrouter",
+            if (definition != null)
+                &.{ "api_key", "title", "referer", "extra_headers" }
+            else
+                &.{ "api_key", "title", "referer" },
+        );
         try rejectFirstPartyBase(allocator, inputs.store, provider);
         try acceptOnlyDefault(allocator, inputs.store, "providers.openrouter.title", "zi");
         try acceptOnlyDefault(
@@ -1268,7 +1309,7 @@ const compatible_definition_fields = [_][]const u8{
     "api",              "base_url",            "api_key",        "api_key_env",
     "display_name",     "catalog_id",          "sort_models",    "model_apis",
     "cache",            "cache_ttl",           "send_cache_key", "request_cost",
-    "reasoning_format", "reasoning_roundtrip",
+    "reasoning_format", "reasoning_roundtrip", "extra_headers",
 };
 
 const known_provider_fields = [_][]const u8{
@@ -2007,11 +2048,16 @@ fn exerciseAllocationFailures(allocator: std.mem.Allocator) !void {
 
     var dynamic_document = try Document.parse(std.testing.allocator, "{\"model\":\"m\"}", .{});
     defer dynamic_document.deinit();
+    var dynamic_headers = [_]ProviderDefinitions.Header{
+        .{ .name = @constCast("X-Token"), .value = @constCast("value") },
+        .{ .name = @constCast("X-Missing"), .value = @constCast("$MISSING") },
+    };
     const dynamic_definition: Definition = .{
         .id = @constCast("dynamic-oom"),
         .base_url = @constCast("https://dynamic.test/v1"),
         .api_key = @constCast("secret"),
         .catalog_id = @constCast("dynamic-catalog"),
+        .extra_headers = &dynamic_headers,
     };
     var dynamic = try resolve(.{
         .allocator = allocator,
@@ -2535,11 +2581,14 @@ test "Ollama extra headers follow non-chat model routes with local transport pol
         .api_key_environment = .from(&empty),
         .provider_override = "ollama",
         .provider_definitions = &.{definition},
-        .ollama_extra_headers = &.{.{
-            .name = "X-Local",
-            .value = "value",
-            .privileged = true,
-        }},
+        .prepared_headers = .{
+            .provider_id = "ollama",
+            .headers = &.{.{
+                .name = "X-Local",
+                .value = "value",
+                .privileged = true,
+            }},
+        },
     });
     defer result.deinit();
     try std.testing.expect(result.resolved.metadata.wire == .openai_responses);
@@ -2548,6 +2597,96 @@ test "Ollama extra headers follow non-chat model routes with local transport pol
         result.resolved.adapter.openai_responses.privileged_header_policy,
     );
     try std.testing.expectEqual(@as(usize, 1), result.resolved.adapter.openai_responses.extra_headers.len);
+}
+
+test "selected dynamic provider resolves owned headers and retains safe warnings" {
+    const environment: TestEnvironment = .{ .entries = &.{.{ .name = "TOKEN", .value = "secret" }} };
+    var token_value = "$TOKEN".*;
+    var missing_value = "$MISSING".*;
+    var configured_headers = [_]ProviderDefinitions.Header{
+        .{ .name = @constCast("X-Token"), .value = &token_value },
+        .{ .name = @constCast("X-Missing"), .value = &missing_value },
+    };
+    const definition: Definition = .{
+        .id = @constCast("gateway"),
+        .base_url = @constCast("https://gateway.test/v1"),
+        .extra_headers = &configured_headers,
+    };
+    var document = try Document.parse(std.testing.allocator, "{\"model\":\"m\"}", .{});
+    defer document.deinit();
+    var result = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "gateway",
+        .provider_definitions = &.{definition},
+        .session_cache_key = "cache-key",
+    });
+    defer result.deinit();
+    @memset(&token_value, 'x');
+    @memset(&missing_value, 'x');
+    const headers = result.resolved.adapter.openai_chat.extra_headers;
+    try std.testing.expectEqual(@as(usize, 1), headers.len);
+    try std.testing.expectEqualStrings("X-Token", headers[0].name);
+    try std.testing.expectEqualStrings("secret", headers[0].value);
+    try std.testing.expect(headers[0].privileged);
+    try std.testing.expectEqual(@as(usize, 1), result.header_warnings.len);
+    try std.testing.expectEqualStrings("X-Missing", result.header_warnings[0].name);
+    try std.testing.expectEqualStrings("MISSING", result.header_warnings[0].environment_name.?);
+}
+
+test "selected provider ignores mismatched prepared headers" {
+    const environment: TestEnvironment = .{ .entries = &.{.{ .name = "OPENAI_API_KEY", .value = "key" }} };
+    var configured_headers = [_]ProviderDefinitions.Header{.{
+        .name = @constCast("X-Selected"),
+        .value = @constCast("value"),
+    }};
+    const definition: Definition = .{
+        .id = @constCast("openai"),
+        .extra_headers = &configured_headers,
+    };
+    var document = try Document.parse(std.testing.allocator, "{\"model\":\"m\"}", .{});
+    defer document.deinit();
+    var result = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "openai",
+        .provider_definitions = &.{definition},
+        .prepared_headers = .{
+            .provider_id = "ollama",
+            .headers = &.{.{ .name = "X-Wrong", .value = "wrong" }},
+        },
+        .session_cache_key = "cache-key",
+    });
+    defer result.deinit();
+    const headers = result.resolved.adapter.openai_responses.extra_headers;
+    try std.testing.expectEqual(@as(usize, 1), headers.len);
+    try std.testing.expectEqualStrings("X-Selected", headers[0].name);
+}
+
+test "provider header collision fails during plan resolution" {
+    const environment: TestEnvironment = .{};
+    var configured_headers = [_]ProviderDefinitions.Header{.{
+        .name = @constCast("Authorization"),
+        .value = @constCast("Bearer replacement"),
+    }};
+    const definition: Definition = .{
+        .id = @constCast("gateway"),
+        .base_url = @constCast("https://gateway.test/v1"),
+        .api_key = @constCast("key"),
+        .extra_headers = &configured_headers,
+    };
+    var document = try Document.parse(std.testing.allocator, "{\"model\":\"m\"}", .{});
+    defer document.deinit();
+    try std.testing.expectError(error.InvalidHeaderValue, resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "gateway",
+        .provider_definitions = &.{definition},
+        .session_cache_key = "cache-key",
+    }));
 }
 
 test "config-only providers reject missing inputs and unsupported retained knobs" {
@@ -3204,11 +3343,14 @@ test "llama reconciliation overrides configured IDs and can clear them" {
         .store = testStore(&document, &environment),
         .api_key_environment = .from(&environment),
         .llama_reconciliation = .{ .replace = "served" },
-        .llama_extra_headers = &.{.{
-            .name = &header_name,
-            .value = &header_value,
-            .privileged = true,
-        }},
+        .prepared_headers = .{
+            .provider_id = "llamacpp",
+            .headers = &.{.{
+                .name = &header_name,
+                .value = &header_value,
+                .privileged = true,
+            }},
+        },
     });
     defer replaced.deinit();
     @memset(&header_name, 'x');

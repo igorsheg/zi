@@ -10,6 +10,7 @@ const SecureOpen = @import("../SecureOpen.zig");
 const CatalogService = @import("../CatalogService.zig");
 const ProviderRuntime = @import("../ProviderRuntime.zig");
 const ProviderConfig = @import("../ProviderConfig.zig");
+const ProviderHeaders = @import("../ProviderHeaders.zig");
 const CodexRuntime = @import("../CodexRuntime.zig");
 const CodexAuth = @import("../CodexAuth.zig");
 const ToolRuntime = @import("../ToolRuntime.zig");
@@ -171,9 +172,9 @@ pub fn run(
     var llama_outcome: ?LocalStartup.LlamaOutcome = null;
     defer if (llama_outcome) |*outcome| outcome.deinit();
     var llama_headers: ?LocalStartup.ResolvedHeaders = null;
-    defer if (llama_headers) |*headers| headers.deinit();
+    defer if (llama_headers) |*headers| headers.deinit(allocator);
     var ollama_headers: ?LocalStartup.ResolvedHeaders = null;
-    defer if (ollama_headers) |*headers| headers.deinit();
+    defer if (ollama_headers) |*headers| headers.deinit(allocator);
     var ollama_available = false;
     if (isExplicitLlama(selected_provider.value)) {
         llama_headers = try LocalStartup.resolveHeaders(
@@ -182,11 +183,11 @@ pub fn run(
             "llamacpp",
             environment.apiKey(),
         );
-        try llama_headers.?.renderWarnings(stderr, "llamacpp");
+        try renderProviderHeaderWarnings(stderr, "llamacpp", llama_headers.?.warnings);
         var prepared_llama = try LocalStartup.PreparedLlama.init(
             allocator,
             startup.store(),
-            llama_headers.?.values,
+            llama_headers.?.headers,
             null,
         );
         defer prepared_llama.deinit();
@@ -208,7 +209,7 @@ pub fn run(
             "ollama",
             environment.apiKey(),
         );
-        try ollama_headers.?.renderWarnings(stderr, "ollama");
+        try renderProviderHeaderWarnings(stderr, "ollama", ollama_headers.?.warnings);
     } else if (!hasExplicitProvider(selected_provider.value) and codex_runtime == null) {
         llama_headers = try LocalStartup.resolveHeaders(
             allocator,
@@ -216,25 +217,25 @@ pub fn run(
             "llamacpp",
             environment.apiKey(),
         );
-        try llama_headers.?.renderWarnings(stderr, "llamacpp");
+        try renderProviderHeaderWarnings(stderr, "llamacpp", llama_headers.?.warnings);
         ollama_headers = try LocalStartup.resolveHeaders(
             allocator,
             startup.providerDefinitions(),
             "ollama",
             environment.apiKey(),
         );
-        try ollama_headers.?.renderWarnings(stderr, "ollama");
+        try renderProviderHeaderWarnings(stderr, "ollama", ollama_headers.?.warnings);
         var prepared_llama = try LocalStartup.PreparedLlama.init(
             allocator,
             startup.store(),
-            llama_headers.?.values,
+            llama_headers.?.headers,
             null,
         );
         defer prepared_llama.deinit();
         var prepared_ollama = try LocalStartup.prepareOllama(
             allocator,
             startup.providerDefinitions(),
-            ollama_headers.?.values,
+            ollama_headers.?.headers,
             null,
         );
         defer if (prepared_ollama) |*probe| probe.deinit();
@@ -337,8 +338,13 @@ pub fn run(
         .llamacpp_available = if (llama_outcome) |*outcome| outcome.constructible() else false,
         .ollama_available = ollama_available,
         .llama_reconciliation = if (llama_outcome) |*outcome| outcome.reconciliation() else null,
-        .llama_extra_headers = if (llama_headers) |*headers| headers.values else &.{},
-        .ollama_extra_headers = if (ollama_headers) |*headers| headers.values else &.{},
+        .prepared_headers = if (llama_headers != null and
+            (if (llama_outcome) |*outcome| outcome.constructible() else false))
+            .{ .provider_id = "llamacpp", .headers = llama_headers.?.headers }
+        else if (ollama_headers) |*headers|
+            .{ .provider_id = "ollama", .headers = headers.headers }
+        else
+            null,
         .session_cache_key = &session_cache_key,
         .hints_source = if (catalog != null) ProviderConfig.ModelHintsSource.from(&hints) else null,
         .http_policy = .{
@@ -348,6 +354,11 @@ pub fn run(
         },
     }, http_transport.streaming(), 0);
     defer provider_runtime.deinit();
+    try renderProviderHeaderWarnings(
+        stderr,
+        provider_runtime.metadata.provider_id,
+        provider_runtime.headerWarnings(),
+    );
 
     var selected_preset = try config.Settings.getString(startup.store(), allocator, "preset");
     defer selected_preset.deinit(allocator);
@@ -1160,6 +1171,29 @@ fn isExplicitOllama(provider: ?[]const u8) bool {
 fn hasExplicitProvider(provider: ?[]const u8) bool {
     const value = provider orelse return false;
     return value.len != 0;
+}
+
+fn renderProviderHeaderWarnings(
+    writer: *std.Io.Writer,
+    provider: []const u8,
+    warnings: []const ProviderHeaders.Warning,
+) !void {
+    for (warnings) |warning| {
+        try writer.writeAll("zi: warning: providers.");
+        try DiagnosticText.write(writer, provider);
+        try writer.writeAll(".extra_headers: header '");
+        try DiagnosticText.write(writer, warning.name);
+        try writer.writeAll(switch (warning.kind) {
+            .missing_environment => "' dropped — $",
+            .invalid_resolved_value => "' needs a control-character-free value — ignoring it\n",
+            .protocol_owned => "' is protocol-owned — ignoring it\n",
+            .duplicate => "' duplicates another header name — ignoring it\n",
+        });
+        if (warning.kind == .missing_environment) {
+            try DiagnosticText.write(writer, warning.environment_name.?);
+            try writer.writeAll(" is not set\n");
+        }
+    }
 }
 
 fn renderLlamaDiscoveryDiagnostic(writer: *std.Io.Writer, base_url: []const u8) !void {

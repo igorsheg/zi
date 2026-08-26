@@ -603,7 +603,10 @@ fn parseHeaders(
     result: *Definition,
     warnings: *std.ArrayList(Warning),
 ) !void {
-    const node = nodeFor(documents, name, "extra_headers") orelse return;
+    const document = documents.config orelse return;
+    var key_buffer: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buffer, "providers.{s}.extra_headers", .{name}) catch return;
+    const node = document.lookup(key) orelse return;
     result.extra_headers_json = try canonicalJson(allocator, node);
     if (node.* != .object) {
         try appendWarning(allocator, warnings, name, "extra_headers", .expected_object);
@@ -789,7 +792,7 @@ test "enumeration preserves order, overlays fields, and rejects dotted ids" {
     try std.testing.expect(saw_dotted);
 }
 
-test "structured fields use state before config and keep compact JSON" {
+test "extra headers remain config-only while other structured fields use state" {
     var config = try Document.parse(
         std.testing.allocator,
         "{\"providers\":{\"gateway\":{\"api\":\"responses\",\"model_apis\":{" ++
@@ -809,9 +812,13 @@ test "structured fields use state before config and keep compact JSON" {
     defer result.deinit();
     const definition = &result.definitions[0];
     try std.testing.expectEqualStrings("{\"temperature\":1}", definition.extra_body_json.?);
-    try std.testing.expectEqualStrings("{\"X-Test\":\"ok\"}", definition.extra_headers_json.?);
+    try std.testing.expectEqualStrings(
+        "{\"Authorization\":\"$TOKEN\"}",
+        definition.extra_headers_json.?,
+    );
     try std.testing.expectEqual(@as(usize, 1), definition.extra_headers.?.len);
-    try std.testing.expectEqualStrings("ok", definition.extra_headers.?[0].value);
+    try std.testing.expectEqualStrings("Authorization", definition.extra_headers.?[0].name);
+    try std.testing.expectEqualStrings("$TOKEN", definition.extra_headers.?[0].value);
     try std.testing.expectEqual(@as(usize, 1), definition.model_apis.?.len);
     try std.testing.expect(definition.model_apis.?[0].api == .anthropic_messages);
 }
