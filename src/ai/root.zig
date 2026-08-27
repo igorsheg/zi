@@ -32,6 +32,7 @@ pub const CodexRefresh = @import("CodexRefresh.zig");
 pub const CodexModels = @import("CodexModels.zig");
 pub const CodexOperations = @import("CodexOperations.zig");
 pub const CodexUsage = @import("CodexUsage.zig");
+pub const Mock = @import("Mock.zig");
 const Sse = @import("Sse.zig");
 const Retry = @import("Retry.zig");
 const ApiError = @import("ApiError.zig");

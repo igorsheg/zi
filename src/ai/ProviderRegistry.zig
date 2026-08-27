@@ -3,6 +3,7 @@ const AnthropicMessages = @import("AnthropicMessages.zig").AnthropicMessages;
 const CodexModule = @import("Codex.zig");
 const Codex = CodexModule.Codex;
 const Effort = @import("Effort.zig");
+const Mock = @import("Mock.zig");
 const ModelMeta = @import("ModelMeta.zig");
 const OpenAiChat = @import("OpenAiChat.zig").OpenAiChat;
 const OpenAiResponses = @import("OpenAiResponses.zig").OpenAiResponses;
@@ -175,6 +176,8 @@ pub const Overrides = struct {
     reasoning_roundtrip: ?ModelMeta.ReasoningRoundtrip = null,
     reasoning_roundtrip_field: ?[]const u8 = null,
     extra_headers: []const Transport.Header = &.{},
+    /// Borrowed mock-provider script path. Only valid for the mock descriptor.
+    mock_script: ?[]const u8 = null,
 };
 
 pub const WireHint = union(enum) {
@@ -209,7 +212,8 @@ pub const StableMetadata = struct {
     display_name: []const u8,
     catalog_id: ?[]const u8,
     model_id: []const u8,
-    wire: Wire,
+    /// Null only for the internal mock provider, which has no wire dialect.
+    wire: ?Wire,
     efforts: Effort.Set,
     model: ModelMeta.Metadata,
     send_cache_key: bool,
@@ -220,6 +224,9 @@ pub const AdapterPlan = union(enum) {
     openai_responses: OpenAiResponses.Config,
     openai_chat: OpenAiChat.Config,
     anthropic_messages: AnthropicMessages.Config,
+    /// Internal development provider: exercises dispatch and rendering without
+    /// a model. Its state lives in the factory owner, not in the plan.
+    mock: Mock.Config,
 };
 
 pub const Resolved = struct {
@@ -246,7 +253,7 @@ pub const Resolved = struct {
                 config.events.cache_write_1h = markers and
                     std.mem.eql(u8, config.body.cache_ttl, "1h");
             },
-            .codex, .openai_responses, .anthropic_messages => {},
+            .codex, .openai_responses, .anthropic_messages, .mock => {},
         }
         return plan;
     }
@@ -421,7 +428,34 @@ pub fn resolveDescriptor(
         return error.InvalidOverride;
     if (descriptor.catalog_id) |value| if (value.len != 0 and !validId(value))
         return error.InvalidOverride;
-    if (std.mem.eql(u8, descriptor.id, "mock")) return error.AdapterUnavailable;
+    if (std.mem.eql(u8, descriptor.id, "mock")) {
+        // The internal development provider has no endpoint, wire, or auth; it
+        // exists to exercise dispatch and rendering without a model (hax's
+        // PROVIDER_MOCK factory, marked internal and unlisted in the picker).
+        if (model_id.len == 0 or model_id.len > maximum_model_bytes or
+            !std.unicode.utf8ValidateSlice(model_id) or std.mem.indexOfScalar(u8, model_id, 0) != null)
+            return error.InvalidModelId;
+        try validateOverrides(overrides);
+        const endpoint = try allocator.dupe(u8, "");
+        errdefer allocator.free(endpoint);
+        return .{
+            .allocator = allocator,
+            .endpoint = endpoint,
+            .metadata = .{
+                .provider_id = descriptor.id,
+                .display_name = descriptor.display_name,
+                .catalog_id = null,
+                .model_id = model_id,
+                .wire = null,
+                .efforts = .{},
+                .model = .{},
+                .send_cache_key = false,
+            },
+            .adapter = .{ .mock = .{ .script_path = overrides.mock_script } },
+            .cache_setting = .off,
+        };
+    }
+    if (overrides.mock_script != null) return error.InvalidOverride;
     if (model_id.len == 0 or model_id.len > maximum_model_bytes or
         !std.unicode.utf8ValidateSlice(model_id) or std.mem.indexOfScalar(u8, model_id, 0) != null)
         return error.InvalidModelId;
@@ -674,6 +708,11 @@ fn validateOverrides(overrides: Overrides) Error!void {
         if (value.len == 0 or value.len > maximum_id_bytes or !std.unicode.utf8ValidateSlice(value))
             return error.InvalidOverride;
         for (value) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidOverride;
+    }
+    if (overrides.mock_script) |value| {
+        if (value.len == 0 or value.len > maximum_endpoint_bytes or
+            !std.unicode.utf8ValidateSlice(value) or std.mem.indexOfScalar(u8, value, 0) != null)
+            return error.InvalidOverride;
     }
 }
 
@@ -989,6 +1028,55 @@ test "registry order visibility alias and invalid ids" {
     try std.testing.expect(find("") == null);
     try std.testing.expect(find("open.ai") == null);
     try std.testing.expectEqual(@as(usize, 10), order().len);
+}
+
+test "mock resolves to the internal plan without wire endpoint or auth" {
+    var result = try resolve(
+        std.testing.allocator,
+        "mock",
+        "mock-model",
+        .none,
+        .{ .mock_script = "fixtures/demo.txt" },
+        .{},
+        .{},
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("mock", result.metadata.provider_id);
+    try std.testing.expectEqualStrings("mock-model", result.metadata.model_id);
+    try std.testing.expectEqual(@as(?Wire, null), result.metadata.wire);
+    try std.testing.expectEqualStrings("", result.endpoint);
+    switch (result.adapter) {
+        .mock => |config| try std.testing.expectEqualStrings("fixtures/demo.txt", config.script_path.?),
+        else => return error.TestExpectedEqual,
+    }
+
+    var interactive = try resolve(
+        std.testing.allocator,
+        "mock",
+        "mock-model",
+        .none,
+        .{},
+        .{},
+        .{},
+    );
+    defer interactive.deinit();
+    switch (interactive.adapter) {
+        .mock => |config| try std.testing.expectEqual(@as(?[]const u8, null), config.script_path),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "mock script override is rejected for real providers" {
+    try std.testing.expectError(error.InvalidOverride, resolve(
+        std.testing.allocator,
+        "openai",
+        "gpt",
+        .{ .bearer = "key" },
+        .{ .mock_script = "fixtures/demo.txt" },
+        .{},
+        .{},
+    ));
 }
 
 test "resolution snapshots rules endpoints mixed wires and policy" {
@@ -1711,6 +1799,7 @@ test "configured headers reach every generic HTTP adapter" {
             .openai_responses => |config| config.extra_headers,
             .anthropic_messages => |config| config.extra_headers,
             .codex => unreachable,
+            .mock => unreachable,
         };
         try std.testing.expectEqual(@as(usize, 1), headers.len);
         try std.testing.expectEqualStrings("X-Test", headers[0].name);

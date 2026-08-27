@@ -2,6 +2,7 @@ const std = @import("std");
 const AnthropicMessages = @import("AnthropicMessages.zig").AnthropicMessages;
 const CodexModule = @import("Codex.zig");
 const Codex = CodexModule.Codex;
+const Mock = @import("Mock.zig");
 const OpenAiChat = @import("OpenAiChat.zig").OpenAiChat;
 const ModelMeta = @import("ModelMeta.zig");
 const OpenAiResponses = @import("OpenAiResponses.zig").OpenAiResponses;
@@ -23,6 +24,9 @@ pub const Owner = struct {
     transport: Transport.Transport,
     next_input_tokens: u64,
     operation_mutex: std.Io.Mutex,
+    /// Cross-request script position for the mock provider. Meaningless for
+    /// every other plan; serialized by the operation mutex like the tokens.
+    mock_state: Mock.State,
 
     pub fn init(
         resolved: *const ProviderRegistry.Resolved,
@@ -34,6 +38,7 @@ pub const Owner = struct {
             .transport = transport,
             .next_input_tokens = next_input_tokens,
             .operation_mutex = .init,
+            .mock_state = .{},
         };
     }
 
@@ -88,6 +93,10 @@ pub const Owner = struct {
             .anthropic_messages => |config| {
                 var adapter = AnthropicMessages.init(self.transport, config);
                 try AnthropicMessages.stream(allocator, io, &adapter, request, erased_sink);
+            },
+            .mock => |config| {
+                var adapter = Mock.Mock.init(config, &self.mock_state);
+                try Mock.Mock.stream(allocator, io, &adapter, request, erased_sink);
             },
         }
 
@@ -243,6 +252,7 @@ fn testResolved(
                 .codex, .openai_responses => .openai_responses,
                 .openai_chat => .openai_chat,
                 .anthropic_messages => .anthropic_messages,
+                .mock => null,
             },
             .efforts = .{},
             .model = .{},

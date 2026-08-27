@@ -422,6 +422,8 @@ fn validateHttpPolicy(policy: HttpPolicy) ResolveError!void {
 
 fn applyHttpPolicy(adapter: *Registry.AdapterPlan, policy: HttpPolicy) void {
     switch (adapter.*) {
+        // The mock provider performs no HTTP; retry and timeout policy are moot.
+        .mock => {},
         inline else => |*plan| {
             plan.retry.policy.max_attempts = policy.max_retries + 1;
             plan.retry.policy.base_delay_ms = policy.retry_base_ms;
@@ -587,6 +589,9 @@ fn selectModel(
         inputs.llama_discovered_model
     else if (std.mem.eql(u8, provider, "ollama"))
         inputs.ollama_discovered_model
+    else if (std.mem.eql(u8, provider, "mock"))
+        // hax's mock provider default model; a configured model still wins.
+        @as(?[]const u8, "mock-model")
     else
         null;
     return allocator.dupe(u8, fallback orelse return error.MissingModel);
@@ -984,6 +989,14 @@ fn configure(
     overrides: *Registry.Overrides,
     require_available_auth: bool,
 ) ResolveError!Registry.Auth {
+    if (std.mem.eql(u8, provider, "mock")) {
+        // The internal development provider has no auth or wire settings; its
+        // only configuration is the optional script fixture path.
+        try validateProviderFields(inputs.store, "providers.mock", &.{"script"});
+        const script = try inputs.store.readNonempty(allocator, "providers.mock.script");
+        if (script.value) |value| overrides.mock_script = try allocator.dupe(u8, value);
+        return .none;
+    }
     if (std.mem.eql(u8, provider, "codex")) {
         try validateProviderFields(
             inputs.store,
@@ -1333,6 +1346,7 @@ const known_provider_fields = [_][]const u8{
     "version",
     "extra_body",
     "extra_headers",
+    "script",
 };
 
 fn validateProviderFields(store: Store, prefix: []const u8, allowed: []const []const u8) !void {
@@ -1439,6 +1453,7 @@ fn isSupportedPlan(value: []const u8) bool {
     const supported = [_][]const u8{
         "codex",             "llamacpp",             "openai",       "anthropic",   "openrouter",
         "openai-compatible", "anthropic-compatible", "opencode-zen", "opencode-go", "ollama",
+        "mock",
     };
     for (supported) |candidate| if (std.mem.eql(u8, value, candidate)) return true;
     return false;
@@ -1496,6 +1511,7 @@ fn expectHttpPolicy(
     idle_timeout_ms: u64,
 ) !void {
     switch (adapter) {
+        .mock => {},
         inline else => |plan| {
             try std.testing.expectEqual(max_attempts, plan.retry.policy.max_attempts);
             try std.testing.expectEqual(base_delay_ms, plan.retry.policy.base_delay_ms);
@@ -1618,6 +1634,45 @@ test "the three remaining compiled recipe plans resolve explicitly" {
         } else {
             try std.testing.expectEqualStrings("opencode-key", result.resolved.adapter.openai_chat.api_key.?);
         }
+    }
+}
+
+test "mock provider resolves from settings with script and default model" {
+    const environment: TestEnvironment = .{};
+    var document = try Document.parse(
+        std.testing.allocator,
+        "{\"provider\":\"mock\",\"providers\":{\"mock\":{\"script\":\"fixtures/demo.txt\"}}}",
+        .{},
+    );
+    defer document.deinit();
+    var result = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("mock", result.resolved.metadata.provider_id);
+    try std.testing.expectEqualStrings("mock-model", result.model);
+    try std.testing.expectEqual(@as(?[]const u8, null), result.effort);
+    try std.testing.expect(!result.provider_autoselected);
+    try std.testing.expectEqual(@as(?ai.Wire, null), result.resolved.metadata.wire);
+    switch (result.resolved.adapter) {
+        .mock => |mock_config| try std.testing.expectEqualStrings("fixtures/demo.txt", mock_config.script_path.?),
+        else => return error.TestExpectedEqual,
+    }
+
+    var interactive_document = try Document.parse(std.testing.allocator, "{\"provider\":\"mock\"}", .{});
+    defer interactive_document.deinit();
+    var interactive = try resolve(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&interactive_document, &environment),
+        .api_key_environment = .from(&environment),
+    });
+    defer interactive.deinit();
+    switch (interactive.resolved.adapter) {
+        .mock => |mock_config| try std.testing.expectEqual(@as(?[]const u8, null), mock_config.script_path),
+        else => return error.TestExpectedEqual,
     }
 }
 
@@ -2096,6 +2151,7 @@ test "explicit first-party selection permits absent credentials" {
             .openai_chat => |plan| try std.testing.expect(plan.api_key == null),
             .anthropic_messages => |plan| try std.testing.expect(plan.api_key == null),
             .codex => unreachable,
+            .mock => unreachable,
         }
     }
 }

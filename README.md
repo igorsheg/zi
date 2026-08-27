@@ -36,3 +36,22 @@ libcurl sysroot and matching pkg-config metadata.
 Interactive output stays in the terminal's normal buffer. On a TTY, Markdown
 rendering is enabled by default and follows the configured theme, tint, and
 display-width policy; piped output remains plain.
+
+## Mock provider
+
+The internal mock provider exercises dispatch and rendering without an LLM:
+
+```sh
+HAX_PROVIDER=mock ./zig-out/bin/zi
+HAX_PROVIDER=mock HAX_MOCK_SCRIPT=scripts/mock/layout.txt ./zig-out/bin/zi
+```
+
+With `HAX_MOCK_SCRIPT` (`providers.mock.script`), each request consumes one
+scripted turn: `text`, `reasoning`, `space`, `tool <name> <json>`, `delay <ms>`,
+`usage in=N out=M [cached=K] [cache_write=W] [cache_write_1h=H] [cost=D]`, and
+`end-turn`; a final turn may end at EOF. `\n`, `\t`, and `\\` escapes decode in
+text, and `{{CWD}}` expands to the working directory. Without a script, the
+provider answers heuristically: a backtick-quoted command in the user message
+becomes a `bash` (or `read`) tool call when that tool is available, otherwise
+the message is echoed. Script fixtures live under `scripts/mock/`. Mock runs
+skip session recording by default (`no_session=auto`).
