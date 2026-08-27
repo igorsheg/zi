@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
-const text = @import("../text/root.zig");
+const SafeText = @import("SafeText.zig");
 
 pub const Terminal = enum {
     complete,
@@ -21,8 +21,7 @@ pub const StreamRenderer = struct {
     stream_wrote_text: bool = false,
     wrote_assistant_text: bool = false,
     trailing_newlines: usize = 0,
-    control_state: ControlState = .text,
-    utf8: text.Utf8Sanitizer = .{},
+    safe_text: SafeText.SafeText = .{},
 
     pub fn init(writer: *std.Io.Writer) StreamRenderer {
         return .{ .writer = writer };
@@ -65,100 +64,21 @@ pub const StreamRenderer = struct {
     }
 
     fn closeStream(self: *StreamRenderer) void {
-        self.utf8.finish(sanitizedOutput, self);
+        self.safe_text.finish(.{ .context = self, .emit_fn = safeOutput });
         if (self.stream_wrote_text and self.write_error == null) self.write("\n");
         self.trailing_newlines = 0;
         self.stream_wrote_text = false;
-        self.control_state = .text;
         self.flush();
     }
 
     fn feed(self: *StreamRenderer, bytes: []const u8) void {
-        for (bytes) |byte| self.controlByte(byte);
+        self.safe_text.feed(.{ .context = self, .emit_fn = safeOutput }, bytes);
     }
 
-    fn controlByte(self: *StreamRenderer, byte: u8) void {
-        var reprocess = true;
-        while (reprocess) {
-            reprocess = false;
-            switch (self.control_state) {
-                .text => {
-                    if (byte == 0x1b) {
-                        self.control_state = .escape;
-                    } else if (byte == '\t' or byte == '\n' or byte >= 0x20 and byte != 0x7f) {
-                        self.utf8.feed(sanitizedOutput, self, &.{byte});
-                    }
-                },
-                .escape => {
-                    if (byte == '[') self.control_state = .csi else if (byte == ']') {
-                        self.control_state = .osc;
-                    } else if (byte == 'P' or byte == '^' or byte == '_') {
-                        self.control_state = .control_string;
-                    } else if (byte >= 0x20 and byte <= 0x2f) {
-                        self.control_state = .escape_intermediate;
-                    } else if (byte >= 0x30 and byte <= 0x7e) {
-                        self.control_state = .text;
-                    } else {
-                        self.control_state = .text;
-                        reprocess = true;
-                    }
-                },
-                .csi => {
-                    if (cancelsControl(byte)) {
-                        self.control_state = .text;
-                        reprocess = true;
-                    } else if (byte >= 0x40 and byte <= 0x7e) self.control_state = .text;
-                },
-                .osc => {
-                    if (cancelsControl(byte)) {
-                        self.control_state = .text;
-                        reprocess = true;
-                    } else if (byte == 0x07) {
-                        self.control_state = .text;
-                    } else if (byte == 0x1b) self.control_state = .osc_escape;
-                },
-                .osc_escape => {
-                    if (byte == '\\') {
-                        self.control_state = .text;
-                    } else {
-                        if (cancelsControl(byte)) self.control_state = .text else self.control_state = .osc;
-                        reprocess = true;
-                    }
-                },
-                .control_string => {
-                    if (cancelsControl(byte)) {
-                        self.control_state = .text;
-                        reprocess = true;
-                    } else if (byte == 0x1b) self.control_state = .control_string_escape;
-                },
-                .control_string_escape => {
-                    if (byte == '\\') {
-                        self.control_state = .text;
-                    } else {
-                        if (cancelsControl(byte)) self.control_state = .text else self.control_state = .control_string;
-                        reprocess = true;
-                    }
-                },
-                .escape_intermediate => {
-                    if (cancelsControl(byte)) {
-                        self.control_state = .text;
-                        reprocess = true;
-                    } else if (byte >= 0x30 and byte <= 0x7e) self.control_state = .text;
-                },
-            }
-        }
-    }
-
-    fn sanitizedOutput(self: *StreamRenderer, bytes: []const u8) void {
+    fn safeOutput(context: *anyopaque, bytes: []const u8) void {
+        const self: *StreamRenderer = @ptrCast(@alignCast(context));
         if (bytes.len == 1) {
             self.outputByte(bytes[0]);
-            return;
-        }
-        const scalar = decodeScalar(bytes);
-        if (text.Utf8.isTerminalUnsafeScalar(scalar)) {
-            var buffer: [12]u8 = undefined;
-            const escaped = std.fmt.bufPrint(&buffer, "\\u{{{x}}}", .{scalar}) catch unreachable;
-            self.output(escaped);
         } else {
             self.output(bytes);
         }
@@ -192,6 +112,7 @@ pub const StreamRenderer = struct {
     }
 
     fn write(self: *StreamRenderer, bytes: []const u8) void {
+        if (self.write_error != null) return;
         self.writer.writeAll(bytes) catch |err| {
             self.write_error = err;
         };
@@ -204,30 +125,6 @@ pub const StreamRenderer = struct {
         };
     }
 };
-
-const ControlState = enum {
-    text,
-    escape,
-    csi,
-    osc,
-    osc_escape,
-    control_string,
-    control_string_escape,
-    escape_intermediate,
-};
-
-fn cancelsControl(byte: u8) bool {
-    return byte == '\n' or byte == 0x18 or byte == 0x1a;
-}
-
-fn decodeScalar(bytes: []const u8) u21 {
-    return switch (bytes.len) {
-        2 => std.unicode.utf8Decode2(bytes[0..2].*) catch unreachable,
-        3 => std.unicode.utf8Decode3(bytes[0..3].*) catch unreachable,
-        4 => std.unicode.utf8Decode4(bytes[0..4].*) catch unreachable,
-        else => unreachable,
-    };
-}
 
 test "observer renders text incrementally and normalizes terminal newline" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -365,4 +262,16 @@ test "renderer visibly escapes split C1 and bidi scalars" {
     renderer.emit(.{ .done = .{} });
 
     try std.testing.expectEqualStrings("safe\\u{9b} \\u{200e} text\n", output.written());
+}
+
+test "writer failures are sticky and reported by check" {
+    var writer: std.Io.Writer = .failing;
+    var renderer: StreamRenderer = .init(&writer);
+
+    renderer.emit(.{ .text_delta = "visible" });
+    renderer.emit(.{ .text_delta = "ignored" });
+    renderer.emit(.{ .done = .{} });
+    renderer.close(.failure);
+
+    try std.testing.expectError(error.WriteFailed, renderer.check());
 }

@@ -713,10 +713,16 @@ pub fn run(
             if (!interactive_terminal)
                 break :interactive runInteractiveWithFinish(allocator, io, interactive_inputs, &terminal);
 
+            const markdown_enabled = (try config.Settings.getBool(store, allocator, "markdown")).value;
             var configured_theme = try config.Settings.getString(store, allocator, "theme");
             defer configured_theme.deinit(allocator);
             var configured_tint = try config.Settings.getString(store, allocator, "tint");
             defer configured_tint.deinit(allocator);
+            const effective_tint = effectiveThemeTint(
+                configured_tint.source,
+                configured_tint.value,
+                startup.tint(),
+            );
             var configured_display_width = try config.Settings.getString(store, allocator, "display_width");
             defer configured_display_width.deinit(allocator);
             const display_columns = try terminal_module.DisplayColumns.Policy.parse(
@@ -724,7 +730,7 @@ pub fn run(
             );
             const theme = try render.Theme.resolve(.{
                 .configured_theme = configured_theme.value orelse "auto",
-                .configured_tint = configured_tint.value orelse "teal",
+                .configured_tint = effective_tint,
                 .no_color = environment.get("NO_COLOR"),
                 .term = environment.get("TERM"),
                 .colorterm = environment.get("COLORTERM"),
@@ -741,6 +747,7 @@ pub fn run(
                 &terminal,
                 theme,
                 display_columns,
+                markdown_enabled,
                 .{
                     .provider = provider_runtime.metadata.display_name,
                     .model = provider_runtime.model,
@@ -839,6 +846,15 @@ fn prefetchInteractiveCatalog(
     }
 }
 
+fn effectiveThemeTint(
+    source: config.Store.Source,
+    configured: ?[]const u8,
+    preset: ?[]const u8,
+) []const u8 {
+    if (source == .run) return nonEmpty(configured) orelse "teal";
+    return nonEmpty(preset) orelse nonEmpty(configured) orelse "teal";
+}
+
 const RawBannerFallbacks = struct {
     provider: ?[]const u8,
     model: ?[]const u8,
@@ -859,6 +875,16 @@ fn rawBannerIdentity(
         .effort = nonEmpty(selection.effort) orelse nonEmpty(fallbacks.effort),
     };
 }
+
+const RawMarkdownWidth = struct {
+    display_columns: terminal_module.DisplayColumns.Policy,
+    stdout_fd: std.posix.fd_t,
+
+    pub fn resolve(self: *const RawMarkdownWidth) usize {
+        const physical_columns = terminal_module.Size.presentationColumns(self.stdout_fd);
+        return @min(self.display_columns.resolve(physical_columns), physical_columns -| 1);
+    }
+};
 
 const RawPresentation = struct {
     frame: *render.Frame,
@@ -943,6 +969,7 @@ fn runRawInteractive(
     terminal_owner: *Terminal,
     theme: render.Theme,
     display_columns: terminal_module.DisplayColumns.Policy,
+    markdown_enabled: bool,
     banner_fallbacks: RawBannerFallbacks,
     stats: *Stats.Renderer,
     usage: *agent.UsageStats.UsageStats,
@@ -1009,6 +1036,18 @@ fn runRawInteractive(
         .catalog_hook = catalog_hook,
         .stdout_fd = stdout_file.handle,
     };
+    const markdown_width: RawMarkdownWidth = .{
+        .display_columns = display_columns,
+        .stdout_fd = stdout_file.handle,
+    };
+    var markdown_renderer = render.MarkdownStreamRenderer.init(
+        allocator,
+        inputs_value.stdout,
+        theme,
+        markdown_width.resolve(),
+    );
+    markdown_renderer.setWidthSource(.from(&markdown_width));
+    defer markdown_renderer.deinit();
     var checkpoint: TerminalCheckpoint = .{ .interrupt = &interrupt };
     var compact_cancellation: CompactCancellation = .{ .interrupt = &interrupt };
     compaction.cancellation = agent.CompactRunner.Cancellation.from(&compact_cancellation);
@@ -1020,6 +1059,9 @@ fn runRawInteractive(
     inputs.generation = Interactive.Generation.from(&interrupt);
     inputs.checkpoint = agent.Loop.Checkpoint.from(&checkpoint);
     inputs.presentation = Interactive.Presentation.from(&presentation);
+    if (markdown_enabled) {
+        inputs.turn_renderer = Interactive.TurnRenderer.from(&markdown_renderer);
+    }
 
     const exit_code = runInteractiveWithFinish(allocator, io, inputs, terminal_owner) catch |run_error| {
         try cleanupRawTerminal(&interrupt);
@@ -2135,4 +2177,22 @@ test "raw presentation spaces blocks renders policy and suppresses provider erro
             "\x1b[2m[provider error — enter to retry]\x1b[0m\n\n",
         output.written(),
     );
+}
+
+test "theme tint gives run override precedence then active preset" {
+    try std.testing.expectEqualStrings("runtime", effectiveThemeTint(.run, "runtime", "preset"));
+    try std.testing.expectEqualStrings("preset", effectiveThemeTint(.config, "configured", "preset"));
+    try std.testing.expectEqualStrings("configured", effectiveThemeTint(.env, "configured", null));
+    try std.testing.expectEqualStrings("teal", effectiveThemeTint(.default, "", ""));
+}
+
+test "Markdown width follows display policy and reserves terminal edge" {
+    const fallback_fd: std.posix.fd_t = -1;
+    const automatic: RawMarkdownWidth = .{ .display_columns = .auto, .stdout_fd = fallback_fd };
+    const fixed: RawMarkdownWidth = .{ .display_columns = .{ .fixed = 80 }, .stdout_fd = fallback_fd };
+    const terminal_width: RawMarkdownWidth = .{ .display_columns = .terminal, .stdout_fd = fallback_fd };
+
+    try std.testing.expectEqual(@as(usize, 99), automatic.resolve());
+    try std.testing.expectEqual(@as(usize, 80), fixed.resolve());
+    try std.testing.expectEqual(@as(usize, 99), terminal_width.resolve());
 }

@@ -3,7 +3,7 @@
 Zi is a from-scratch Zig 0.16 rewrite of [hax](https://github.com/OleksandrChekhovskyi/hax).
 The rewrite currently contains provider-independent conversation and agent-loop
 components, provider wire adapters, a bounded cancellable libcurl HTTP/SSE transport,
-and a bootstrap CLI.
+persistent sessions, synchronous tools, and normal-buffer interactive and one-shot CLIs.
 
 ## Build
 
@@ -29,6 +29,10 @@ libcurl sysroot and matching pkg-config metadata.
 ```sh
 ./zig-out/bin/zi --help
 ./zig-out/bin/zi --version
+./zig-out/bin/zi
+./zig-out/bin/zi --print "Summarize this repository"
 ```
 
-Interactive and one-shot agent runs are not implemented yet.
+Interactive output stays in the terminal's normal buffer. On a TTY, Markdown
+rendering is enabled by default and follows the configured theme, tint, and
+display-width policy; piped output remains plain.

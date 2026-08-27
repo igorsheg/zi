@@ -110,6 +110,97 @@ pub const PromptInput = struct {
     }
 };
 
+/// Erased synchronous renderer for one outer user turn.
+///
+/// The implementation and observer returned by `begin` are borrowed through
+/// the matching `close` and `check` calls. `close` must be safe after a failed
+/// `begin`; errors are retained or returned synchronously and no callback may
+/// retain event payloads.
+pub const TurnRenderer = struct {
+    context: *anyopaque,
+    begin_fn: *const fn (*anyopaque) anyerror!agent.Loop.Observer,
+    close_fn: *const fn (*anyopaque, render.Terminal) anyerror!void,
+    check_fn: *const fn (*anyopaque) anyerror!void,
+    wrote_assistant_text_fn: *const fn (*anyopaque) bool,
+
+    pub fn begin(self: TurnRenderer) !agent.Loop.Observer {
+        return self.begin_fn(self.context);
+    }
+
+    pub fn close(self: TurnRenderer, result: render.Terminal) !void {
+        return self.close_fn(self.context, result);
+    }
+
+    pub fn check(self: TurnRenderer) !void {
+        return self.check_fn(self.context);
+    }
+
+    pub fn wroteAssistantText(self: TurnRenderer) bool {
+        return self.wrote_assistant_text_fn(self.context);
+    }
+
+    pub fn from(implementation: anytype) TurnRenderer {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("TurnRenderer.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn begin(context: *anyopaque) anyerror!agent.Loop.Observer {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.begin();
+            }
+
+            fn close(context: *anyopaque, result: render.Terminal) anyerror!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.close(result);
+            }
+
+            fn check(context: *anyopaque) anyerror!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.check();
+            }
+
+            fn wroteAssistantText(context: *anyopaque) bool {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.wroteAssistantText();
+            }
+        };
+        return .{
+            .context = implementation,
+            .begin_fn = Adapter.begin,
+            .close_fn = Adapter.close,
+            .check_fn = Adapter.check,
+            .wrote_assistant_text_fn = Adapter.wroteAssistantText,
+        };
+    }
+};
+
+const PlainTurnRenderer = struct {
+    stream: render.StreamRenderer,
+
+    fn init(writer: *std.Io.Writer) PlainTurnRenderer {
+        return .{ .stream = .init(writer) };
+    }
+
+    pub fn begin(self: *PlainTurnRenderer) !agent.Loop.Observer {
+        return self.stream.observer();
+    }
+
+    pub fn close(self: *PlainTurnRenderer, result: render.Terminal) !void {
+        self.stream.close(result);
+    }
+
+    pub fn check(self: *PlainTurnRenderer) !void {
+        return self.stream.check();
+    }
+
+    pub fn wroteAssistantText(self: *PlainTurnRenderer) bool {
+        return self.stream.wroteAssistantText();
+    }
+};
+
 pub const Generation = struct {
     context: *anyopaque,
     arm_fn: *const fn (*anyopaque) anyerror!void,
@@ -235,6 +326,7 @@ pub const Inputs = struct {
     show_prompt: bool,
     generation: ?Generation = null,
     presentation: ?Presentation = null,
+    turn_renderer: ?TurnRenderer = null,
     seam_hook: ?agent.Loop.SeamHook = null,
     checkpoint: ?agent.Loop.Checkpoint = null,
     pre_request_hook: ?agent.Loop.PreRequestHook = null,
@@ -243,6 +335,20 @@ pub const Inputs = struct {
     max_turns: usize = agent.Loop.maximum_max_turns,
     before_first_send: ?BeforeFirstSend = null,
 };
+
+fn finishTurn(generation: ?Generation, renderer_instance: TurnRenderer, result: render.Terminal) ?anyerror {
+    var first_error: ?anyerror = null;
+    if (generation) |control| control.disarm() catch |err| {
+        first_error = err;
+    };
+    renderer_instance.close(result) catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    renderer_instance.check() catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    return first_error;
+}
 
 /// Runs a bounded prompt REPL around the shared provider-independent agent loop.
 /// Provider failures are turn-local and return control to the next prompt.
@@ -320,7 +426,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
         if (inputs.presentation) |presentation| try presentation.beforeGeneration();
         const started_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
         if (inputs.generation) |generation| try generation.arm();
-        var stream_renderer = render.StreamRenderer.init(inputs.stdout);
+
+        var plain_renderer: PlainTurnRenderer = undefined;
+        const turn_renderer = inputs.turn_renderer orelse renderer: {
+            plain_renderer = .init(inputs.stdout);
+            break :renderer TurnRenderer.from(&plain_renderer);
+        };
+        const observer = turn_renderer.begin() catch |begin_error| {
+            _ = finishTurn(inputs.generation, turn_renderer, .failure);
+            return begin_error;
+        };
+
         var loop_result = agent.Loop.run(allocator, io, .{
             .session = inputs.session,
             .provider = inputs.provider,
@@ -335,24 +451,30 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
             .max_turns = inputs.max_turns,
             .continued = continuing,
             .checkpoint = inputs.checkpoint,
-            .observer = stream_renderer.observer(),
+            .observer = observer,
             .usage_observer = inputs.usage_observer,
             .seam_hook = inputs.seam_hook,
             .pre_request_hook = inputs.pre_request_hook,
             .continuation_hook = inputs.continuation_hook,
         }) catch |loop_error| {
-            if (inputs.generation) |generation| try generation.disarm();
-            stream_renderer.close(.failure);
-            try stream_renderer.check();
+            // The operation error remains primary; cleanup still runs best-effort.
+            _ = finishTurn(inputs.generation, turn_renderer, .failure);
             return loop_error;
         };
         defer loop_result.deinit(allocator);
-        if (inputs.generation) |generation| try generation.disarm();
+
+        const renderer_terminal: render.Terminal = switch (loop_result.outcome) {
+            .complete => .complete,
+            .provider_error, .max_turns => .failure,
+            .paused, .interrupted => .interrupted,
+        };
+        if (finishTurn(inputs.generation, turn_renderer, renderer_terminal)) |cleanup_error| {
+            return cleanup_error;
+        }
 
         switch (loop_result.outcome) {
-            .complete => stream_renderer.close(.complete),
+            .complete => {},
             .provider_error => {
-                stream_renderer.close(.failure);
                 if (inputs.presentation == null) {
                     try inputs.stderr.writeAll("zi: provider error: ");
                     try DiagnosticText.write(inputs.stderr, loop_result.diagnostic orelse "(no message)");
@@ -363,7 +485,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
                 abort_marker_placed = loop_result.abort_marker_placed;
             },
             .max_turns => {
-                stream_renderer.close(.failure);
                 if (inputs.presentation == null) {
                     try inputs.stderr.print(
                         "zi: max turns ({d}) exceeded; submit an empty prompt to continue\n",
@@ -373,17 +494,12 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
                 }
                 resume_reason = .max_turns;
             },
-            .paused => {
-                stream_renderer.close(.interrupted);
-                resume_reason = .paused;
-            },
+            .paused => resume_reason = .paused,
             .interrupted => {
-                stream_renderer.close(.interrupted);
                 resume_reason = .interrupted;
                 abort_marker_placed = loop_result.abort_marker_placed;
             },
         }
-        try stream_renderer.check();
 
         const finished_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
         const elapsed_ms: u64 = @intCast(@max(0, finished_ns - started_ns) / std.time.ns_per_ms);
@@ -391,7 +507,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
             .outcome = loop_result.outcome,
             .elapsed_ms = elapsed_ms,
             .context_tokens = loop_result.last_context_tokens,
-            .wrote_assistant_text = stream_renderer.wroteAssistantText(),
+            .wrote_assistant_text = turn_renderer.wroteAssistantText(),
             .diagnostic = loop_result.diagnostic,
         });
     }
@@ -1206,4 +1322,141 @@ test "presentation adapter propagates every callback error" {
         .context_tokens = null,
         .wrote_assistant_text = false,
     }));
+}
+
+test "custom turn renderer observes lifecycle and operation errors stay primary" {
+    const Renderer = struct {
+        const Self = @This();
+
+        fail_begin: bool = false,
+        fail_close: bool = false,
+        fail_check: bool = false,
+        begins: usize = 0,
+        closes: usize = 0,
+        checks: usize = 0,
+        events: usize = 0,
+        terminal: ?render.Terminal = null,
+
+        pub fn begin(self: *Self) !agent.Loop.Observer {
+            self.begins += 1;
+            if (self.fail_begin) return error.RenderBeginFailed;
+            return agent.Loop.Observer.from(self);
+        }
+
+        pub fn emit(self: *Self, _: ai.StreamEvent.StreamEvent) void {
+            self.events += 1;
+        }
+
+        pub fn close(self: *Self, terminal_result: render.Terminal) !void {
+            self.closes += 1;
+            self.terminal = terminal_result;
+            if (self.fail_close) return error.RenderCloseFailed;
+        }
+
+        pub fn check(self: *Self) !void {
+            self.checks += 1;
+            if (self.fail_check) return error.RenderCheckFailed;
+        }
+
+        pub fn wroteAssistantText(_: *Self) bool {
+            return false;
+        }
+    };
+    const Provider = struct {
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: *@This(),
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            try sink.emit(.{ .text_delta = "answer" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+
+    // Loop validation is the primary failure even when renderer cleanup fails.
+    {
+        var provider: Provider = .{};
+        var renderer: Renderer = .{ .fail_close = true, .fail_check = true };
+        var session = try agent.Session.Session.init(std.testing.allocator, .{});
+        defer session.deinit();
+        var reader = std.Io.Reader.fixed("go\n");
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+
+        try std.testing.expectError(error.InvalidMaxTurns, run(std.testing.allocator, std.testing.io, .{
+            .session = &session,
+            .provider = ai.Provider.Provider.from(&provider, "fake"),
+            .model = "model",
+            .system_prompt = "",
+            .reader = &reader,
+            .stdout = &stdout.writer,
+            .stderr = &stderr.writer,
+            .show_prompt = false,
+            .turn_renderer = TurnRenderer.from(&renderer),
+            .max_turns = 0,
+        }));
+        try std.testing.expectEqual(@as(usize, 1), renderer.begins);
+        try std.testing.expectEqual(@as(usize, 1), renderer.closes);
+        try std.testing.expectEqual(@as(usize, 1), renderer.checks);
+        try std.testing.expectEqual(render.Terminal.failure, renderer.terminal.?);
+    }
+
+    // A begin failure remains primary, but its close-safe lifecycle still runs.
+    {
+        var provider: Provider = .{};
+        var renderer: Renderer = .{ .fail_begin = true, .fail_close = true, .fail_check = true };
+        var session = try agent.Session.Session.init(std.testing.allocator, .{});
+        defer session.deinit();
+        var reader = std.Io.Reader.fixed("go\n");
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+
+        try std.testing.expectError(error.RenderBeginFailed, run(std.testing.allocator, std.testing.io, .{
+            .session = &session,
+            .provider = ai.Provider.Provider.from(&provider, "fake"),
+            .model = "model",
+            .system_prompt = "",
+            .reader = &reader,
+            .stdout = &stdout.writer,
+            .stderr = &stderr.writer,
+            .show_prompt = false,
+            .turn_renderer = TurnRenderer.from(&renderer),
+        }));
+        try std.testing.expectEqual(@as(usize, 1), renderer.closes);
+        try std.testing.expectEqual(@as(usize, 1), renderer.checks);
+    }
+
+    // With a successful operation, the first cleanup error is returned.
+    {
+        var provider: Provider = .{};
+        var renderer: Renderer = .{ .fail_close = true, .fail_check = true };
+        var session = try agent.Session.Session.init(std.testing.allocator, .{});
+        defer session.deinit();
+        var reader = std.Io.Reader.fixed("go\n");
+        var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr.deinit();
+
+        try std.testing.expectError(error.RenderCloseFailed, run(std.testing.allocator, std.testing.io, .{
+            .session = &session,
+            .provider = ai.Provider.Provider.from(&provider, "fake"),
+            .model = "model",
+            .system_prompt = "",
+            .reader = &reader,
+            .stdout = &stdout.writer,
+            .stderr = &stderr.writer,
+            .show_prompt = false,
+            .turn_renderer = TurnRenderer.from(&renderer),
+        }));
+        try std.testing.expect(renderer.events >= 2);
+        try std.testing.expectEqual(render.Terminal.complete, renderer.terminal.?);
+        try std.testing.expectEqual(@as(usize, 1), renderer.checks);
+    }
 }

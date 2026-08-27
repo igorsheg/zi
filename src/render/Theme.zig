@@ -44,7 +44,15 @@ accent: Style,
 chrome: Style,
 chrome_dim: Style,
 stance: Style,
+code_inline: Style,
+code_block: Style,
+heading: Style,
+link: Style,
+add: Style,
+remove: Style,
+ok: Style,
 error_style: Style,
+warn: Style,
 
 /// Resolves borrowed configuration and environment snapshots into a value-only theme.
 /// The returned styles refer only to static strings and require no deinitialization.
@@ -93,10 +101,19 @@ fn autodetect(inputs: Inputs) Name {
 }
 
 const fg_default = "\x1b[39m";
+const bold = "\x1b[1m";
 const bold_off = "\x1b[22m";
+const dim = "\x1b[2m";
+const underline = "\x1b[4m";
+const underline_off = "\x1b[24m";
+const link_close = "\x1b[24;39m";
 
 fn color(open: []const u8) Style {
     return .{ .open = open, .close = fg_default };
+}
+
+fn plain(open: []const u8, close: []const u8) Style {
+    return .{ .open = open, .close = close };
 }
 
 fn preset(name: Name, tint: Tint) Theme {
@@ -106,9 +123,17 @@ fn preset(name: Name, tint: Tint) Theme {
             .tint = tint,
             .accent = color("\x1b[95m"),
             .chrome = color("\x1b[36m"),
-            .chrome_dim = .{ .open = "\x1b[2m\x1b[36m", .close = fg_default ++ bold_off },
+            .chrome_dim = plain(dim ++ "\x1b[36m", fg_default ++ bold_off),
             .stance = color("\x1b[36m"),
+            .code_inline = color("\x1b[36m"),
+            .code_block = plain(dim, bold_off),
+            .heading = plain(bold, bold_off),
+            .link = plain(underline, underline_off),
+            .add = color("\x1b[32m"),
+            .remove = color("\x1b[31m"),
+            .ok = color("\x1b[32m"),
             .error_style = color("\x1b[31m"),
+            .warn = color("\x1b[33m"),
         },
         .dark => .{
             .name = .dark,
@@ -116,8 +141,16 @@ fn preset(name: Name, tint: Tint) Theme {
             .accent = color("\x1b[38;5;173m"),
             .chrome = color("\x1b[38;5;37m"),
             .chrome_dim = color("\x1b[38;5;23m"),
-            .stance = color(darkStance(tint)),
+            .stance = color(darkPrimary(tint)),
+            .code_inline = color(darkPrimary(tint)),
+            .code_block = color(darkSecondary(tint)),
+            .heading = plain(darkHeading(tint), bold_off ++ fg_default),
+            .link = plain(darkLink(tint), link_close),
+            .add = color("\x1b[38;5;34m"),
+            .remove = color("\x1b[38;5;160m"),
+            .ok = color("\x1b[38;5;28m"),
             .error_style = color("\x1b[38;5;160m"),
+            .warn = color("\x1b[38;5;178m"),
         },
         .light => .{
             .name = .light,
@@ -125,22 +158,38 @@ fn preset(name: Name, tint: Tint) Theme {
             .accent = color("\x1b[38;5;130m"),
             .chrome = color("\x1b[38;5;30m"),
             .chrome_dim = color("\x1b[38;5;37m"),
-            .stance = color(lightStance(tint)),
+            .stance = color(lightPrimary(tint)),
+            .code_inline = color(lightPrimary(tint)),
+            .code_block = color(lightSecondary(tint)),
+            .heading = plain(lightHeading(tint), bold_off ++ fg_default),
+            .link = plain(lightLink(tint), link_close),
+            .add = color("\x1b[38;5;28m"),
+            .remove = color("\x1b[38;5;124m"),
+            .ok = color("\x1b[38;5;28m"),
             .error_style = color("\x1b[38;5;160m"),
+            .warn = color("\x1b[38;5;136m"),
         },
         .off => .{
             .name = .off,
             .tint = tint,
-            .accent = .{ .open = "", .close = "" },
-            .chrome = .{ .open = "", .close = "" },
-            .chrome_dim = .{ .open = "\x1b[2m", .close = bold_off },
-            .stance = .{ .open = "", .close = "" },
-            .error_style = .{ .open = "", .close = "" },
+            .accent = plain("", ""),
+            .chrome = plain("", ""),
+            .chrome_dim = plain(dim, bold_off),
+            .stance = plain("", ""),
+            .code_inline = plain("", ""),
+            .code_block = plain(dim, bold_off),
+            .heading = plain(bold, bold_off),
+            .link = plain(underline, underline_off),
+            .add = plain("", ""),
+            .remove = plain("", ""),
+            .ok = plain("", ""),
+            .error_style = plain("", ""),
+            .warn = plain("", ""),
         },
     };
 }
 
-fn darkStance(tint: Tint) []const u8 {
+fn darkPrimary(tint: Tint) []const u8 {
     return switch (tint) {
         .teal => "\x1b[38;5;38m",
         .violet => "\x1b[38;5;140m",
@@ -149,7 +198,7 @@ fn darkStance(tint: Tint) []const u8 {
     };
 }
 
-fn lightStance(tint: Tint) []const u8 {
+fn darkSecondary(tint: Tint) []const u8 {
     return switch (tint) {
         .teal => "\x1b[38;5;31m",
         .violet => "\x1b[38;5;97m",
@@ -158,61 +207,203 @@ fn lightStance(tint: Tint) []const u8 {
     };
 }
 
+fn darkHeading(tint: Tint) []const u8 {
+    return switch (tint) {
+        .teal => bold ++ "\x1b[38;5;38m",
+        .violet => bold ++ "\x1b[38;5;140m",
+        .rose => bold ++ "\x1b[38;5;168m",
+        .sage => bold ++ "\x1b[38;5;114m",
+    };
+}
+
+fn darkLink(tint: Tint) []const u8 {
+    return switch (tint) {
+        .teal => "\x1b[4;38;5;31m",
+        .violet => "\x1b[4;38;5;97m",
+        .rose => "\x1b[4;38;5;132m",
+        .sage => "\x1b[4;38;5;71m",
+    };
+}
+
+fn lightPrimary(tint: Tint) []const u8 {
+    return switch (tint) {
+        .teal => "\x1b[38;5;31m",
+        .violet => "\x1b[38;5;97m",
+        .rose => "\x1b[38;5;132m",
+        .sage => "\x1b[38;5;71m",
+    };
+}
+
+fn lightSecondary(tint: Tint) []const u8 {
+    return switch (tint) {
+        .teal => "\x1b[38;5;38m",
+        .violet => "\x1b[38;5;140m",
+        .rose => "\x1b[38;5;168m",
+        .sage => "\x1b[38;5;114m",
+    };
+}
+
+fn lightHeading(tint: Tint) []const u8 {
+    return switch (tint) {
+        .teal => bold ++ "\x1b[38;5;31m",
+        .violet => bold ++ "\x1b[38;5;97m",
+        .rose => bold ++ "\x1b[38;5;132m",
+        .sage => bold ++ "\x1b[38;5;71m",
+    };
+}
+
+fn lightLink(tint: Tint) []const u8 {
+    return switch (tint) {
+        .teal => "\x1b[4;38;5;38m",
+        .violet => "\x1b[4;38;5;140m",
+        .rose => "\x1b[4;38;5;168m",
+        .sage => "\x1b[4;38;5;114m",
+    };
+}
+
 fn expectStyle(expected: Style, actual: Style) !void {
     try std.testing.expectEqualStrings(expected.open, actual.open);
     try std.testing.expectEqualStrings(expected.close, actual.close);
 }
 
-test "all explicit themes preserve presentation role palettes" {
+test "all explicit themes preserve exact base role palettes" {
     const ansi = try resolve(.{ .configured_theme = "ANSI", .configured_tint = "SAGE" });
     try std.testing.expectEqual(Name.ansi, ansi.name);
     try std.testing.expectEqual(Tint.sage, ansi.tint);
     try expectStyle(color("\x1b[95m"), ansi.accent);
     try expectStyle(color("\x1b[36m"), ansi.chrome);
-    try expectStyle(.{ .open = "\x1b[2m\x1b[36m", .close = "\x1b[39m\x1b[22m" }, ansi.chrome_dim);
+    try expectStyle(plain("\x1b[2m\x1b[36m", "\x1b[39m\x1b[22m"), ansi.chrome_dim);
     try expectStyle(color("\x1b[36m"), ansi.stance);
+    try expectStyle(color("\x1b[36m"), ansi.code_inline);
+    try expectStyle(plain("\x1b[2m", "\x1b[22m"), ansi.code_block);
+    try expectStyle(plain("\x1b[1m", "\x1b[22m"), ansi.heading);
+    try expectStyle(plain("\x1b[4m", "\x1b[24m"), ansi.link);
+    try expectStyle(color("\x1b[32m"), ansi.add);
+    try expectStyle(color("\x1b[31m"), ansi.remove);
+    try expectStyle(color("\x1b[32m"), ansi.ok);
+    try expectStyle(color("\x1b[31m"), ansi.error_style);
+    try expectStyle(color("\x1b[33m"), ansi.warn);
 
     const dark = try resolve(.{ .configured_theme = "dark", .configured_tint = "teal" });
     try expectStyle(color("\x1b[38;5;173m"), dark.accent);
     try expectStyle(color("\x1b[38;5;37m"), dark.chrome);
     try expectStyle(color("\x1b[38;5;23m"), dark.chrome_dim);
     try expectStyle(color("\x1b[38;5;38m"), dark.stance);
+    try expectStyle(color("\x1b[38;5;38m"), dark.code_inline);
+    try expectStyle(color("\x1b[38;5;31m"), dark.code_block);
+    try expectStyle(plain("\x1b[1m\x1b[38;5;38m", "\x1b[22m\x1b[39m"), dark.heading);
+    try expectStyle(plain("\x1b[4;38;5;31m", "\x1b[24;39m"), dark.link);
+    try expectStyle(color("\x1b[38;5;34m"), dark.add);
+    try expectStyle(color("\x1b[38;5;160m"), dark.remove);
+    try expectStyle(color("\x1b[38;5;28m"), dark.ok);
+    try expectStyle(color("\x1b[38;5;160m"), dark.error_style);
+    try expectStyle(color("\x1b[38;5;178m"), dark.warn);
 
     const light = try resolve(.{ .configured_theme = "light", .configured_tint = "teal" });
     try expectStyle(color("\x1b[38;5;130m"), light.accent);
     try expectStyle(color("\x1b[38;5;30m"), light.chrome);
     try expectStyle(color("\x1b[38;5;37m"), light.chrome_dim);
     try expectStyle(color("\x1b[38;5;31m"), light.stance);
+    try expectStyle(color("\x1b[38;5;31m"), light.code_inline);
+    try expectStyle(color("\x1b[38;5;38m"), light.code_block);
+    try expectStyle(plain("\x1b[1m\x1b[38;5;31m", "\x1b[22m\x1b[39m"), light.heading);
+    try expectStyle(plain("\x1b[4;38;5;38m", "\x1b[24;39m"), light.link);
+    try expectStyle(color("\x1b[38;5;28m"), light.add);
+    try expectStyle(color("\x1b[38;5;124m"), light.remove);
+    try expectStyle(color("\x1b[38;5;28m"), light.ok);
+    try expectStyle(color("\x1b[38;5;160m"), light.error_style);
+    try expectStyle(color("\x1b[38;5;136m"), light.warn);
 
     const off = try resolve(.{ .configured_theme = "Off", .configured_tint = "Violet" });
-    try expectStyle(.{ .open = "", .close = "" }, off.accent);
-    try expectStyle(.{ .open = "", .close = "" }, off.chrome);
-    try expectStyle(.{ .open = "\x1b[2m", .close = "\x1b[22m" }, off.chrome_dim);
-    try expectStyle(.{ .open = "", .close = "" }, off.stance);
+    try expectStyle(plain("", ""), off.accent);
+    try expectStyle(plain("", ""), off.chrome);
+    try expectStyle(plain("\x1b[2m", "\x1b[22m"), off.chrome_dim);
+    try expectStyle(plain("", ""), off.stance);
+    try expectStyle(plain("", ""), off.code_inline);
+    try expectStyle(plain("\x1b[2m", "\x1b[22m"), off.code_block);
+    try expectStyle(plain("\x1b[1m", "\x1b[22m"), off.heading);
+    try expectStyle(plain("\x1b[4m", "\x1b[24m"), off.link);
+    try expectStyle(plain("", ""), off.add);
+    try expectStyle(plain("", ""), off.remove);
+    try expectStyle(plain("", ""), off.ok);
+    try expectStyle(plain("", ""), off.error_style);
+    try expectStyle(plain("", ""), off.warn);
 }
 
-test "dark and light apply every tint only to stance" {
+test "dark and light apply every tint to all model roles" {
     const tint_names = [_][]const u8{ "teal", "violet", "rose", "sage" };
-    const dark_opens = [_][]const u8{
+    const dark_primary = [_][]const u8{
         "\x1b[38;5;38m",
         "\x1b[38;5;140m",
         "\x1b[38;5;168m",
         "\x1b[38;5;114m",
     };
-    const light_opens = [_][]const u8{
+    const dark_secondary = [_][]const u8{
         "\x1b[38;5;31m",
         "\x1b[38;5;97m",
         "\x1b[38;5;132m",
         "\x1b[38;5;71m",
     };
+    const dark_headings = [_][]const u8{
+        "\x1b[1m\x1b[38;5;38m",
+        "\x1b[1m\x1b[38;5;140m",
+        "\x1b[1m\x1b[38;5;168m",
+        "\x1b[1m\x1b[38;5;114m",
+    };
+    const dark_links = [_][]const u8{
+        "\x1b[4;38;5;31m",
+        "\x1b[4;38;5;97m",
+        "\x1b[4;38;5;132m",
+        "\x1b[4;38;5;71m",
+    };
 
-    for (tint_names, dark_opens, light_opens) |tint_name, dark_open, light_open| {
+    for (tint_names, dark_primary, dark_secondary, dark_headings, dark_links) |
+        tint_name,
+        primary,
+        secondary,
+        heading_open,
+        link_open,
+    | {
         const dark = try resolve(.{ .configured_theme = "dark", .configured_tint = tint_name });
+        try std.testing.expectEqualStrings(primary, dark.stance.open);
+        try std.testing.expectEqualStrings(primary, dark.code_inline.open);
+        try std.testing.expectEqualStrings(secondary, dark.code_block.open);
+        try std.testing.expectEqualStrings(heading_open, dark.heading.open);
+        try std.testing.expectEqualStrings("\x1b[22m\x1b[39m", dark.heading.close);
+        try std.testing.expectEqualStrings(link_open, dark.link.open);
+        try std.testing.expectEqualStrings("\x1b[24;39m", dark.link.close);
+    }
+
+    const light_primary = dark_secondary;
+    const light_secondary = dark_primary;
+    const light_headings = [_][]const u8{
+        "\x1b[1m\x1b[38;5;31m",
+        "\x1b[1m\x1b[38;5;97m",
+        "\x1b[1m\x1b[38;5;132m",
+        "\x1b[1m\x1b[38;5;71m",
+    };
+    const light_links = [_][]const u8{
+        "\x1b[4;38;5;38m",
+        "\x1b[4;38;5;140m",
+        "\x1b[4;38;5;168m",
+        "\x1b[4;38;5;114m",
+    };
+
+    for (tint_names, light_primary, light_secondary, light_headings, light_links) |
+        tint_name,
+        primary,
+        secondary,
+        heading_open,
+        link_open,
+    | {
         const light = try resolve(.{ .configured_theme = "light", .configured_tint = tint_name });
-        try std.testing.expectEqualStrings(dark_open, dark.stance.open);
-        try std.testing.expectEqualStrings(light_open, light.stance.open);
-        try std.testing.expectEqualStrings("\x1b[38;5;173m", dark.accent.open);
-        try std.testing.expectEqualStrings("\x1b[38;5;130m", light.accent.open);
+        try std.testing.expectEqualStrings(primary, light.stance.open);
+        try std.testing.expectEqualStrings(primary, light.code_inline.open);
+        try std.testing.expectEqualStrings(secondary, light.code_block.open);
+        try std.testing.expectEqualStrings(heading_open, light.heading.open);
+        try std.testing.expectEqualStrings("\x1b[22m\x1b[39m", light.heading.close);
+        try std.testing.expectEqualStrings(link_open, light.link.open);
+        try std.testing.expectEqualStrings("\x1b[24;39m", light.link.close);
     }
 }
 
@@ -222,7 +413,15 @@ test "ansi and off ignore every valid tint" {
         const ansi = try resolve(.{ .configured_theme = "ansi", .configured_tint = tint_name });
         const off = try resolve(.{ .configured_theme = "off", .configured_tint = tint_name });
         try std.testing.expectEqualStrings("\x1b[36m", ansi.stance.open);
+        try std.testing.expectEqualStrings("\x1b[36m", ansi.code_inline.open);
+        try std.testing.expectEqualStrings("\x1b[2m", ansi.code_block.open);
+        try std.testing.expectEqualStrings("\x1b[1m", ansi.heading.open);
+        try std.testing.expectEqualStrings("\x1b[4m", ansi.link.open);
         try std.testing.expectEqualStrings("", off.stance.open);
+        try std.testing.expectEqualStrings("", off.code_inline.open);
+        try std.testing.expectEqualStrings("\x1b[2m", off.code_block.open);
+        try std.testing.expectEqualStrings("\x1b[1m", off.heading.open);
+        try std.testing.expectEqualStrings("\x1b[4m", off.link.open);
     }
 }
 
