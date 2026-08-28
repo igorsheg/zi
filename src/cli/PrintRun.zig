@@ -898,6 +898,14 @@ fn rawBannerIdentity(
     };
 }
 
+const RawSpinnerWidth = struct {
+    stdout_fd: std.posix.fd_t,
+
+    pub fn resolve(self: *const RawSpinnerWidth) usize {
+        return terminal_module.Size.presentationColumns(self.stdout_fd);
+    }
+};
+
 const RawMarkdownWidth = struct {
     display_columns: terminal_module.DisplayColumns.Policy,
     stdout_fd: std.posix.fd_t,
@@ -1099,6 +1107,21 @@ fn runRawInteractive(
             try render.History.replayBrief(&plain_renderer, history_inputs);
         }
         frame.syncExternal(1);
+    }
+    const spinner_width: RawSpinnerWidth = .{ .stdout_fd = stdout_file.handle };
+    const spinner = try render.Spinner.Spinner.create(
+        allocator,
+        io,
+        inputs_value.stdout,
+        theme,
+        .from(&spinner_width),
+    );
+    markdown_renderer.setSpinner(spinner);
+    plain_renderer.setSpinner(spinner);
+    defer {
+        markdown_renderer.setSpinner(null);
+        plain_renderer.setSpinner(null);
+        spinner.destroy();
     }
     var checkpoint: TerminalCheckpoint = .{ .interrupt = &interrupt };
     var compact_cancellation: CompactCancellation = .{ .interrupt = &interrupt };

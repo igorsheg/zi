@@ -6,6 +6,7 @@
 const std = @import("std");
 const text = @import("../text/root.zig");
 const SafeText = @import("SafeText.zig");
+const SpinnerModule = @import("Spinner.zig");
 const Theme = @import("Theme.zig");
 const ToolContract = @import("../tool/root.zig").Tool;
 
@@ -49,6 +50,8 @@ writer: *std.Io.Writer,
 theme: Theme,
 width: usize,
 mode: Mode,
+spinner: ?*SpinnerModule.Spinner = null,
+live_finalizing: bool = false,
 safe_text: SafeText.SafeText = .{ .unsafe_policy = .substitute },
 line: std.ArrayList(u8) = .empty,
 line_has_content: bool = false,
@@ -93,6 +96,14 @@ pub fn deinit(self: *ToolRenderer) void {
     self.* = undefined;
 }
 
+pub fn setSpinner(self: *ToolRenderer, spinner: ?*SpinnerModule.Spinner) void {
+    self.spinner = spinner;
+}
+
+pub fn beginLive(self: *ToolRenderer) void {
+    self.paintLiveRow("");
+}
+
 pub fn sink(self: *ToolRenderer) ToolContract.DisplaySink {
     return .from(self);
 }
@@ -123,6 +134,8 @@ pub fn finalize(self: *ToolRenderer) Error!void {
     if (self.finalized) return self.check();
     self.finalized = true;
     self.safe_text.finish(.{ .context = self, .emit_fn = safeOutput });
+    if (self.spinner) |spinner| spinner.swapBegin();
+    self.live_finalizing = true;
     if (self.line.items.len != 0 or self.line_has_content) self.finishLine();
     if (self.mode == .head and self.suppressed_lines != 0) {
         var marker_buffer: [96]u8 = undefined;
@@ -137,6 +150,7 @@ pub fn finalize(self: *ToolRenderer) Error!void {
     }
     self.flushPending(true);
     self.flushWriter();
+    if (self.spinner) |spinner| spinner.swapEnd();
     return self.check();
 }
 
@@ -188,7 +202,15 @@ fn pushTailByte(self: *ToolRenderer, byte: u8) void {
     if (self.head_complete) self.suppressed_tail_bytes +|= 1;
 }
 
-fn emitTailPreview(self: *ToolRenderer) void {
+const TailPreview = struct {
+    marker: [96]u8 = undefined,
+    marker_len: usize = 0,
+    rows: [tail_lines][line_bytes]u8 = undefined,
+    row_lengths: [tail_lines]usize = @splat(0),
+    row_count: usize = 0,
+};
+
+fn buildTailPreview(self: *ToolRenderer) TailPreview {
     const ring_len = if (self.tail_full) self.tail_ring.len else self.tail_write_pos;
     const oldest = if (self.tail_full) self.tail_write_pos else 0;
     var linearized: [tail_ring_bytes]u8 = undefined;
@@ -206,9 +228,7 @@ fn emitTailPreview(self: *ToolRenderer) void {
         view_start -= 1;
         if (suppressed[view_start] != '\n') continue;
         const candidate = view_start + 1;
-        if (current_line_end > candidate and
-            !lineIsBlank(suppressed[candidate..current_line_end]))
-        {
+        if (current_line_end > candidate and !lineIsBlank(suppressed[candidate..current_line_end])) {
             visible_lines += 1;
             if (visible_lines == tail_lines) {
                 view_start = candidate;
@@ -217,9 +237,7 @@ fn emitTailPreview(self: *ToolRenderer) void {
         }
         current_line_end = view_start;
     }
-    while (view_start < suppressed.len and suppressed[view_start] & 0xc0 == 0x80) {
-        view_start += 1;
-    }
+    while (view_start < suppressed.len and suppressed[view_start] & 0xc0 == 0x80) view_start += 1;
 
     const Span = struct { start: usize, end: usize };
     var spans: [tail_lines]Span = undefined;
@@ -235,22 +253,34 @@ fn emitTailPreview(self: *ToolRenderer) void {
         line_start = index + 1;
     }
 
+    var preview: TailPreview = .{};
     const elided = self.suppressed_lines -| span_count;
     if (elided != 0) {
-        var marker_buffer: [96]u8 = undefined;
         const marker = std.fmt.bufPrint(
-            &marker_buffer,
+            &preview.marker,
             "... ({d} more line{s}) ...",
             .{ elided, if (elided == 1) "" else "s" },
         ) catch unreachable;
-        self.addRow(marker, .plain);
+        preview.marker_len = marker.len;
     }
     for (spans[0..span_count], 0..) |span, row| {
         const bytes = if (row + 1 == span_count and self.latest_suppressed_len != 0)
             self.latest_suppressed[0..self.latest_suppressed_len]
         else
             suppressed[span.start..span.end];
-        self.addRow(bytes, .plain);
+        const amount = @min(bytes.len, preview.rows[row].len);
+        @memcpy(preview.rows[row][0..amount], bytes[0..amount]);
+        preview.row_lengths[row] = amount;
+        preview.row_count += 1;
+    }
+    return preview;
+}
+
+fn emitTailPreview(self: *ToolRenderer) void {
+    const preview = self.buildTailPreview();
+    if (preview.marker_len != 0) self.addRow(preview.marker[0..preview.marker_len], .plain);
+    for (0..preview.row_count) |row| {
+        self.addRow(preview.rows[row][0..preview.row_lengths[row]], .plain);
     }
 }
 
@@ -289,6 +319,7 @@ fn finishPreviewLine(self: *ToolRenderer, bytes: []const u8) void {
     const amount = @min(bytes.len, self.latest_suppressed.len);
     @memcpy(self.latest_suppressed[0..amount], bytes[0..amount]);
     self.latest_suppressed_len = amount;
+    self.paintLiveTail();
 }
 
 fn finishDiffLine(self: *ToolRenderer, bytes: []const u8) void {
@@ -321,14 +352,78 @@ fn addOwnedRow(self: *ToolRenderer, row: Row) void {
         discarded.deinit(self.allocator);
         return;
     }
+    const replacing_live = self.spinner != null and self.pending != null and !self.live_finalizing;
+    if (replacing_live) self.spinner.?.swapBegin();
     self.flushPending(false);
     if (self.write_error != null) {
+        if (replacing_live) self.spinner.?.swapEnd();
         var discarded = row;
         discarded.deinit(self.allocator);
         return;
     }
     self.pending = row;
     self.rows_added +|= 1;
+    if (!self.live_finalizing) self.paintLiveRow(row.bytes);
+    if (replacing_live) self.spinner.?.swapEnd();
+}
+
+fn paintLiveRow(self: *ToolRenderer, bytes: []const u8) void {
+    const contents = [_][]const u8{bytes};
+    self.paintLiveRows(&contents);
+}
+
+fn paintLiveTail(self: *ToolRenderer) void {
+    if (self.spinner == null or self.live_finalizing) return;
+    const preview = self.buildTailPreview();
+    var contents: [tail_lines + 1][]const u8 = undefined;
+    var count: usize = 0;
+    if (preview.marker_len != 0) {
+        contents[count] = preview.marker[0..preview.marker_len];
+        count += 1;
+    }
+    for (0..preview.row_count) |row| {
+        contents[count] = preview.rows[row][0..preview.row_lengths[row]];
+        count += 1;
+    }
+    if (count != 0) self.paintLiveRows(contents[0..count]);
+}
+
+fn paintLiveRows(self: *ToolRenderer, contents: []const []const u8) void {
+    const spinner = self.spinner orelse return;
+    if (self.allocation_failed or self.write_error != null or contents.len == 0) return;
+    var styled: [tail_lines + 1]std.ArrayList(u8) = @splat(.empty);
+    defer for (styled[0..contents.len]) |*row| row.deinit(self.allocator);
+    var rows: [tail_lines + 1]SpinnerModule.Row = undefined;
+    for (contents, 0..) |content, index| {
+        const clipped = self.clipRowAtWidth(content, @min(self.width, spinner.columns())) catch {
+            self.allocation_failed = true;
+            return;
+        };
+        defer self.allocator.free(clipped);
+        styled[index].appendSlice(self.allocator, self.theme.chrome_dim.open) catch {
+            self.allocation_failed = true;
+            return;
+        };
+        styled[index].appendSlice(self.allocator, "│ \x1b[0m\x1b[2m") catch {
+            self.allocation_failed = true;
+            return;
+        };
+        styled[index].appendSlice(self.allocator, clipped) catch {
+            self.allocation_failed = true;
+            return;
+        };
+        styled[index].appendSlice(self.allocator, "\x1b[0m") catch {
+            self.allocation_failed = true;
+            return;
+        };
+        rows[index] = .{
+            .bytes = styled[index].items,
+            .cells = gutter_columns + text.DisplayWidth.visibleWidth(clipped, std.math.maxInt(usize)),
+        };
+    }
+    spinner.setToolStatusView(rows[0..contents.len]) catch {
+        self.allocation_failed = true;
+    };
 }
 
 fn flushPending(self: *ToolRenderer, final: bool) void {
@@ -354,10 +449,14 @@ fn flushPending(self: *ToolRenderer, final: bool) void {
 }
 
 fn clipRow(self: *ToolRenderer, bytes: []const u8) error{OutOfMemory}![]u8 {
-    const budget = if (self.width <= gutter_columns + 5)
+    return self.clipRowAtWidth(bytes, self.width);
+}
+
+fn clipRowAtWidth(self: *ToolRenderer, bytes: []const u8, width: usize) error{OutOfMemory}![]u8 {
+    const budget = if (width <= gutter_columns + 5)
         1
     else
-        @min(self.width - gutter_columns - 1, line_bytes);
+        @min(width - gutter_columns - 1, line_bytes);
     if (text.DisplayWidth.visibleWidth(bytes, budget + 1) <= budget) {
         return self.allocator.dupe(u8, bytes);
     }

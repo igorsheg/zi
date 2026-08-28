@@ -6,6 +6,7 @@ const ai = @import("../ai/root.zig");
 const text = @import("../text/root.zig");
 const tool = @import("../tool/root.zig");
 const Theme = @import("Theme.zig");
+const Spinner = @import("Spinner.zig").Spinner;
 const ToolRenderer = @import("ToolRenderer.zig");
 
 const ToolPresentation = @This();
@@ -23,6 +24,7 @@ allocator: std.mem.Allocator,
 writer: *std.Io.Writer,
 theme: Theme,
 width: usize,
+spinner: ?*Spinner = null,
 active: ?ToolRenderer = null,
 active_style: tool.Tool.OutputStyle = .plain,
 error_value: ?Error = null,
@@ -60,6 +62,10 @@ pub fn resetTurn(self: *ToolPresentation, width: usize) void {
     self.needs_separator = false;
 }
 
+pub fn setSpinner(self: *ToolPresentation, spinner: ?*Spinner) void {
+    self.spinner = spinner;
+}
+
 pub fn setWidth(self: *ToolPresentation, width: usize) void {
     self.width = width;
 }
@@ -79,10 +85,20 @@ pub fn beginTool(
     else
         tool.Tool.PreviewMode.head;
     if (preview == .collapsed) {
+        if (self.spinner) |spinner| spinner.swapBegin();
         self.renderCollapsed(observation, display);
+        self.requestRunningLabel(observation.call.name);
+        if (self.spinner) |spinner| {
+            spinner.park(if (self.cluster_open) self.cluster_cells else 0);
+            spinner.swapEnd();
+        }
         return null;
     }
 
+    if (self.spinner) |spinner| {
+        spinner.hide();
+        spinner.setLabel("working", "working...") catch self.recordError(error.OutOfMemory);
+    }
     self.closeCluster();
     self.openBlock();
     self.renderHeader(observation, display);
@@ -99,6 +115,8 @@ pub fn beginTool(
         self.width,
         mode,
     );
+    self.active.?.setSpinner(self.spinner);
+    self.active.?.beginLive();
     self.active_style = display.output_style;
     return self.active.?.sink();
 }
@@ -108,6 +126,7 @@ pub fn endTool(
     observation: agent.Loop.ToolObservation,
     result: *const ai.Item.ToolResult,
 ) void {
+    self.requestWorkingLabel();
     if (self.active == null) return;
     var renderer = &self.active.?;
     const display_called = renderer.display_was_called;
@@ -159,12 +178,27 @@ pub fn closeCluster(self: *ToolPresentation) void {
 
 pub fn close(self: *ToolPresentation) void {
     self.finishActive();
+    if (self.spinner) |spinner| spinner.hide();
     self.closeCluster();
     self.flush();
 }
 
 pub fn check(self: *const ToolPresentation) Error!void {
     if (self.error_value) |err| return err;
+}
+
+fn requestRunningLabel(self: *ToolPresentation, tool_name: []const u8) void {
+    const spinner = self.spinner orelse return;
+    var key_buffer: [96]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buffer, "run:{s}", .{tool_name}) catch "run";
+    var label_buffer: [160]u8 = undefined;
+    const label = std.fmt.bufPrint(&label_buffer, "[{s}] running...", .{tool_name}) catch "working...";
+    spinner.requestLabel(key, label) catch self.recordError(error.OutOfMemory);
+}
+
+fn requestWorkingLabel(self: *ToolPresentation) void {
+    const spinner = self.spinner orelse return;
+    spinner.requestLabel("working", "working...") catch self.recordError(error.OutOfMemory);
 }
 
 fn finishActive(self: *ToolPresentation) void {

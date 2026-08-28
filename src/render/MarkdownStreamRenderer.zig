@@ -11,6 +11,7 @@ const MarkdownOutput = @import("MarkdownOutput.zig");
 const SafeText = @import("SafeText.zig");
 const StreamRenderer = @import("StreamRenderer.zig");
 const Theme = @import("Theme.zig");
+const Spinner = @import("Spinner.zig").Spinner;
 const ToolPresentation = @import("ToolPresentation.zig");
 
 const MarkdownStreamRenderer = @This();
@@ -62,6 +63,7 @@ safe_length: usize = 0,
 write_error: ?std.Io.Writer.Error = null,
 render_error: ?Markdown.Error = null,
 show_reasoning: bool = false,
+spinner: ?*Spinner = null,
 terminal: bool = false,
 stream_active: bool = false,
 reasoning_active: bool = false,
@@ -101,6 +103,11 @@ pub fn setWidthSource(self: *MarkdownStreamRenderer, source: WidthSource) void {
     self.width_source = source;
 }
 
+pub fn setSpinner(self: *MarkdownStreamRenderer, spinner: ?*Spinner) void {
+    self.spinner = spinner;
+    self.tool_presentation.setSpinner(spinner);
+}
+
 pub fn setShowReasoning(self: *MarkdownStreamRenderer, visible: bool) void {
     self.show_reasoning = visible;
 }
@@ -128,6 +135,10 @@ pub fn begin(self: *MarkdownStreamRenderer) !agent.Loop.Observer {
     self.answer_started = false;
     self.wrap_width = self.resolveWidth();
     self.tool_presentation.resetTurn(self.wrap_width);
+    if (self.spinner) |spinner| {
+        try spinner.setLabel("working", "working...");
+        spinner.show();
+    }
     if (self.markdown) |*markdown| {
         markdown.reset(self.wrap_width);
     } else {
@@ -148,12 +159,14 @@ pub fn close(self: *MarkdownStreamRenderer, terminal: StreamRenderer.Terminal) !
     self.closeReasoning();
     self.closeStream();
     self.tool_presentation.close();
+    if (self.spinner) |spinner| spinner.hide();
 }
 
 pub fn check(self: *const MarkdownStreamRenderer) !void {
     if (self.render_error) |err| return err;
     if (self.write_error) |err| return err;
     try self.tool_presentation.check();
+    if (self.spinner) |spinner| try spinner.check();
 }
 
 pub fn wroteAssistantText(self: *const MarkdownStreamRenderer) bool {
@@ -193,11 +206,24 @@ pub fn emit(self: *MarkdownStreamRenderer, event: ai.StreamEvent.StreamEvent) vo
             self.tool_presentation.closeCluster();
             self.feed(bytes);
         },
-        .reasoning_delta => |maybe_bytes| if (self.show_reasoning) if (maybe_bytes) |bytes| {
-            if (bytes.len != 0) self.feedReasoning(bytes);
+        .reasoning_delta => |maybe_bytes| {
+            self.requestSpinnerLabel("thinking", "thinking...");
+            if (self.show_reasoning) if (maybe_bytes) |bytes| {
+                if (bytes.len != 0) self.feedReasoning(bytes);
+            };
         },
-        // Tool and opaque-reasoning boundaries end any preceding item.
-        .tool_call_start, .reasoning_item => {
+        .tool_call_start => |start| {
+            var label_buffer: [160]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buffer, "[{s}] composing...", .{start.name}) catch "composing...";
+            self.requestSpinnerLabel("compose", label);
+            self.closeReasoning();
+            self.closeStream();
+        },
+        .tool_call_end => {
+            self.requestSpinnerLabel("working", "working...");
+        },
+        // Opaque reasoning ends any preceding visible item.
+        .reasoning_item => {
             self.closeReasoning();
             self.closeStream();
         },
@@ -205,6 +231,8 @@ pub fn emit(self: *MarkdownStreamRenderer, event: ai.StreamEvent.StreamEvent) vo
         // abandons the partial attempt: hax marks it so the replacement
         // stream does not read as a continuation of the truncated text.
         .retry => {
+            self.requestSpinnerLabel("retry", "retrying...");
+            if (self.spinner) |spinner| spinner.show();
             const abandoned_text = self.stream_wrote_text or self.reasoning_stream_wrote_text;
             self.closeReasoning();
             self.closeStream();
@@ -217,9 +245,17 @@ pub fn emit(self: *MarkdownStreamRenderer, event: ai.StreamEvent.StreamEvent) vo
         .done, .failure => {
             self.closeReasoning();
             self.closeStream();
+            if (self.spinner) |spinner| spinner.hide();
         },
         else => {},
     }
+}
+
+fn requestSpinnerLabel(self: *MarkdownStreamRenderer, key: []const u8, label: []const u8) void {
+    const spinner = self.spinner orelse return;
+    spinner.requestLabel(key, label) catch {
+        if (self.render_error == null) self.render_error = error.OutOfMemory;
+    };
 }
 
 fn markdownOutput(
@@ -243,6 +279,7 @@ fn feedReasoning(self: *MarkdownStreamRenderer, bytes: []const u8) void {
 }
 
 fn beginReasoning(self: *MarkdownStreamRenderer) void {
+    if (self.spinner) |spinner| spinner.hide();
     const follows_assistant = self.stream_active and self.stream_wrote_text;
     self.closeStream();
     self.tool_presentation.closeCluster();
@@ -281,6 +318,7 @@ fn closeReasoning(self: *MarkdownStreamRenderer) void {
 
 fn ensureStream(self: *MarkdownStreamRenderer) void {
     if (self.stream_active) return;
+    if (self.spinner) |spinner| spinner.hide();
     if (self.separator_after_reasoning) self.write("\n");
     self.separator_after_reasoning = false;
     self.stream_active = true;

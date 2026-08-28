@@ -3,6 +3,7 @@ pub const Frame = @import("Frame.zig");
 pub const History = @import("History.zig");
 pub const MarkdownStreamRenderer = @import("MarkdownStreamRenderer.zig");
 pub const PlainInteractiveRenderer = @import("PlainInteractiveRenderer.zig");
+pub const Spinner = @import("Spinner.zig");
 pub const StreamRenderer = @import("StreamRenderer.zig").StreamRenderer;
 pub const Terminal = @import("StreamRenderer.zig").Terminal;
 pub const Theme = @import("Theme.zig");
@@ -23,4 +24,5 @@ test {
     _ = @import("ToolRenderer.zig");
     _ = @import("ToolPresentation.zig");
     _ = History;
+    _ = Spinner;
 }

@@ -8,6 +8,7 @@ const MarkdownStreamRenderer = @import("MarkdownStreamRenderer.zig");
 const SafeText = @import("SafeText.zig");
 const Stream = @import("StreamRenderer.zig");
 const Theme = @import("Theme.zig");
+const Spinner = @import("Spinner.zig").Spinner;
 const ToolPresentation = @import("ToolPresentation.zig");
 
 const PlainInteractiveRenderer = @This();
@@ -20,6 +21,8 @@ width_source: ?MarkdownStreamRenderer.WidthSource = null,
 stream: Stream.StreamRenderer,
 tools: ToolPresentation,
 show_reasoning: bool = false,
+spinner: ?*Spinner = null,
+spinner_allocation_failed: bool = false,
 reasoning_active: bool = false,
 reasoning_stream_wrote_text: bool = false,
 reasoning_wrote_text: bool = false,
@@ -48,6 +51,11 @@ pub fn deinit(self: *PlainInteractiveRenderer) void {
     self.* = undefined;
 }
 
+pub fn setSpinner(self: *PlainInteractiveRenderer, spinner: ?*Spinner) void {
+    self.spinner = spinner;
+    self.tools.setSpinner(spinner);
+}
+
 pub fn setShowReasoning(self: *PlainInteractiveRenderer, visible: bool) void {
     self.show_reasoning = visible;
 }
@@ -69,6 +77,11 @@ pub fn begin(self: *PlainInteractiveRenderer) !agent.Loop.Observer {
     self.separator_after_reasoning = false;
     self.reasoning_text = .{};
     self.write_error = null;
+    self.spinner_allocation_failed = false;
+    if (self.spinner) |spinner| {
+        try spinner.setLabel("working", "working...");
+        spinner.show();
+    }
     return agent.Loop.Observer.from(self);
 }
 
@@ -76,12 +89,15 @@ pub fn close(self: *PlainInteractiveRenderer, terminal: Stream.Terminal) !void {
     self.closeReasoning();
     self.stream.close(terminal);
     self.tools.close();
+    if (self.spinner) |spinner| spinner.hide();
 }
 
 pub fn check(self: *const PlainInteractiveRenderer) !void {
     try self.stream.check();
     try self.tools.check();
     if (self.write_error) |err| return err;
+    if (self.spinner_allocation_failed) return error.OutOfMemory;
+    if (self.spinner) |spinner| try spinner.check();
 }
 
 pub fn wroteAssistantText(self: *const PlainInteractiveRenderer) bool {
@@ -94,16 +110,22 @@ pub fn toolObserver(self: *PlainInteractiveRenderer) ?agent.Loop.ToolObserver {
 
 pub fn emit(self: *PlainInteractiveRenderer, event: ai.StreamEvent.StreamEvent) void {
     switch (event) {
-        .reasoning_delta => |maybe_bytes| if (self.show_reasoning) if (maybe_bytes) |bytes| {
-            if (bytes.len != 0) self.feedReasoning(bytes);
+        .reasoning_delta => |maybe_bytes| {
+            self.requestSpinnerLabel("thinking", "thinking...");
+            if (self.show_reasoning) if (maybe_bytes) |bytes| {
+                if (bytes.len != 0) self.feedReasoning(bytes);
+            };
         },
         .text_delta => {
+            if (self.spinner) |spinner| spinner.hide();
             self.closeReasoning();
             self.consumeReasoningSeparator();
             self.tools.closeCluster();
             self.stream.emit(event);
         },
         .retry => {
+            self.requestSpinnerLabel("retry", "retrying...");
+            if (self.spinner) |spinner| spinner.show();
             const abandoned_reasoning = self.reasoning_stream_wrote_text;
             self.closeReasoning();
             if (abandoned_reasoning) {
@@ -112,9 +134,25 @@ pub fn emit(self: *PlainInteractiveRenderer, event: ai.StreamEvent.StreamEvent) 
             }
             self.stream.emit(event);
         },
-        .tool_call_start, .reasoning_item, .done, .failure => {
+        .tool_call_start => |start| {
+            var label_buffer: [160]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buffer, "[{s}] composing...", .{start.name}) catch "composing...";
+            self.requestSpinnerLabel("compose", label);
             self.closeReasoning();
             self.stream.emit(event);
+        },
+        .tool_call_end => {
+            self.requestSpinnerLabel("working", "working...");
+            self.stream.emit(event);
+        },
+        .reasoning_item => {
+            self.closeReasoning();
+            self.stream.emit(event);
+        },
+        .done, .failure => {
+            self.closeReasoning();
+            self.stream.emit(event);
+            if (self.spinner) |spinner| spinner.hide();
         },
         else => self.stream.emit(event),
     }
@@ -141,8 +179,16 @@ pub fn endTool(
     self.tools.endTool(observation, result);
 }
 
+fn requestSpinnerLabel(self: *PlainInteractiveRenderer, key: []const u8, label: []const u8) void {
+    const spinner = self.spinner orelse return;
+    spinner.requestLabel(key, label) catch {
+        self.spinner_allocation_failed = true;
+    };
+}
+
 fn feedReasoning(self: *PlainInteractiveRenderer, bytes: []const u8) void {
     if (!self.reasoning_active) {
+        if (self.spinner) |spinner| spinner.hide();
         const follows_assistant = self.stream.wroteAssistantText();
         self.stream.boundary();
         self.tools.closeCluster();
