@@ -644,6 +644,24 @@ pub fn run(
     model_metadata_source.effects = &catalog_hook;
     compaction.effects = &catalog_hook;
 
+    var configured_theme = try config.Settings.getString(store, allocator, "theme");
+    defer configured_theme.deinit(allocator);
+    var configured_tint = try config.Settings.getString(store, allocator, "tint");
+    defer configured_tint.deinit(allocator);
+    const effective_tint = effectiveThemeTint(
+        configured_tint.source,
+        configured_tint.value,
+        startup.tint(),
+    );
+    const theme = try resolveTheme(stderr, .{
+        .configured_theme = configured_theme.value orelse "auto",
+        .configured_tint = effective_tint,
+        .no_color = environment.get("NO_COLOR"),
+        .term = environment.get("TERM"),
+        .colorterm = environment.get("COLORTERM"),
+        .colorfgbg = environment.get("COLORFGBG"),
+    });
+
     const run_result = switch (mode) {
         .print => |prompt| OneShot.run(allocator, io, .{
             .session = session_run.session(),
@@ -715,28 +733,11 @@ pub fn run(
 
             const markdown_enabled = (try config.Settings.getBool(store, allocator, "markdown")).value;
             const show_reasoning = (try config.Settings.getBool(store, allocator, "show_reasoning")).value;
-            var configured_theme = try config.Settings.getString(store, allocator, "theme");
-            defer configured_theme.deinit(allocator);
-            var configured_tint = try config.Settings.getString(store, allocator, "tint");
-            defer configured_tint.deinit(allocator);
-            const effective_tint = effectiveThemeTint(
-                configured_tint.source,
-                configured_tint.value,
-                startup.tint(),
-            );
             var configured_display_width = try config.Settings.getString(store, allocator, "display_width");
             defer configured_display_width.deinit(allocator);
             const display_columns = try terminal_module.DisplayColumns.Policy.parse(
                 configured_display_width.value orelse "auto",
             );
-            const theme = try resolveTheme(stderr, .{
-                .configured_theme = configured_theme.value orelse "auto",
-                .configured_tint = effective_tint,
-                .no_color = environment.get("NO_COLOR"),
-                .term = environment.get("TERM"),
-                .colorterm = environment.get("COLORTERM"),
-                .colorfgbg = environment.get("COLORFGBG"),
-            });
             break :interactive runRawInteractive(
                 allocator,
                 io,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Item = @import("Item.zig").Item;
 const Provider = @import("Provider.zig");
 const Retry = @import("Retry.zig");
@@ -16,8 +17,21 @@ const DeltaKind = enum { text, reasoning };
 // dirty run even when every test passes. Under tests the warnings stay silent;
 // they still appear when the provider runs against a live session.
 fn warnScript(comptime format: []const u8, args: anytype) void {
-    if (@import("builtin").is_test) return;
+    if (builtin.is_test) return;
     std.debug.print(format, args);
+}
+
+fn fileErrorReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound => "No such file or directory",
+        error.AccessDenied, error.PermissionDenied => "Permission denied",
+        error.NotDir => "Not a directory",
+        error.NameTooLong => "File name too long",
+        error.SymLinkLoop => "Too many levels of symbolic links",
+        error.ProcessFdQuotaExceeded => "Too many open files",
+        error.SystemFdQuotaExceeded => "Too many open files in system",
+        else => @errorName(err),
+    };
 }
 
 pub const Config = struct {
@@ -53,7 +67,7 @@ pub const Mock = struct {
             const message = try std.fmt.allocPrint(
                 allocator,
                 "mock: cannot open '{s}': {s}",
-                .{ script_path, @errorName(err) },
+                .{ script_path, fileErrorReason(err) },
             );
             defer allocator.free(message);
             try sink.emit(.{ .failure = .{ .message = message } });
@@ -104,12 +118,12 @@ fn cancellableSleep(io: std.Io, tick: ?Provider.Tick, delay_ms: u64) Provider.St
 }
 
 fn emitChunked(
+    comptime kind: DeltaKind,
     io: std.Io,
     tick: ?Provider.Tick,
     sink: Provider.EventSink,
     text: []const u8,
     delay_ms: u64,
-    comptime kind: DeltaKind,
 ) Provider.StreamError!void {
     var offset: usize = 0;
     var chunk: [text_chunk_bytes]u8 = undefined;
@@ -140,20 +154,20 @@ fn isUtf8Continuation(byte: u8) bool {
 }
 
 fn emitScriptText(
+    comptime kind: DeltaKind,
     allocator: std.mem.Allocator,
     io: std.Io,
     tick: ?Provider.Tick,
     sink: Provider.EventSink,
     raw: []const u8,
     delay_ms: u64,
-    comptime kind: DeltaKind,
 ) Provider.StreamError!void {
     try cancellableSleep(io, tick, delay_ms);
     var decoded = try decodeEscapes(allocator, raw);
     defer decoded.deinit(allocator);
     var expanded = try expandCwd(allocator, io, decoded.bytes);
     defer expanded.deinit(allocator);
-    try emitChunked(io, tick, sink, expanded.bytes, delay_ms, kind);
+    try emitChunked(kind, io, tick, sink, expanded.bytes, delay_ms);
 }
 
 fn emitToolCall(
@@ -201,7 +215,7 @@ fn emitDone(sink: Provider.EventSink, usage: Usage.StreamUsage) Provider.StreamE
 }
 
 fn emitScriptExhausted(io: std.Io, tick: ?Provider.Tick, sink: Provider.EventSink) Provider.StreamError!void {
-    try emitChunked(io, tick, sink, "Script exhausted — no more turns.", 0, .text);
+    try emitChunked(.text, io, tick, sink, "Script exhausted — no more turns.", 0);
     try emitDone(sink, .{});
 }
 
@@ -248,9 +262,9 @@ fn playScriptTurn(
         if (matchDirective(directive, "delay", &argument)) {
             delay_ms = parseDelay(argument);
         } else if (matchDirective(directive, "text", &argument)) {
-            try emitScriptText(allocator, io, tick, sink, argument, delay_ms, .text);
+            try emitScriptText(.text, allocator, io, tick, sink, argument, delay_ms);
         } else if (matchDirective(directive, "reasoning", &argument)) {
-            try emitScriptText(allocator, io, tick, sink, argument, delay_ms, .reasoning);
+            try emitScriptText(.reasoning, allocator, io, tick, sink, argument, delay_ms);
         } else if (matchDirective(directive, "space", null)) {
             try cancellableSleep(io, tick, delay_ms);
             try sink.emit(.{ .text_delta = " " });
@@ -367,9 +381,9 @@ fn parseUsage(spec: []const u8) Usage.StreamUsage {
         } else if (std.mem.eql(u8, key, "cached")) {
             if (parseDecimal(u64, value)) |parsed| usage.cached_tokens = parsed else usage.cached_tokens = null;
         } else if (std.mem.eql(u8, key, "cache_write")) {
-            if (parseDecimal(u64, value)) |parsed| usage.cache_write_tokens = parsed else usage.cache_write_tokens = null;
+            usage.cache_write_tokens = parseDecimal(u64, value);
         } else if (std.mem.eql(u8, key, "cache_write_1h")) {
-            if (parseDecimal(u64, value)) |parsed| usage.cache_write_1h_tokens = parsed else usage.cache_write_1h_tokens = null;
+            usage.cache_write_1h_tokens = parseDecimal(u64, value);
         } else if (std.mem.eql(u8, key, "cost")) {
             if (std.mem.indexOfScalar(u8, value, '_') == null) {
                 if (std.fmt.parseFloat(f64, value)) |parsed| usage.cost_usd = parsed else |_| {}
@@ -439,7 +453,7 @@ fn expandCwd(
 
     var output_length: usize = text.len;
     var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, text, search_from, cwd_token)) |index| {
+    while (std.mem.findPos(u8, text, search_from, cwd_token)) |index| {
         output_length = std.math.sub(usize, output_length, cwd_token.len) catch return error.OutOfMemory;
         output_length = std.math.add(usize, output_length, cwd.len) catch return error.OutOfMemory;
         search_from = index + cwd_token.len;
@@ -448,7 +462,7 @@ fn expandCwd(
     const allocation = try allocator.alloc(u8, output_length);
     var output: usize = 0;
     var input: usize = 0;
-    while (std.mem.indexOfPos(u8, text, input, cwd_token)) |index| {
+    while (std.mem.findPos(u8, text, input, cwd_token)) |index| {
         const prefix = text[input..index];
         @memcpy(allocation[output .. output + prefix.len], prefix);
         output += prefix.len;
@@ -617,7 +631,7 @@ fn interactiveResponse(
 
     switch (last.*) {
         .tool_result => {
-            try emitChunked(io, request.tick, sink, "Tool finished — awaiting next instruction.", 0, .text);
+            try emitChunked(.text, io, request.tick, sink, "Tool finished — awaiting next instruction.", 0);
             try emitDone(sink, .{});
             return;
         },
@@ -625,12 +639,12 @@ fn interactiveResponse(
     }
 
     const message = lastUserText(request.context.items) orelse {
-        try emitChunked(io, request.tick, sink, "Hello.", 0, .text);
+        try emitChunked(.text, io, request.tick, sink, "Hello.", 0);
         try emitDone(sink, .{});
         return;
     };
     if (message.len == 0) {
-        try emitChunked(io, request.tick, sink, "Hello.", 0, .text);
+        try emitChunked(.text, io, request.tick, sink, "Hello.", 0);
         try emitDone(sink, .{});
         return;
     }
@@ -643,7 +657,7 @@ fn interactiveResponse(
         defer escaped.deinit(allocator);
         var arguments = try makeJsonArguments(allocator, argument_key, escaped.bytes);
         defer arguments.deinit(allocator);
-        try emitChunked(io, request.tick, sink, "Sure, on it.", 0, .text);
+        try emitChunked(.text, io, request.tick, sink, "Sure, on it.", 0);
         try emitToolCall(io, request.tick, sink, tool_name, arguments.bytes, 0, false);
         try emitDone(sink, .{});
         return;
@@ -651,7 +665,7 @@ fn interactiveResponse(
 
     const echo = try std.fmt.allocPrint(allocator, "You said: {s}", .{message});
     defer allocator.free(echo);
-    try emitChunked(io, request.tick, sink, echo, 0, .text);
+    try emitChunked(.text, io, request.tick, sink, echo, 0);
     try emitDone(sink, .{});
 }
 
@@ -871,7 +885,7 @@ test "scripted cancellation preserves the next turn" {
     var mock = Mock.init(.{ .script_path = path }, &state);
     var capture = TestCapture.init(std.testing.allocator);
     defer capture.deinit();
-    var cancel = AlwaysCancel{};
+    var cancel: AlwaysCancel = .{};
     var request = emptyRequest();
     request.tick = Provider.Tick.from(&cancel);
     try std.testing.expectError(
@@ -985,6 +999,7 @@ test "a missing script emits one terminal failure event" {
     try std.testing.expectEqual(@as(usize, 1), capture.failure_event_count);
     try std.testing.expectEqual(@as(usize, 0), capture.done_event_count);
     try std.testing.expect(std.mem.indexOf(u8, capture.failure_message.items, "cannot open") != null);
+    try std.testing.expect(std.mem.endsWith(u8, capture.failure_message.items, "No such file or directory"));
 }
 
 fn bashTool() []const Provider.ToolDefinition {
@@ -998,7 +1013,7 @@ fn readTool() []const Provider.ToolDefinition {
 test "interactive bash call escapes JSON strings" {
     const message = @constCast("run `echo \"hi\" C:\\tmp\n\t\x01`");
     const items = [_]Item{.{ .user_message = .{ .text = message } }};
-    const context = Provider.Context{
+    const context: Provider.Context = .{
         .system_prompt = "",
         .items = &items,
         .tools = bashTool(),
@@ -1026,7 +1041,7 @@ test "interactive bash call escapes JSON strings" {
 test "interactive read call uses the path argument" {
     const message = @constCast("read `docs/notes.md`");
     const items = [_]Item{.{ .user_message = .{ .text = message } }};
-    const context = Provider.Context{
+    const context: Provider.Context = .{
         .system_prompt = "",
         .items = &items,
         .tools = readTool(),
@@ -1050,7 +1065,7 @@ test "interactive read call uses the path argument" {
 test "interactive mode echoes when tools are unavailable" {
     const message = @constCast("run `ls`");
     const items = [_]Item{.{ .user_message = .{ .text = message } }};
-    const context = Provider.Context{
+    const context: Provider.Context = .{
         .system_prompt = "",
         .items = &items,
         .tools = &.{},
@@ -1074,7 +1089,7 @@ test "interactive mode echoes when tools are unavailable" {
 test "interactive read echoes without a matching read tool" {
     const message = @constCast("read `notes.md`");
     const items = [_]Item{.{ .user_message = .{ .text = message } }};
-    const context = Provider.Context{
+    const context: Provider.Context = .{
         .system_prompt = "",
         .items = &items,
         .tools = bashTool(),
@@ -1104,7 +1119,7 @@ test "interactive tool result after a boundary gets a follow-up message" {
         } },
         .turn_boundary,
     };
-    const context = Provider.Context{
+    const context: Provider.Context = .{
         .system_prompt = "",
         .items = &items,
         .tools = bashTool(),

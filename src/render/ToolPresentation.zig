@@ -282,6 +282,17 @@ fn displayArgument(
     display: tool.Tool.Display,
     arguments_json: ?[]const u8,
 ) ?[]u8 {
+    if (display.format_argument) |format| {
+        const bytes = format(self.allocator, arguments_json) catch {
+            self.recordError(error.OutOfMemory);
+            return null;
+        };
+        defer self.allocator.free(bytes);
+        return self.sanitizeFlat(bytes) catch {
+            self.recordError(error.OutOfMemory);
+            return null;
+        };
+    }
     const arg_name = display.arg_name orelse return null;
     const source = arguments_json orelse return null;
     var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, source, .{}) catch return null;
@@ -556,6 +567,30 @@ test "verbose tool presentation renders a safe header and bounded result" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "[fake]") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "echo hi there") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "done") != null);
+}
+
+test "formatted tool argument precedes raw JSON fallback" {
+    const Formatter = struct {
+        fn format(allocator: std.mem.Allocator, _: ?[]const u8) error{OutOfMemory}![]u8 {
+            return allocator.dupe(u8, "t1 (up to 30s)");
+        }
+    };
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var fake: FakeTool = .{};
+    const selected = tool.Tool.Tool.from(&fake, fake_definition, .{
+        .format_argument = Formatter.format,
+        .preview_mode = .head_tail,
+    });
+    var presentation = init(std.testing.allocator, &output.writer, try testTheme(), 80);
+    defer presentation.deinit();
+    const observed = namedTestObservation("task_wait", selected, "{\"id\":\"t1\",\"timeout_seconds\":30}");
+    _ = presentation.beginTool(observed);
+    const result: ai.Item.ToolResult = .{ .call_id = @constCast("id"), .output = @constCast("") };
+    presentation.endTool(observed, &result);
+    try presentation.check();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "t1 (up to 30s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "timeout_seconds") == null);
 }
 
 test "collapsed reads coalesce and omit result previews" {

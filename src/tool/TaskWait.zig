@@ -11,7 +11,7 @@ pub const TaskWait = struct {
     pub fn tool(self: *TaskWait) ToolContract.Tool {
         return ToolContract.Tool.from(self, definition, .{
             .preview_mode = .head_tail,
-            .collapse_argument = formatArgument,
+            .format_argument = formatArgument,
         });
     }
 

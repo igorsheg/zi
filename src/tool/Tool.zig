@@ -105,6 +105,10 @@ pub const Display = struct {
     output_style: OutputStyle = .plain,
     preview_mode: PreviewMode = .head,
     header_rows: usize = 1,
+    format_argument: ?*const fn (
+        std.mem.Allocator,
+        ?[]const u8,
+    ) error{OutOfMemory}![]u8 = null,
     format_extra: ?*const fn (
         std.mem.Allocator,
         ?[]const u8,
