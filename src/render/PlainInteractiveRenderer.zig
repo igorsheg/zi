@@ -123,8 +123,15 @@ pub fn emit(self: *PlainInteractiveRenderer, event: ai.StreamEvent.StreamEvent) 
             self.tools.closeCluster();
             self.stream.emit(event);
         },
-        .retry => {
-            self.requestSpinnerLabel("retry", "retrying...");
+        .retry => |retry| {
+            var label_buffer: [96]u8 = undefined;
+            const seconds = (retry.delay_ms +| 999) / 1000;
+            const label = std.fmt.bufPrint(
+                &label_buffer,
+                "retrying in {d}s (attempt {d}/{d})...",
+                .{ seconds, retry.attempt, retry.maximum_attempts },
+            ) catch "retrying...";
+            self.requestSpinnerLabel("retry", label);
             if (self.spinner) |spinner| spinner.show();
             const abandoned_reasoning = self.reasoning_stream_wrote_text;
             self.closeReasoning();
@@ -148,6 +155,17 @@ pub fn emit(self: *PlainInteractiveRenderer, event: ai.StreamEvent.StreamEvent) 
         .reasoning_item => {
             self.closeReasoning();
             self.stream.emit(event);
+        },
+        .progress => |progress| {
+            const uncached_total = progress.total_tokens -| progress.cached_tokens;
+            if (uncached_total != 0) {
+                const uncached_processed = progress.processed_tokens -| progress.cached_tokens;
+                const percentage = @min(100, uncached_processed *| 100 / uncached_total);
+                var label_buffer: [40]u8 = undefined;
+                const label = std.fmt.bufPrint(&label_buffer, "processing... {d}%", .{percentage}) catch
+                    "processing...";
+                self.requestSpinnerLabel("processing", label);
+            }
         },
         .done, .failure => {
             self.closeReasoning();
