@@ -118,6 +118,68 @@ pub const Observer = struct {
     }
 };
 
+pub const ToolAction = enum {
+    run,
+    refuse,
+    skip,
+};
+
+/// Borrowed view of one prepared tool call. The effective argument slice may
+/// belong to Dispatch and remains valid only through the matching `end` call.
+pub const ToolObservation = struct {
+    call: *const ai.Item.ToolCall,
+    effective_arguments_json: []const u8,
+    display: ?tool.Tool.Display,
+    action: ToolAction,
+};
+
+/// Synchronous display observer around provider-independent tool execution.
+/// Presentation is optional and cannot own or execute the tool. Callback
+/// failures stay sticky in the observer and are reported by its frontend after
+/// Loop returns, matching the stream observer contract.
+pub const ToolObserver = struct {
+    context: *anyopaque,
+    begin_fn: *const fn (*anyopaque, ToolObservation) ?tool.Tool.DisplaySink,
+    end_fn: *const fn (*anyopaque, ToolObservation, *const ai.Item.ToolResult) void,
+
+    pub fn begin(self: ToolObserver, observation: ToolObservation) ?tool.Tool.DisplaySink {
+        return self.begin_fn(self.context, observation);
+    }
+
+    pub fn end(
+        self: ToolObserver,
+        observation: ToolObservation,
+        result: *const ai.Item.ToolResult,
+    ) void {
+        self.end_fn(self.context, observation, result);
+    }
+
+    pub fn from(implementation: anytype) ToolObserver {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("ToolObserver.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn begin(context: *anyopaque, observation: ToolObservation) ?tool.Tool.DisplaySink {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.beginTool(observation);
+            }
+
+            fn end(
+                context: *anyopaque,
+                observation: ToolObservation,
+                result: *const ai.Item.ToolResult,
+            ) void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                self.endTool(observation, result);
+            }
+        };
+        return .{ .context = implementation, .begin_fn = Adapter.begin, .end_fn = Adapter.end };
+    }
+};
+
 pub const HookError = error{
     OutOfMemory,
     Failed,
@@ -303,6 +365,7 @@ pub const Params = struct {
     continued: bool = false,
     checkpoint: ?Checkpoint = null,
     observer: ?Observer = null,
+    tool_observer: ?ToolObserver = null,
     seam_hook: ?SeamHook = null,
     usage_observer: ?UsageObserver = null,
     pre_request_hook: ?PreRequestHook = null,
@@ -1016,15 +1079,39 @@ pub fn run(
                 params,
             ) catch |err| return settleToolFailure(params, &turn, err);
             const tool_signal = signals.resolve();
-            var tool_result = (if (definitions.len == 0)
-                dispatch.refused(params.session.allocator, call)
-            else if (tool_signal == .abort) skipped: {
-                abort_skipped = true;
-                break :skipped dispatch.skipped(params.session.allocator, call);
-            } else dispatch.run(params.session.allocator, io, call, .{
-                .image_input = tool_image_input,
-                .cancel = tool.Tool.Cancellation.from(&cancellation),
-            })) catch |err| return settleToolFailure(params, &turn, err);
+            var prepared = dispatch.prepare(params.session.allocator, io, call) catch |err|
+                return settleToolFailure(params, &turn, err);
+            defer prepared.deinit(params.session.allocator);
+            const action: ToolAction = if (definitions.len == 0)
+                .refuse
+            else if (tool_signal == .abort)
+                .skip
+            else
+                .run;
+            if (action == .skip) abort_skipped = true;
+            const observation: ToolObservation = .{
+                .call = call,
+                .effective_arguments_json = prepared.effective_arguments_json,
+                .display = if (prepared.tool) |selected| selected.display else null,
+                .action = action,
+            };
+            const display = if (params.tool_observer) |observer|
+                observer.begin(observation)
+            else
+                null;
+            var tool_result = (switch (action) {
+                .refuse => dispatch.refused(params.session.allocator, call),
+                .skip => dispatch.skipped(params.session.allocator, call),
+                .run => dispatch.runPrepared(params.session.allocator, io, &prepared, .{
+                    .display = display,
+                    .image_input = tool_image_input,
+                    .cancel = tool.Tool.Cancellation.from(&cancellation),
+                }),
+            }) catch |err| return settleToolFailure(params, &turn, err);
+            if (params.tool_observer) |observer| {
+                std.debug.assert(tool_result == .tool_result);
+                observer.end(observation, &tool_result.tool_result);
+            }
             var result_owned = true;
             defer if (result_owned) tool_result.deinit(params.session.allocator);
             enforceImageBudget(
@@ -1253,6 +1340,119 @@ test "loop commits a tool batch before requesting the final response" {
         try std.testing.expectEqualStrings("model", item.turn_usage.source.?.model.?);
     };
     try std.testing.expectEqual(@as(usize, 2), usage_count);
+}
+
+test "loop tool observer brackets prepared execution and receives settled output" {
+    const Provider = struct {
+        const Self = @This();
+
+        calls: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.calls += 1;
+            if (self.calls == 1) {
+                try sink.emit(.{ .tool_call_start = .{ .id = "call", .name = "echo" } });
+                try sink.emit(.{ .tool_call_delta = .{ .id = "call", .arguments_delta = "{}" } });
+                try sink.emit(.{ .tool_call_end = "call" });
+            } else {
+                try sink.emit(.{ .text_delta = "done" });
+            }
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const FakeTool = struct {
+        const Self = @This();
+
+        pub fn preprocess(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            _: ?[]const u8,
+        ) error{OutOfMemory}!?[]u8 {
+            const rewritten = try allocator.dupe(u8, "{\"value\":\"effective\"}");
+            return rewritten;
+        }
+
+        pub fn run(
+            allocator: std.mem.Allocator,
+            _: std.Io,
+            _: *Self,
+            arguments: ?[]const u8,
+            context: tool.Tool.RunContext,
+        ) tool.Tool.RunError!tool.Tool.Result {
+            if (!std.mem.eql(u8, arguments.?, "{\"value\":\"effective\"}")) {
+                return error.InvalidResult;
+            }
+            try context.display.?.emit("live");
+            return .{ .output = try allocator.dupe(u8, "stored") };
+        }
+    };
+    const Display = struct {
+        const Self = @This();
+
+        bytes: [4]u8 = undefined,
+        begins: usize = 0,
+        ends: usize = 0,
+        invalid: bool = false,
+
+        pub fn emit(self: *Self, bytes: []const u8) error{OutOfMemory}!void {
+            if (bytes.len != self.bytes.len) return error.OutOfMemory;
+            @memcpy(&self.bytes, bytes);
+        }
+
+        pub fn beginTool(
+            self: *Self,
+            observed: ToolObservation,
+        ) ?tool.Tool.DisplaySink {
+            self.begins += 1;
+            if (observed.action != .run or observed.display == null or
+                !std.mem.eql(u8, observed.call.name, "echo") or
+                !std.mem.eql(u8, observed.effective_arguments_json, "{\"value\":\"effective\"}"))
+            {
+                self.invalid = true;
+            }
+            return tool.Tool.DisplaySink.from(self);
+        }
+
+        pub fn endTool(
+            self: *Self,
+            observed: ToolObservation,
+            result: *const ai.Item.ToolResult,
+        ) void {
+            self.ends += 1;
+            if (observed.action != .run or !std.mem.eql(u8, result.output, "stored")) {
+                self.invalid = true;
+            }
+        }
+    };
+
+    var provider: Provider = .{};
+    var fake_tool: FakeTool = .{};
+    var display: Display = .{};
+    var tools = [_]tool.Tool.Tool{tool.Tool.Tool.from(&fake_tool, test_definition, .{})};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var loop_result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "",
+        .tools = &tools,
+        .tool_observer = ToolObserver.from(&display),
+    });
+    defer loop_result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Outcome.complete, loop_result.outcome);
+    try std.testing.expectEqual(@as(usize, 1), display.begins);
+    try std.testing.expectEqual(@as(usize, 1), display.ends);
+    try std.testing.expectEqualStrings("live", &display.bytes);
+    try std.testing.expect(!display.invalid);
 }
 
 test "loop provider failure copies diagnostics and keeps reported usage" {

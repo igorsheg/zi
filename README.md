@@ -35,7 +35,8 @@ libcurl sysroot and matching pkg-config metadata.
 
 Interactive output stays in the terminal's normal buffer. On a TTY, Markdown
 rendering is enabled by default and follows the configured theme, tint, and
-display-width policy; piped output remains plain.
+display-width policy. Tool calls show bounded head or head/tail previews, while
+read calls collapse to one-line breadcrumbs. Piped output remains plain.
 
 ## Mock provider
 

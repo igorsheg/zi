@@ -5,11 +5,13 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
+const tool = @import("../tool/root.zig");
 const Markdown = @import("Markdown.zig");
 const MarkdownOutput = @import("MarkdownOutput.zig");
 const SafeText = @import("SafeText.zig");
 const StreamRenderer = @import("StreamRenderer.zig");
 const Theme = @import("Theme.zig");
+const ToolPresentation = @import("ToolPresentation.zig");
 
 const MarkdownStreamRenderer = @This();
 
@@ -45,6 +47,7 @@ pub const WidthSource = struct {
 allocator: std.mem.Allocator,
 writer: *std.Io.Writer,
 theme: Theme,
+tool_presentation: ToolPresentation,
 wrap_width: usize,
 width_source: ?WidthSource = null,
 markdown: ?Markdown = null,
@@ -72,11 +75,13 @@ pub fn init(
         .allocator = allocator,
         .writer = writer,
         .theme = theme,
+        .tool_presentation = .init(allocator, writer, theme, wrap_width),
         .wrap_width = wrap_width,
     };
 }
 
 pub fn deinit(self: *MarkdownStreamRenderer) void {
+    self.tool_presentation.deinit();
     if (self.markdown) |*markdown| markdown.deinit();
     self.* = undefined;
 }
@@ -102,6 +107,7 @@ pub fn begin(self: *MarkdownStreamRenderer) !agent.Loop.Observer {
     self.trailing_newlines = 0;
     self.answer_started = false;
     self.wrap_width = self.resolveWidth();
+    self.tool_presentation.resetTurn(self.wrap_width);
     if (self.markdown) |*markdown| {
         markdown.reset(self.wrap_width);
     } else {
@@ -120,21 +126,47 @@ pub fn close(self: *MarkdownStreamRenderer, terminal: StreamRenderer.Terminal) !
     if (self.terminal) return;
     self.terminal = true;
     self.closeStream();
+    self.tool_presentation.close();
 }
 
 pub fn check(self: *const MarkdownStreamRenderer) !void {
     if (self.render_error) |err| return err;
     if (self.write_error) |err| return err;
+    try self.tool_presentation.check();
 }
 
 pub fn wroteAssistantText(self: *const MarkdownStreamRenderer) bool {
     return self.wrote_assistant_text;
 }
 
+pub fn toolObserver(self: *MarkdownStreamRenderer) ?agent.Loop.ToolObserver {
+    return agent.Loop.ToolObserver.from(self);
+}
+
+pub fn beginTool(
+    self: *MarkdownStreamRenderer,
+    observation: agent.Loop.ToolObservation,
+) ?tool.Tool.DisplaySink {
+    self.tool_presentation.setWidth(self.resolveWidth());
+    if (self.wrote_assistant_text) self.tool_presentation.requireSeparator();
+    return self.tool_presentation.beginTool(observation);
+}
+
+pub fn endTool(
+    self: *MarkdownStreamRenderer,
+    observation: agent.Loop.ToolObservation,
+    result: *const ai.Item.ToolResult,
+) void {
+    self.tool_presentation.endTool(observation, result);
+}
+
 pub fn emit(self: *MarkdownStreamRenderer, event: ai.StreamEvent.StreamEvent) void {
     if (self.terminal or self.write_error != null or self.render_error != null) return;
     switch (event) {
-        .text_delta => |bytes| self.feed(bytes),
+        .text_delta => |bytes| {
+            self.tool_presentation.closeCluster();
+            self.feed(bytes);
+        },
         // Tool and opaque-reasoning boundaries end any preceding text item.
         .tool_call_start, .reasoning_item => self.closeStream(),
         // Each provider request is a complete Markdown stream. A retry
@@ -363,9 +395,11 @@ test "writer and parser errors are retained for synchronous check" {
 
 test "width source is resolved for each provider stream" {
     const DynamicWidth = struct {
+        const Self = @This();
+
         width: usize,
 
-        pub fn resolve(self: *const @This()) usize {
+        pub fn resolve(self: *const Self) usize {
             return self.width;
         }
     };

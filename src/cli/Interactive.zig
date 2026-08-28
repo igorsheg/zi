@@ -122,6 +122,7 @@ pub const TurnRenderer = struct {
     close_fn: *const fn (*anyopaque, render.Terminal) anyerror!void,
     check_fn: *const fn (*anyopaque) anyerror!void,
     wrote_assistant_text_fn: *const fn (*anyopaque) bool,
+    tool_observer_fn: *const fn (*anyopaque) ?agent.Loop.ToolObserver,
 
     pub fn begin(self: TurnRenderer) !agent.Loop.Observer {
         return self.begin_fn(self.context);
@@ -137,6 +138,10 @@ pub const TurnRenderer = struct {
 
     pub fn wroteAssistantText(self: TurnRenderer) bool {
         return self.wrote_assistant_text_fn(self.context);
+    }
+
+    pub fn toolObserver(self: TurnRenderer) ?agent.Loop.ToolObserver {
+        return self.tool_observer_fn(self.context);
     }
 
     pub fn from(implementation: anytype) TurnRenderer {
@@ -166,6 +171,12 @@ pub const TurnRenderer = struct {
                 const self: *Implementation = @ptrCast(@alignCast(context));
                 return self.wroteAssistantText();
             }
+
+            fn toolObserver(context: *anyopaque) ?agent.Loop.ToolObserver {
+                if (!@hasDecl(Implementation, "toolObserver")) return null;
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.toolObserver();
+            }
         };
         return .{
             .context = implementation,
@@ -173,6 +184,7 @@ pub const TurnRenderer = struct {
             .close_fn = Adapter.close,
             .check_fn = Adapter.check,
             .wrote_assistant_text_fn = Adapter.wroteAssistantText,
+            .tool_observer_fn = Adapter.toolObserver,
         };
     }
 };
@@ -452,6 +464,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
             .continued = continuing,
             .checkpoint = inputs.checkpoint,
             .observer = observer,
+            .tool_observer = turn_renderer.toolObserver(),
             .usage_observer = inputs.usage_observer,
             .seam_hook = inputs.seam_hook,
             .pre_request_hook = inputs.pre_request_hook,
@@ -1363,10 +1376,12 @@ test "custom turn renderer observes lifecycle and operation errors stay primary"
         }
     };
     const Provider = struct {
+        const Self = @This();
+
         pub fn stream(
             _: std.mem.Allocator,
             _: std.Io,
-            _: *@This(),
+            _: *Self,
             _: ai.Provider.Request,
             sink: ai.Provider.EventSink,
         ) ai.Provider.StreamError!void {

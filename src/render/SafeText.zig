@@ -35,7 +35,13 @@ pub const Sink = struct {
 ///
 /// Input and emitted chunks are borrowed. `feed` consumes input synchronously,
 /// and the sink must consume each output payload before returning.
+pub const UnsafePolicy = enum {
+    escape,
+    substitute,
+};
+
 pub const SafeText = struct {
+    unsafe_policy: UnsafePolicy = .escape,
     control_state: ControlState = .text,
     control_bytes: u8 = 0,
     utf8: text.Utf8Sanitizer = .{},
@@ -47,7 +53,7 @@ pub const SafeText = struct {
     /// Emits any incomplete UTF-8 as replacements and discards an incomplete
     /// terminal control sequence. The decoder is ready for another stream.
     pub fn finish(self: *SafeText, sink: Sink) void {
-        var output: SanitizedOutput = .{ .sink = sink };
+        var output: SanitizedOutput = .{ .sink = sink, .unsafe_policy = self.unsafe_policy };
         self.utf8.finish(SanitizedOutput.emit, &output);
         self.control_state = .text;
         self.control_bytes = 0;
@@ -73,7 +79,7 @@ pub const SafeText = struct {
                     if (byte == 0x1b) {
                         self.control_state = .escape;
                     } else if (byte == '\t' or byte == '\n' or byte >= 0x20 and byte != 0x7f) {
-                        var output: SanitizedOutput = .{ .sink = sink };
+                        var output: SanitizedOutput = .{ .sink = sink, .unsafe_policy = self.unsafe_policy };
                         self.utf8.feed(SanitizedOutput.emit, &output, &.{byte});
                     }
                 },
@@ -139,6 +145,7 @@ pub const SafeText = struct {
 
     const SanitizedOutput = struct {
         sink: Sink,
+        unsafe_policy: UnsafePolicy,
 
         fn emit(output: *SanitizedOutput, bytes: []const u8) void {
             if (bytes.len == 1) {
@@ -147,9 +154,14 @@ pub const SafeText = struct {
             }
             const scalar = decodeScalar(bytes);
             if (text.Utf8.isTerminalUnsafeScalar(scalar)) {
-                var buffer: [12]u8 = undefined;
-                const escaped = std.fmt.bufPrint(&buffer, "\\u{{{x}}}", .{scalar}) catch unreachable;
-                output.sink.emit(escaped);
+                switch (output.unsafe_policy) {
+                    .escape => {
+                        var buffer: [12]u8 = undefined;
+                        const escaped = std.fmt.bufPrint(&buffer, "\\u{{{x}}}", .{scalar}) catch unreachable;
+                        output.sink.emit(escaped);
+                    },
+                    .substitute => output.sink.emit("?"),
+                }
             } else {
                 output.sink.emit(bytes);
             }
@@ -243,6 +255,15 @@ test "finish resolves pending UTF-8 and discards pending control" {
     decoder.feed(output, "z");
     decoder.finish(output);
     try std.testing.expectEqualStrings("x\xef\xbf\xbdyz", sink.written());
+}
+
+test "unsafe scalar policy can substitute for compact previews" {
+    var sink: TestSink = .{};
+    var decoder: SafeText = .{ .unsafe_policy = .substitute };
+    const output: Sink = .from(&sink);
+    decoder.feed(output, "a\xe2\x80\xaeb");
+    decoder.finish(output);
+    try std.testing.expectEqualStrings("a?b", sink.written());
 }
 
 test "unterminated control sequences stop suppressing after the shared bound" {

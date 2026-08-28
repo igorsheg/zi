@@ -1048,6 +1048,14 @@ fn runRawInteractive(
     );
     markdown_renderer.setWidthSource(.from(&markdown_width));
     defer markdown_renderer.deinit();
+    var plain_renderer = render.PlainInteractiveRenderer.init(
+        allocator,
+        inputs_value.stdout,
+        theme,
+        markdown_width.resolve(),
+    );
+    plain_renderer.setWidthSource(.from(&markdown_width));
+    defer plain_renderer.deinit();
     var checkpoint: TerminalCheckpoint = .{ .interrupt = &interrupt };
     var compact_cancellation: CompactCancellation = .{ .interrupt = &interrupt };
     compaction.cancellation = agent.CompactRunner.Cancellation.from(&compact_cancellation);
@@ -1059,9 +1067,10 @@ fn runRawInteractive(
     inputs.generation = Interactive.Generation.from(&interrupt);
     inputs.checkpoint = agent.Loop.Checkpoint.from(&checkpoint);
     inputs.presentation = Interactive.Presentation.from(&presentation);
-    if (markdown_enabled) {
-        inputs.turn_renderer = Interactive.TurnRenderer.from(&markdown_renderer);
-    }
+    inputs.turn_renderer = if (markdown_enabled)
+        Interactive.TurnRenderer.from(&markdown_renderer)
+    else
+        Interactive.TurnRenderer.from(&plain_renderer);
 
     const exit_code = runInteractiveWithFinish(allocator, io, inputs, terminal_owner) catch |run_error| {
         try cleanupRawTerminal(&interrupt);
