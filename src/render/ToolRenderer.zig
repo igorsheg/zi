@@ -1,7 +1,7 @@
 //! Bounded normal-buffer renderer for untrusted tool output.
 //!
 //! The renderer keeps at most one pending display row, one 4096-byte input
-//! line, and four bounded tail rows. Tool output may be arbitrarily large.
+//! line, and hax's 1500-byte circular tail. Tool output may be arbitrarily large.
 
 const std = @import("std");
 const text = @import("../text/root.zig");
@@ -24,6 +24,7 @@ const head_bytes: usize = 3000;
 const head_tail_lines: usize = 4;
 const head_tail_bytes: usize = 1500;
 const tail_lines: usize = 4;
+const tail_ring_bytes: usize = 1500;
 const line_bytes: usize = 4096;
 const gutter_columns: usize = 2;
 
@@ -52,7 +53,14 @@ safe_text: SafeText.SafeText = .{ .unsafe_policy = .substitute },
 line: std.ArrayList(u8) = .empty,
 line_has_content: bool = false,
 pending: ?Row = null,
-tail: std.ArrayList(Row) = .empty,
+tail_ring: [tail_ring_bytes]u8 = undefined,
+tail_write_pos: usize = 0,
+tail_full: bool = false,
+line_tail_bytes: usize = 0,
+suppressed_tail_bytes: usize = 0,
+head_complete: bool = false,
+latest_suppressed: [line_bytes]u8 = undefined,
+latest_suppressed_len: usize = 0,
 rows_added: usize = 0,
 head_lines_emitted: usize = 0,
 head_bytes_emitted: usize = 0,
@@ -82,8 +90,6 @@ pub fn init(
 pub fn deinit(self: *ToolRenderer) void {
     self.line.deinit(self.allocator);
     if (self.pending) |*row| row.deinit(self.allocator);
-    for (self.tail.items) |*row| row.deinit(self.allocator);
-    self.tail.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -95,7 +101,8 @@ pub fn sink(self: *ToolRenderer) ToolContract.DisplaySink {
 pub fn setMode(self: *ToolRenderer, mode: Mode) void {
     std.debug.assert(self.rows_added == 0);
     std.debug.assert(self.line.items.len == 0);
-    std.debug.assert(self.tail.items.len == 0);
+    std.debug.assert(self.tail_write_pos == 0);
+    std.debug.assert(!self.tail_full);
     self.mode = mode;
 }
 
@@ -126,21 +133,7 @@ pub fn finalize(self: *ToolRenderer) Error!void {
         ) catch unreachable;
         self.addRow(marker, .plain);
     } else if (self.mode == .head_tail) {
-        const elided = self.suppressed_lines -| self.tail.items.len;
-        if (elided != 0) {
-            var marker_buffer: [96]u8 = undefined;
-            const marker = std.fmt.bufPrint(
-                &marker_buffer,
-                "... ({d} more line{s}) ...",
-                .{ elided, if (elided == 1) "" else "s" },
-            ) catch unreachable;
-            self.addRow(marker, .plain);
-        }
-        for (self.tail.items) |*row| {
-            self.addOwnedRow(row.*);
-            row.bytes = &.{};
-        }
-        self.tail.clearRetainingCapacity();
+        self.emitTailPreview();
     }
     self.flushPending(true);
     self.flushWriter();
@@ -167,15 +160,103 @@ fn safeOutput(context: *anyopaque, bytes: []const u8) void {
 
 fn consumeSafe(self: *ToolRenderer, bytes: []const u8) error{OutOfMemory}!void {
     for (bytes) |byte| switch (byte) {
-        '\n' => self.finishLine(),
+        '\n' => {
+            self.pushTailByte('\n');
+            self.finishLine();
+        },
         '\t' => {
             if (self.line.items.len <= line_bytes - 4) try self.line.appendSlice(self.allocator, "    ");
+            for ("    ") |space| self.pushTailByte(space);
         },
         else => {
             if (self.line.items.len < line_bytes) try self.line.append(self.allocator, byte);
+            self.pushTailByte(byte);
             if (byte != ' ') self.line_has_content = true;
         },
     };
+}
+
+fn pushTailByte(self: *ToolRenderer, byte: u8) void {
+    if (self.mode != .head_tail) return;
+    self.tail_ring[self.tail_write_pos] = byte;
+    self.tail_write_pos += 1;
+    if (self.tail_write_pos == self.tail_ring.len) {
+        self.tail_write_pos = 0;
+        self.tail_full = true;
+    }
+    self.line_tail_bytes +|= 1;
+    if (self.head_complete) self.suppressed_tail_bytes +|= 1;
+}
+
+fn emitTailPreview(self: *ToolRenderer) void {
+    const ring_len = if (self.tail_full) self.tail_ring.len else self.tail_write_pos;
+    const oldest = if (self.tail_full) self.tail_write_pos else 0;
+    var linearized: [tail_ring_bytes]u8 = undefined;
+    for (0..ring_len) |index| {
+        linearized[index] = self.tail_ring[(oldest + index) % self.tail_ring.len];
+    }
+
+    const suppressed_len = @min(self.suppressed_tail_bytes, ring_len);
+    const suppressed = linearized[ring_len - suppressed_len .. ring_len];
+    var view_start = suppressed.len;
+    if (view_start != 0 and suppressed[view_start - 1] == '\n') view_start -= 1;
+    var current_line_end = view_start;
+    var visible_lines: usize = 0;
+    while (view_start != 0) {
+        view_start -= 1;
+        if (suppressed[view_start] != '\n') continue;
+        const candidate = view_start + 1;
+        if (current_line_end > candidate and
+            !lineIsBlank(suppressed[candidate..current_line_end]))
+        {
+            visible_lines += 1;
+            if (visible_lines == tail_lines) {
+                view_start = candidate;
+                break;
+            }
+        }
+        current_line_end = view_start;
+    }
+    while (view_start < suppressed.len and suppressed[view_start] & 0xc0 == 0x80) {
+        view_start += 1;
+    }
+
+    const Span = struct { start: usize, end: usize };
+    var spans: [tail_lines]Span = undefined;
+    var span_count: usize = 0;
+    var line_start = view_start;
+    var index = view_start;
+    while (index <= suppressed.len) : (index += 1) {
+        if (index < suppressed.len and suppressed[index] != '\n') continue;
+        if (index > line_start and !lineIsBlank(suppressed[line_start..index]) and span_count < spans.len) {
+            spans[span_count] = .{ .start = line_start, .end = index };
+            span_count += 1;
+        }
+        line_start = index + 1;
+    }
+
+    const elided = self.suppressed_lines -| span_count;
+    if (elided != 0) {
+        var marker_buffer: [96]u8 = undefined;
+        const marker = std.fmt.bufPrint(
+            &marker_buffer,
+            "... ({d} more line{s}) ...",
+            .{ elided, if (elided == 1) "" else "s" },
+        ) catch unreachable;
+        self.addRow(marker, .plain);
+    }
+    for (spans[0..span_count], 0..) |span, row| {
+        const bytes = if (row + 1 == span_count and self.latest_suppressed_len != 0)
+            self.latest_suppressed[0..self.latest_suppressed_len]
+        else
+            suppressed[span.start..span.end];
+        self.addRow(bytes, .plain);
+    }
+}
+
+fn lineIsBlank(bytes: []const u8) bool {
+    for (bytes) |byte| if (byte != ' ') return false;
+    return true;
 }
 
 fn finishLine(self: *ToolRenderer) void {
@@ -187,6 +268,7 @@ fn finishLine(self: *ToolRenderer) void {
     }
     self.line.clearRetainingCapacity();
     self.line_has_content = false;
+    self.line_tail_bytes = 0;
 }
 
 fn finishPreviewLine(self: *ToolRenderer, bytes: []const u8) void {
@@ -196,23 +278,17 @@ fn finishPreviewLine(self: *ToolRenderer, bytes: []const u8) void {
         self.addRow(bytes, .plain);
         self.head_lines_emitted += 1;
         self.head_bytes_emitted +|= bytes.len + 1;
+        if (self.head_lines_emitted >= limit_lines or self.head_bytes_emitted >= limit_bytes) {
+            self.head_complete = true;
+        }
         return;
     }
 
     self.suppressed_lines +|= 1;
     if (self.mode != .head_tail) return;
-    const clipped = self.clipRow(bytes) catch {
-        self.allocation_failed = true;
-        return;
-    };
-    if (self.tail.items.len == tail_lines) {
-        var first = self.tail.orderedRemove(0);
-        first.deinit(self.allocator);
-    }
-    self.tail.append(self.allocator, .{ .bytes = clipped, .class = .plain }) catch {
-        self.allocator.free(clipped);
-        self.allocation_failed = true;
-    };
+    const amount = @min(bytes.len, self.latest_suppressed.len);
+    @memcpy(self.latest_suppressed[0..amount], bytes[0..amount]);
+    self.latest_suppressed_len = amount;
 }
 
 fn finishDiffLine(self: *ToolRenderer, bytes: []const u8) void {
@@ -386,6 +462,35 @@ test "head-tail preview retains the newest four rows" {
     try std.testing.expect(std.mem.indexOf(u8, output, "row19") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "12 more lines") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "row10") == null);
+}
+
+test "head-tail suffix is bounded by hax's byte ring" {
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    try input.appendSlice(std.testing.allocator, "h1\nh2\nh3\nh4\nOLD-A-");
+    try input.appendNTimes(std.testing.allocator, 'a', 900);
+    try input.appendSlice(std.testing.allocator, "\nOLD-B-");
+    try input.appendNTimes(std.testing.allocator, 'b', 900);
+    try input.appendSlice(std.testing.allocator, "\nnewest\n");
+
+    const output = try renderOne(.head_tail, input.items, 80);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "OLD-A-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "OLD-B-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "newest") != null);
+}
+
+test "head-tail newest long line replays its display prefix" {
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    try input.appendSlice(std.testing.allocator, "h1\nh2\nh3\nh4\nPREFIX-");
+    try input.appendNTimes(std.testing.allocator, 'x', 2000);
+    try input.appendSlice(std.testing.allocator, "-SUFFIX\n");
+
+    const output = try renderOne(.head_tail, input.items, 80);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "PREFIX-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "SUFFIX") == null);
 }
 
 test "modest head-tail overflow replays without a marker" {
