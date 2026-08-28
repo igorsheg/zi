@@ -751,6 +751,7 @@ pub fn run(
                 display_columns,
                 markdown_enabled,
                 show_reasoning,
+                restored != null,
                 .{
                     .provider = provider_runtime.metadata.display_name,
                     .model = provider_runtime.model,
@@ -992,6 +993,7 @@ fn runRawInteractive(
     display_columns: terminal_module.DisplayColumns.Policy,
     markdown_enabled: bool,
     show_reasoning: bool,
+    resumed: bool,
     banner_fallbacks: RawBannerFallbacks,
     stats: *Stats.Renderer,
     usage: *agent.UsageStats.UsageStats,
@@ -1080,6 +1082,24 @@ fn runRawInteractive(
     plain_renderer.setWidthSource(.from(&markdown_width));
     plain_renderer.setShowReasoning(show_reasoning);
     defer plain_renderer.deinit();
+    if (resumed) {
+        const history_inputs: render.History.Inputs = .{
+            .allocator = allocator,
+            .io = io,
+            .writer = inputs_value.stdout,
+            .theme = theme,
+            .columns = markdown_width.resolve(),
+            .show_reasoning = show_reasoning,
+            .items = inputs_value.session.items(),
+            .tools = inputs_value.tools,
+        };
+        if (markdown_enabled) {
+            try render.History.replayBrief(&markdown_renderer, history_inputs);
+        } else {
+            try render.History.replayBrief(&plain_renderer, history_inputs);
+        }
+        frame.syncExternal(1);
+    }
     var checkpoint: TerminalCheckpoint = .{ .interrupt = &interrupt };
     var compact_cancellation: CompactCancellation = .{ .interrupt = &interrupt };
     compaction.cancellation = agent.CompactRunner.Cancellation.from(&compact_cancellation);

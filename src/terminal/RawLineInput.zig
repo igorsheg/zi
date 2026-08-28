@@ -240,6 +240,33 @@ fn leaveFreshRow(input: *RawLineInput) !void {
     input.screen_rows = 1;
 }
 
+/// Paints one already-committed user message at column zero. The caller owns
+/// surrounding block separation and guarantees no active editor row exists.
+pub fn renderCommitted(
+    writer: *std.Io.Writer,
+    text: []const u8,
+    style_open: []const u8,
+    style_close: []const u8,
+    columns: usize,
+) std.Io.Writer.Error!void {
+    try writer.writeAll(style_open);
+    try writer.writeAll(submission_marker_default);
+    var sink_context: SubmittedPaintSink = .{
+        .writer = writer,
+        .style_open = style_open,
+        .style_close = style_close,
+    };
+    _ = EditLayout.render(text, text.len, .{
+        .prompt_width = submission_body_column,
+        .continuation_column = submission_body_column,
+        .columns = columns,
+    }, sink_context.sink());
+    if (sink_context.failed) return error.WriteFailed;
+    try writer.writeAll(style_close);
+    try writer.writeAll("\x1b[K\r\n");
+    try writer.flush();
+}
+
 fn renderSubmitted(input: *RawLineInput, text: []const u8) !void {
     try input.writer.writeAll(sync_begin);
     errdefer {

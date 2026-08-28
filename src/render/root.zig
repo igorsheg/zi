@@ -1,5 +1,6 @@
 pub const Banner = @import("Banner.zig");
 pub const Frame = @import("Frame.zig");
+pub const History = @import("History.zig");
 pub const MarkdownStreamRenderer = @import("MarkdownStreamRenderer.zig");
 pub const PlainInteractiveRenderer = @import("PlainInteractiveRenderer.zig");
 pub const StreamRenderer = @import("StreamRenderer.zig").StreamRenderer;
@@ -21,4 +22,5 @@ test {
     _ = Theme;
     _ = @import("ToolRenderer.zig");
     _ = @import("ToolPresentation.zig");
+    _ = History;
 }
