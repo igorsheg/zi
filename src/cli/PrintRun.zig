@@ -729,7 +729,7 @@ pub fn run(
             const display_columns = try terminal_module.DisplayColumns.Policy.parse(
                 configured_display_width.value orelse "auto",
             );
-            const theme = try render.Theme.resolve(.{
+            const theme = try resolveTheme(stderr, .{
                 .configured_theme = configured_theme.value orelse "auto",
                 .configured_tint = effective_tint,
                 .no_color = environment.get("NO_COLOR"),
@@ -846,6 +846,24 @@ fn prefetchInteractiveCatalog(
             try stderr.writeByte('\n');
         },
     }
+}
+
+fn resolveTheme(
+    stderr: *std.Io.Writer,
+    inputs: render.Theme.Inputs,
+) std.Io.Writer.Error!render.Theme {
+    const resolution = render.Theme.resolveWithFallback(inputs);
+    if (resolution.unknown_theme) {
+        try stderr.writeAll("zi: warning: unknown theme '");
+        try DiagnosticText.write(stderr, inputs.configured_theme);
+        try stderr.writeAll("' (expected auto, dark, light, ansi, or off)\n");
+    }
+    if (resolution.unknown_tint) {
+        try stderr.writeAll("zi: warning: unknown tint '");
+        try DiagnosticText.write(stderr, inputs.configured_tint);
+        try stderr.writeAll("' (expected teal, violet, rose, or sage)\n");
+    }
+    return resolution.theme;
 }
 
 fn effectiveThemeTint(
@@ -2189,6 +2207,23 @@ test "raw presentation spaces blocks renders policy and suppresses provider erro
         "\n\n\n\x1b[2m0s\x1b[0m\n\n" ++
             "[error: temporary]\n\n" ++
             "\x1b[2m[provider error — enter to retry]\x1b[0m\n\n",
+        output.written(),
+    );
+}
+
+test "invalid theme settings warn safely and recover independently" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const theme = try resolveTheme(&output.writer, .{
+        .configured_theme = "bad\n\x1b",
+        .configured_tint = "worse\u{202e}",
+        .term = "vt100",
+    });
+    try std.testing.expectEqual(render.Theme.Name.ansi, theme.name);
+    try std.testing.expectEqual(render.Theme.Tint.teal, theme.tint);
+    try std.testing.expectEqualStrings(
+        "zi: warning: unknown theme 'bad\\n\\x1b' (expected auto, dark, light, ansi, or off)\n" ++
+            "zi: warning: unknown tint 'worse\\u{202e}' (expected teal, violet, rose, or sage)\n",
         output.written(),
     );
 }

@@ -38,6 +38,12 @@ pub const Error = error{
     UnknownTint,
 };
 
+pub const FallbackResolution = struct {
+    theme: Theme,
+    unknown_theme: bool,
+    unknown_tint: bool,
+};
+
 name: Name,
 tint: Tint,
 accent: Style,
@@ -60,6 +66,26 @@ pub fn resolve(inputs: Inputs) Error!Theme {
     const name = try parseTheme(inputs.configured_theme, inputs);
     const tint = try parseTint(inputs.configured_tint);
     return preset(name, tint);
+}
+
+/// Applies hax's process-startup recovery while preserving strict `resolve`
+/// for callers which validate configuration transactionally.
+pub fn resolveWithFallback(inputs: Inputs) FallbackResolution {
+    var unknown_theme = false;
+    const name = parseTheme(inputs.configured_theme, inputs) catch fallback: {
+        unknown_theme = true;
+        break :fallback autodetect(inputs);
+    };
+    var unknown_tint = false;
+    const tint = parseTint(inputs.configured_tint) catch fallback: {
+        unknown_tint = true;
+        break :fallback .teal;
+    };
+    return .{
+        .theme = preset(name, tint),
+        .unknown_theme = unknown_theme,
+        .unknown_tint = unknown_tint,
+    };
 }
 
 fn parseTheme(value: []const u8, inputs: Inputs) Error!Name {
@@ -476,4 +502,35 @@ test "unknown configured values return validation errors" {
         .configured_theme = "auto",
         .configured_tint = "",
     }));
+}
+
+test "startup fallback recovers theme and tint independently" {
+    const invalid_theme = resolveWithFallback(.{
+        .configured_theme = "solarized",
+        .configured_tint = "rose",
+        .term = "xterm-256color",
+    });
+    try std.testing.expect(invalid_theme.unknown_theme);
+    try std.testing.expect(!invalid_theme.unknown_tint);
+    try std.testing.expectEqual(Name.dark, invalid_theme.theme.name);
+    try std.testing.expectEqual(Tint.rose, invalid_theme.theme.tint);
+
+    const invalid_tint = resolveWithFallback(.{
+        .configured_theme = "light",
+        .configured_tint = "chartreuse",
+    });
+    try std.testing.expect(!invalid_tint.unknown_theme);
+    try std.testing.expect(invalid_tint.unknown_tint);
+    try std.testing.expectEqual(Name.light, invalid_tint.theme.name);
+    try std.testing.expectEqual(Tint.teal, invalid_tint.theme.tint);
+
+    const both = resolveWithFallback(.{
+        .configured_theme = "bad",
+        .configured_tint = "worse",
+        .term = "vt100",
+    });
+    try std.testing.expect(both.unknown_theme);
+    try std.testing.expect(both.unknown_tint);
+    try std.testing.expectEqual(Name.ansi, both.theme.name);
+    try std.testing.expectEqual(Tint.teal, both.theme.tint);
 }
