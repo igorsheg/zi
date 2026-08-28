@@ -714,6 +714,7 @@ pub fn run(
                 break :interactive runInteractiveWithFinish(allocator, io, interactive_inputs, &terminal);
 
             const markdown_enabled = (try config.Settings.getBool(store, allocator, "markdown")).value;
+            const show_reasoning = (try config.Settings.getBool(store, allocator, "show_reasoning")).value;
             var configured_theme = try config.Settings.getString(store, allocator, "theme");
             defer configured_theme.deinit(allocator);
             var configured_tint = try config.Settings.getString(store, allocator, "tint");
@@ -748,6 +749,7 @@ pub fn run(
                 theme,
                 display_columns,
                 markdown_enabled,
+                show_reasoning,
                 .{
                     .provider = provider_runtime.metadata.display_name,
                     .model = provider_runtime.model,
@@ -970,6 +972,7 @@ fn runRawInteractive(
     theme: render.Theme,
     display_columns: terminal_module.DisplayColumns.Policy,
     markdown_enabled: bool,
+    show_reasoning: bool,
     banner_fallbacks: RawBannerFallbacks,
     stats: *Stats.Renderer,
     usage: *agent.UsageStats.UsageStats,
@@ -1047,6 +1050,7 @@ fn runRawInteractive(
         markdown_width.resolve(),
     );
     markdown_renderer.setWidthSource(.from(&markdown_width));
+    markdown_renderer.setShowReasoning(show_reasoning);
     defer markdown_renderer.deinit();
     var plain_renderer = render.PlainInteractiveRenderer.init(
         allocator,
@@ -1055,6 +1059,7 @@ fn runRawInteractive(
         markdown_width.resolve(),
     );
     plain_renderer.setWidthSource(.from(&markdown_width));
+    plain_renderer.setShowReasoning(show_reasoning);
     defer plain_renderer.deinit();
     var checkpoint: TerminalCheckpoint = .{ .interrupt = &interrupt };
     var compact_cancellation: CompactCancellation = .{ .interrupt = &interrupt };

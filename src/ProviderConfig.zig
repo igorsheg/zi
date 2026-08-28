@@ -316,6 +316,7 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
 
     var overrides: Registry.Overrides = .{
         .session_cache_key = if (inputs.session_cache_key) |value| try allocator.dupe(u8, value) else null,
+        .show_reasoning = (try Settings.getBool(inputs.store, allocator, "show_reasoning")).value,
     };
     if (dynamic) {
         const value = definition orelse unreachable;
@@ -1527,7 +1528,10 @@ test "all four adapter plans accept large HTTP durations" {
     const cases = [_]struct { json: []const u8, provider: []const u8 }{
         .{ .json = "{\"provider\":\"llamacpp\",\"model\":\"local\"}", .provider = "llamacpp" },
         .{ .json = "{\"provider\":\"openai\",\"model\":\"gpt\"}", .provider = "openai" },
-        .{ .json = "{\"provider\":\"anthropic\",\"model\":\"claude\"}", .provider = "anthropic" },
+        .{
+            .json = "{\"provider\":\"anthropic\",\"model\":\"claude\",\"show_reasoning\":true}",
+            .provider = "anthropic",
+        },
         .{ .json = "{\"provider\":\"openrouter\",\"model\":\"vendor/model\"}", .provider = "openrouter" },
         .{
             .json = "{\"provider\":\"openai-compatible\",\"model\":\"m\"," ++
@@ -1562,6 +1566,9 @@ test "all four adapter plans accept large HTTP durations" {
         defer result.deinit();
         try std.testing.expectEqualStrings(case.provider, result.resolved.metadata.provider_id);
         try expectHttpPolicy(result.resolved.adapter, 101, maximum_duration_ms, maximum_duration_ms);
+        if (std.mem.eql(u8, case.provider, "anthropic")) {
+            try std.testing.expect(result.resolved.adapter.anthropic_messages.body.show_reasoning);
+        }
         try std.testing.expect(!result.provider_autoselected);
     }
 

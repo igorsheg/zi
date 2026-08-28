@@ -175,6 +175,7 @@ pub const Overrides = struct {
     reasoning_format: ?OpenAiChat.ReasoningFormat = null,
     reasoning_roundtrip: ?ModelMeta.ReasoningRoundtrip = null,
     reasoning_roundtrip_field: ?[]const u8 = null,
+    show_reasoning: bool = false,
     extra_headers: []const Transport.Header = &.{},
     /// Borrowed mock-provider script path. Only valid for the mock descriptor.
     mock_script: ?[]const u8 = null,
@@ -592,6 +593,7 @@ pub fn resolveDescriptor(
                 .privileged_header_policy = privileged_header_policy,
                 .body = .{
                     .thinking_mode = if (std.mem.eql(u8, descriptor.id, "anthropic")) .adaptive else .budget,
+                    .show_reasoning = overrides.show_reasoning,
                     .cache_markers = overrides.cache != .off and
                         (overrides.cache == .on or std.mem.eql(u8, descriptor.id, "anthropic")),
                     .cache_ttl = overrides.cache_ttl,
@@ -1240,7 +1242,7 @@ test "first party adapter plans preserve pinned auth headers and policy" {
         "anthropic",
         "claude",
         .{ .anthropic_key = "anthropic-key" },
-        .{},
+        .{ .show_reasoning = true },
         .{},
         .{},
     );
@@ -1252,6 +1254,7 @@ test "first party adapter plans preserve pinned auth headers and policy" {
         anthropic.adapter.anthropic_messages.body.thinking_mode,
     );
     try std.testing.expect(anthropic.adapter.anthropic_messages.body.cache_markers);
+    try std.testing.expect(anthropic.adapter.anthropic_messages.body.show_reasoning);
 }
 
 test "compatible routing is bounded explicit and never silently misroutes Responses" {

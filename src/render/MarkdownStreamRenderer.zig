@@ -17,6 +17,11 @@ const MarkdownStreamRenderer = @This();
 
 const safe_buffer_bytes: usize = 4096;
 
+const ContentKind = enum {
+    assistant,
+    reasoning,
+};
+
 /// Allocation-free source for the current content width. The implementation is
 /// borrowed for the renderer lifetime and may query terminal geometry.
 pub const WidthSource = struct {
@@ -56,8 +61,14 @@ safe_buffer: [safe_buffer_bytes]u8 = undefined,
 safe_length: usize = 0,
 write_error: ?std.Io.Writer.Error = null,
 render_error: ?Markdown.Error = null,
+show_reasoning: bool = false,
 terminal: bool = false,
 stream_active: bool = false,
+reasoning_active: bool = false,
+reasoning_stream_wrote_text: bool = false,
+reasoning_wrote_text: bool = false,
+separator_after_reasoning: bool = false,
+content_kind: ContentKind = .assistant,
 stream_wrote_text: bool = false,
 wrote_assistant_text: bool = false,
 trailing_newlines: usize = 0,
@@ -90,6 +101,10 @@ pub fn setWidthSource(self: *MarkdownStreamRenderer, source: WidthSource) void {
     self.width_source = source;
 }
 
+pub fn setShowReasoning(self: *MarkdownStreamRenderer, visible: bool) void {
+    self.show_reasoning = visible;
+}
+
 fn resolveWidth(self: *const MarkdownStreamRenderer) usize {
     return if (self.width_source) |source| source.resolve() else self.wrap_width;
 }
@@ -103,6 +118,11 @@ pub fn begin(self: *MarkdownStreamRenderer) !agent.Loop.Observer {
     self.terminal = false;
     self.stream_active = false;
     self.stream_wrote_text = false;
+    self.reasoning_active = false;
+    self.reasoning_stream_wrote_text = false;
+    self.reasoning_wrote_text = false;
+    self.separator_after_reasoning = false;
+    self.content_kind = .assistant;
     self.wrote_assistant_text = false;
     self.trailing_newlines = 0;
     self.answer_started = false;
@@ -125,6 +145,7 @@ pub fn close(self: *MarkdownStreamRenderer, terminal: StreamRenderer.Terminal) !
     _ = terminal;
     if (self.terminal) return;
     self.terminal = true;
+    self.closeReasoning();
     self.closeStream();
     self.tool_presentation.close();
 }
@@ -136,7 +157,7 @@ pub fn check(self: *const MarkdownStreamRenderer) !void {
 }
 
 pub fn wroteAssistantText(self: *const MarkdownStreamRenderer) bool {
-    return self.wrote_assistant_text;
+    return self.wrote_assistant_text or self.reasoning_wrote_text;
 }
 
 pub fn toolObserver(self: *MarkdownStreamRenderer) ?agent.Loop.ToolObserver {
@@ -147,8 +168,12 @@ pub fn beginTool(
     self: *MarkdownStreamRenderer,
     observation: agent.Loop.ToolObservation,
 ) ?tool.Tool.DisplaySink {
+    self.closeReasoning();
     self.tool_presentation.setWidth(self.resolveWidth());
-    if (self.wrote_assistant_text) self.tool_presentation.requireSeparator();
+    if (self.wrote_assistant_text or self.reasoning_wrote_text) {
+        self.tool_presentation.requireSeparator();
+    }
+    self.separator_after_reasoning = false;
     return self.tool_presentation.beginTool(observation);
 }
 
@@ -164,20 +189,35 @@ pub fn emit(self: *MarkdownStreamRenderer, event: ai.StreamEvent.StreamEvent) vo
     if (self.terminal or self.write_error != null or self.render_error != null) return;
     switch (event) {
         .text_delta => |bytes| {
+            self.closeReasoning();
             self.tool_presentation.closeCluster();
             self.feed(bytes);
         },
-        // Tool and opaque-reasoning boundaries end any preceding text item.
-        .tool_call_start, .reasoning_item => self.closeStream(),
+        .reasoning_delta => |maybe_bytes| if (self.show_reasoning) if (maybe_bytes) |bytes| {
+            if (bytes.len != 0) self.feedReasoning(bytes);
+        },
+        // Tool and opaque-reasoning boundaries end any preceding item.
+        .tool_call_start, .reasoning_item => {
+            self.closeReasoning();
+            self.closeStream();
+        },
         // Each provider request is a complete Markdown stream. A retry
         // abandons the partial attempt: hax marks it so the replacement
         // stream does not read as a continuation of the truncated text.
         .retry => {
-            const abandoned_text = self.stream_wrote_text;
+            const abandoned_text = self.stream_wrote_text or self.reasoning_stream_wrote_text;
+            self.closeReasoning();
             self.closeStream();
-            if (abandoned_text) self.write("\x1b[2m[unexpected end]\x1b[0m\n");
+            if (abandoned_text) {
+                if (self.separator_after_reasoning) self.write("\n");
+                self.separator_after_reasoning = false;
+                self.write("\x1b[2m[unexpected end]\x1b[0m\n");
+            }
         },
-        .done, .failure => self.closeStream(),
+        .done, .failure => {
+            self.closeReasoning();
+            self.closeStream();
+        },
         else => {},
     }
 }
@@ -194,8 +234,55 @@ fn markdownOutput(
     }
 }
 
+fn feedReasoning(self: *MarkdownStreamRenderer, bytes: []const u8) void {
+    if (!self.reasoning_active) self.beginReasoning();
+    if (!self.reasoning_active) return;
+    self.safe_text.feed(.{ .context = self, .emit_fn = safeOutput }, bytes);
+    self.flushSafeBuffer();
+    self.flush();
+}
+
+fn beginReasoning(self: *MarkdownStreamRenderer) void {
+    const follows_assistant = self.stream_active and self.stream_wrote_text;
+    self.closeStream();
+    self.tool_presentation.closeCluster();
+    if (follows_assistant or self.separator_after_reasoning) self.write("\n");
+    self.separator_after_reasoning = false;
+    self.reasoning_active = true;
+    self.reasoning_stream_wrote_text = false;
+    self.content_kind = .reasoning;
+    self.safe_text = .{};
+    self.safe_length = 0;
+    self.wrap_width = self.resolveWidth();
+    self.markdown.?.reset(self.wrap_width);
+    self.markdown.?.setStyled(false) catch |err| {
+        self.render_error = err;
+        self.reasoning_active = false;
+        return;
+    };
+    self.write("\x1b[2m\x1b[3m");
+}
+
+fn closeReasoning(self: *MarkdownStreamRenderer) void {
+    if (!self.reasoning_active) return;
+    self.safe_text.finish(.{ .context = self, .emit_fn = safeOutput });
+    self.flushSafeBuffer();
+    if (self.render_error == null) self.markdown.?.finish() catch |err| {
+        self.render_error = err;
+    };
+    self.write("\x1b[0m\n");
+    self.reasoning_active = false;
+    self.reasoning_stream_wrote_text = false;
+    self.separator_after_reasoning = true;
+    self.content_kind = .assistant;
+    self.safe_length = 0;
+    self.flush();
+}
+
 fn ensureStream(self: *MarkdownStreamRenderer) void {
     if (self.stream_active) return;
+    if (self.separator_after_reasoning) self.write("\n");
+    self.separator_after_reasoning = false;
     self.stream_active = true;
     self.stream_wrote_text = false;
     self.trailing_newlines = 0;
@@ -203,7 +290,12 @@ fn ensureStream(self: *MarkdownStreamRenderer) void {
     self.safe_text = .{};
     self.safe_length = 0;
     self.wrap_width = self.resolveWidth();
-    if (self.markdown) |*markdown| markdown.reset(self.wrap_width);
+    if (self.markdown) |*markdown| {
+        markdown.reset(self.wrap_width);
+        markdown.setStyled(true) catch |err| {
+            self.render_error = err;
+        };
+    }
 }
 
 fn feed(self: *MarkdownStreamRenderer, original: []const u8) void {
@@ -275,10 +367,16 @@ fn outputVisible(self: *MarkdownStreamRenderer, bytes: []const u8) void {
     if (bytes.len == 0) return;
     self.flushTrailingNewlines();
     self.write(bytes);
-    if (self.write_error == null) {
-        self.stream_wrote_text = true;
-        self.wrote_assistant_text = true;
-    }
+    if (self.write_error == null) switch (self.content_kind) {
+        .assistant => {
+            self.stream_wrote_text = true;
+            self.wrote_assistant_text = true;
+        },
+        .reasoning => {
+            self.reasoning_stream_wrote_text = true;
+            self.reasoning_wrote_text = true;
+        },
+    };
 }
 
 fn flushTrailingNewlines(self: *MarkdownStreamRenderer) void {
@@ -345,6 +443,68 @@ test "provider boundaries reset Markdown state without closing the user turn" {
     try renderer.check();
 
     try std.testing.expectEqualStrings("\x1b[1mone\x1b[22m\ntwo**\n", output.written());
+}
+
+test "reasoning is hidden by default and visible mode resets before assistant text" {
+    var hidden_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer hidden_output.deinit();
+    var hidden = MarkdownStreamRenderer.init(
+        std.testing.allocator,
+        &hidden_output.writer,
+        try testTheme(),
+        80,
+    );
+    defer hidden.deinit();
+    const hidden_observer = try hidden.begin();
+    hidden_observer.emit(.{ .reasoning_delta = "private" });
+    hidden_observer.emit(.{ .text_delta = "answer" });
+    hidden_observer.emit(.{ .done = .{} });
+    try hidden.close(.complete);
+    try hidden.check();
+    try std.testing.expectEqualStrings("answer\n", hidden_output.written());
+
+    var visible_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer visible_output.deinit();
+    var visible = MarkdownStreamRenderer.init(
+        std.testing.allocator,
+        &visible_output.writer,
+        try testTheme(),
+        80,
+    );
+    defer visible.deinit();
+    visible.setShowReasoning(true);
+    const visible_observer = try visible.begin();
+    visible_observer.emit(.{ .reasoning_delta = "**think**" });
+    visible_observer.emit(.{ .reasoning_item = .{ .opaque_json = "{}" } });
+    visible_observer.emit(.{ .text_delta = "answer" });
+    visible_observer.emit(.{ .reasoning_delta = "after" });
+    visible_observer.emit(.{ .done = .{} });
+    try visible.close(.complete);
+    try visible.check();
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\x1b[3mthink\x1b[0m\n\nanswer\n\n\x1b[2m\x1b[3mafter\x1b[0m\n",
+        visible_output.written(),
+    );
+    try std.testing.expect(visible.wroteAssistantText());
+}
+
+test "visible reasoning sanitizes split input and closes at tool boundaries" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var renderer = MarkdownStreamRenderer.init(std.testing.allocator, &output.writer, try testTheme(), 80);
+    defer renderer.deinit();
+    renderer.setShowReasoning(true);
+    const observer = try renderer.begin();
+    observer.emit(.{ .reasoning_delta = "safe\xe2" });
+    observer.emit(.{ .reasoning_delta = "\x82\xac\xff\x1b[31m" });
+    observer.emit(.{ .tool_call_start = .{ .id = "id", .name = "read" } });
+    observer.emit(.{ .done = .{} });
+    try renderer.close(.complete);
+    try renderer.check();
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\x1b[3msafe€\xef\xbf\xbd\x1b[0m\n",
+        output.written(),
+    );
 }
 
 test "empty and stripped-control streams do not count as assistant text" {

@@ -54,6 +54,12 @@ pub const StreamRenderer = struct {
         }
     }
 
+    /// Ends the current provider item without closing the outer user turn.
+    pub fn boundary(self: *StreamRenderer) void {
+        if (self.terminal) return;
+        self.closeStream();
+    }
+
     /// Close a stream which ended outside the event channel, including an
     /// interrupted `agent.Loop.run`. Repeated closes have no effect.
     pub fn close(self: *StreamRenderer, terminal: Terminal) void {
