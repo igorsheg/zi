@@ -211,6 +211,7 @@ pub fn applyAction(editor: *LineEditor, action: EscapeAction) Outcome {
         .paste_begin => .paste_begin,
         .history_previous => .history_previous,
         .history_next => .history_next,
+        .page_up, .page_down => .none,
     };
 }
 
@@ -347,6 +348,8 @@ pub const EscapeAction = enum {
     paste_begin,
     history_previous,
     history_next,
+    page_up,
+    page_down,
 };
 
 pub const EscapeDecode = struct {
@@ -397,6 +400,8 @@ fn decodeCsi(sequence: []const u8) EscapeAction {
         std.mem.eql(u8, sequence, "4~") or
         std.mem.eql(u8, sequence, "8~")) return .line_end;
     if (std.mem.eql(u8, sequence, "3~")) return .delete_forward;
+    if (std.mem.eql(u8, sequence, "5~")) return .page_up;
+    if (std.mem.eql(u8, sequence, "6~")) return .page_down;
     if (std.mem.eql(u8, sequence, "200~")) return .paste_begin;
     return .none;
 }
