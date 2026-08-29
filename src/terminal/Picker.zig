@@ -138,10 +138,20 @@ const Picker = struct {
             .timeout, .eof => return .cancel,
             .byte => |value| value,
         };
-        var sequence: [65]u8 = undefined;
+        var sequence: [70]u8 = undefined;
         sequence[0] = byte;
         var length: usize = 1;
-        if (byte == '[') {
+        var leader = byte;
+        var stripped: usize = 0;
+        while (leader == 0x1b and stripped < 4 and length < sequence.len) : (stripped += 1) {
+            leader = switch (self.readByte(escape_timeout_ms) catch return .continue_running) {
+                .byte => |next_byte| next_byte,
+                .timeout, .eof => return .continue_running,
+            };
+            sequence[length] = leader;
+            length += 1;
+        }
+        if (leader == '[' or leader == 'O') {
             while (length < sequence.len) {
                 const next = self.readByte(escape_timeout_ms) catch break;
                 const value = switch (next) {
@@ -151,12 +161,6 @@ const Picker = struct {
                 sequence[length] = value;
                 length += 1;
                 if ((value >= 0x40 and value <= 0x7e) or value < 0x20 or value > 0x7e) break;
-            }
-        } else if (byte == 'O') {
-            const next = self.readByte(escape_timeout_ms) catch return .continue_running;
-            if (next == .byte) {
-                sequence[length] = next.byte;
-                length += 1;
             }
         }
         applyAction(&self.core, LineEditor.decodeEscape(sequence[0..length]).action);

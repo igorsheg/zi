@@ -361,49 +361,92 @@ pub const EscapeDecode = struct {
 /// nothing so the caller can wait for more input. Unknown complete sequences are drained.
 pub fn decodeEscape(input: []const u8) EscapeDecode {
     if (input.len == 0) return .{ .action = .none, .consumed = 0 };
-    if (input[0] == '[') {
-        const cap = @min(input.len, 65);
-        var index: usize = 1;
-        while (index < cap) : (index += 1) {
-            const byte = input[index];
-            if (byte >= 0x40 and byte <= 0x7e) {
-                const seq = input[1 .. index + 1];
-                return .{ .action = decodeCsi(seq), .consumed = index + 1 };
-            }
-        }
-        if (input.len >= 65) return .{ .action = .none, .consumed = 65 };
-        return .{ .action = .none, .consumed = 0 };
+    var offset: usize = 0;
+    var meta = false;
+    while (offset < input.len and input[offset] == 0x1b and offset < 4) : (offset += 1) meta = true;
+    if (offset == input.len) return .{ .action = .none, .consumed = 0 };
+    if (input[offset] == 0x1b) return .{ .action = .none, .consumed = offset + 1 };
+    const leader = input[offset];
+    if (leader != '[' and leader != 'O') return .{ .action = .none, .consumed = offset + 1 };
+    const sequence_start = offset + 1;
+    const cap = @min(input.len, sequence_start + 64);
+    var end = sequence_start;
+    while (end < cap) : (end += 1) {
+        const byte = input[end];
+        if (byte < 0x40 or byte > 0x7e) continue;
+        const sequence = input[sequence_start .. end + 1];
+        const action = if (leader == '[') decodeCsi(sequence, meta) else decodeSs3(sequence, meta);
+        return .{ .action = action, .consumed = end + 1 };
     }
-    if (input[0] == 'O') {
-        if (input.len < 2) return .{ .action = .none, .consumed = 0 };
-        const action: EscapeAction = switch (input[1]) {
-            'C' => .move_right,
-            'D' => .move_left,
-            'H' => .line_start,
-            'F' => .line_end,
-            else => .none,
-        };
-        return .{ .action = action, .consumed = 2 };
+    if (input.len >= sequence_start + 64) {
+        return .{ .action = .none, .consumed = sequence_start + 64 };
     }
-    return .{ .action = .none, .consumed = 1 };
+    return .{ .action = .none, .consumed = 0 };
 }
 
-fn decodeCsi(sequence: []const u8) EscapeAction {
-    if (std.mem.eql(u8, sequence, "A")) return .history_previous;
-    if (std.mem.eql(u8, sequence, "B")) return .history_next;
-    if (std.mem.eql(u8, sequence, "C")) return .move_right;
-    if (std.mem.eql(u8, sequence, "D")) return .move_left;
-    if (std.mem.eql(u8, sequence, "H") or
-        std.mem.eql(u8, sequence, "1~") or
-        std.mem.eql(u8, sequence, "7~")) return .line_start;
-    if (std.mem.eql(u8, sequence, "F") or
-        std.mem.eql(u8, sequence, "4~") or
-        std.mem.eql(u8, sequence, "8~")) return .line_end;
-    if (std.mem.eql(u8, sequence, "3~")) return .delete_forward;
-    if (std.mem.eql(u8, sequence, "5~")) return .page_up;
-    if (std.mem.eql(u8, sequence, "6~")) return .page_down;
+fn decodeCsi(sequence: []const u8, meta: bool) EscapeAction {
+    if (sequence.len == 1) {
+        var final = sequence[0];
+        if (final >= 'a' and final <= 'd') final -= 'a' - 'A';
+        return arrowAction(final, meta);
+    }
     if (std.mem.eql(u8, sequence, "200~")) return .paste_begin;
+    const final = sequence[sequence.len - 1];
+    if ((final == '~' or final == '^' or final == '$' or final == '@') and
+        (sequence.len == 2 or (sequence.len >= 4 and sequence[1] == ';')))
+    {
+        return switch (sequence[0]) {
+            '1', '7' => .line_start,
+            '4', '8' => .line_end,
+            '3' => .delete_forward,
+            '5' => .page_up,
+            '6' => .page_down,
+            else => .none,
+        };
+    }
+    if (sequence.len >= 4 and sequence[0] == '1' and sequence[1] == ';') {
+        return arrowAction(final, meta or modifierImpliesWord(parseModifier(sequence)));
+    }
     return .none;
+}
+
+fn decodeSs3(sequence: []const u8, meta: bool) EscapeAction {
+    var final = sequence[sequence.len - 1];
+    var word = modifierImpliesWord(parseModifier(sequence));
+    if (final >= 'a' and final <= 'd') {
+        final -= 'a' - 'A';
+        word = true;
+    }
+    return arrowAction(final, word or meta);
+}
+
+fn arrowAction(final: u8, word: bool) EscapeAction {
+    return switch (final) {
+        'A' => .history_previous,
+        'B' => .history_next,
+        'C' => if (word) .move_word_right else .move_right,
+        'D' => if (word) .move_word_left else .move_left,
+        'H' => .line_start,
+        'F' => .line_end,
+        else => .none,
+    };
+}
+
+fn parseModifier(sequence: []const u8) u16 {
+    if (sequence.len < 3) return 0;
+    const separator = std.mem.lastIndexOfScalar(u8, sequence[0 .. sequence.len - 1], ';') orelse return 0;
+    if (separator + 1 >= sequence.len - 1) return 0;
+    var value: u16 = 0;
+    for (sequence[separator + 1 .. sequence.len - 1]) |byte| {
+        if (byte < '0' or byte > '9') return 0;
+        value = std.math.mul(u16, value, 10) catch return 0;
+        value = std.math.add(u16, value, byte - '0') catch return 0;
+    }
+    return value;
+}
+
+fn modifierImpliesWord(modifier: u16) bool {
+    return modifier >= 1 and (modifier - 1) & 0xe != 0;
 }
 
 pub const PasteCollector = struct {
@@ -597,6 +640,11 @@ test "escape decoder recognizes editing keys and paste begin" {
     try std.testing.expectEqual(EscapeAction.move_left, decodeEscape("[D").action);
     try std.testing.expectEqual(EscapeAction.line_start, decodeEscape("[1~").action);
     try std.testing.expectEqual(EscapeAction.delete_forward, decodeEscape("[3~").action);
+    try std.testing.expectEqual(EscapeAction.page_up, decodeEscape("[5;2^").action);
+    try std.testing.expectEqual(EscapeAction.page_down, decodeEscape("[6~").action);
+    try std.testing.expectEqual(EscapeAction.history_previous, decodeEscape("[a").action);
+    try std.testing.expectEqual(EscapeAction.move_word_left, decodeEscape("O1;5D").action);
+    try std.testing.expectEqual(EscapeAction.history_next, decodeEscape("\x1b\x1b[B").action);
     try std.testing.expectEqual(EscapeAction.paste_begin, decodeEscape("[200~tail").action);
     try std.testing.expectEqual(@as(usize, 0), decodeEscape("[20").consumed);
 }

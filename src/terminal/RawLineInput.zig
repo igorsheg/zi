@@ -360,10 +360,20 @@ fn handleEscape(input: *RawLineInput, editor: *LineEditor) !LineEditor.Outcome {
     const meta_action = metaAction(first);
     if (meta_action != .none) return editor.applyAction(meta_action);
 
-    var sequence: [65]u8 = undefined;
+    var sequence: [70]u8 = undefined;
     sequence[0] = first;
     var len: usize = 1;
-    if (first == '[') {
+    var leader = first;
+    var stripped: usize = 0;
+    while (leader == 0x1b and stripped < 4 and len < sequence.len) : (stripped += 1) {
+        leader = switch (try input.readByte(50)) {
+            .byte => |byte| byte,
+            .timeout, .eof => break,
+        };
+        sequence[len] = leader;
+        len += 1;
+    }
+    if (leader == '[' or leader == 'O') {
         while (len < sequence.len) {
             const byte = switch (try input.readByte(50)) {
                 .byte => |byte| byte,
@@ -372,14 +382,6 @@ fn handleEscape(input: *RawLineInput, editor: *LineEditor) !LineEditor.Outcome {
             sequence[len] = byte;
             len += 1;
             if ((byte >= 0x40 and byte <= 0x7e) or byte < 0x20 or byte > 0x7e) break;
-        }
-    } else if (first == 'O') {
-        switch (try input.readByte(50)) {
-            .byte => |byte| {
-                sequence[len] = byte;
-                len += 1;
-            },
-            .timeout, .eof => {},
         }
     }
 
