@@ -381,7 +381,7 @@ fn handleEscape(input: *RawLineInput, editor: *LineEditor) !LineEditor.Outcome {
             };
             sequence[len] = byte;
             len += 1;
-            if ((byte >= 0x40 and byte <= 0x7e) or byte < 0x20 or byte > 0x7e) break;
+            if ((byte >= 0x40 and byte <= 0x7e) or byte == '$' or byte < 0x20 or byte > 0x7e) break;
         }
     }
 

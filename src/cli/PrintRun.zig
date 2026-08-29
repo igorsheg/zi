@@ -123,16 +123,36 @@ pub fn run(
             const display_columns = try terminal_module.DisplayColumns.Policy.parse(
                 configured_width.value orelse "auto",
             );
+            var configured_picker_theme = try config.Settings.getString(
+                prepared.storeBeforeResume(),
+                allocator,
+                "theme",
+            );
+            defer configured_picker_theme.deinit(allocator);
+            var configured_picker_tint = try config.Settings.getString(
+                prepared.storeBeforeResume(),
+                allocator,
+                "tint",
+            );
+            defer configured_picker_tint.deinit(allocator);
+            const picker_theme = render.Theme.resolveWithFallback(.{
+                .configured_theme = configured_picker_theme.value orelse "auto",
+                .configured_tint = configured_picker_tint.value orelse "teal",
+                .no_color = environment.get("NO_COLOR"),
+                .term = environment.get("TERM"),
+                .colorterm = environment.get("COLORTERM"),
+                .colorfgbg = environment.get("COLORFGBG"),
+            }).theme;
             const stdin_file: std.Io.File = .stdin();
             const stdout_file: std.Io.File = .stdout();
-            const original = try std.posix.tcgetattr(stdin_file.handle);
-            try terminal_module.SignalRestore.install(.{
+            const original = std.posix.tcgetattr(stdin_file.handle) catch return 0;
+            terminal_module.SignalRestore.install(.{
                 .terminal_fd = stdin_file.handle,
                 .output_fd = stdout_file.handle,
                 .saved_termios = original,
                 .terminal_active = true,
                 .interactive_terminal = true,
-            });
+            }) catch return 0;
             var restoration_owned = true;
             defer if (restoration_owned) terminal_module.SignalRestore.restore() catch |err|
                 ignoreTerminalCleanupError(err);
@@ -145,6 +165,12 @@ pub fn run(
                 .entries = candidates.entries(),
                 .now_epoch_seconds = now_epoch_seconds,
                 .display_columns = display_columns,
+                .style = .{
+                    .accent_open = picker_theme.accent.open,
+                    .accent_close = picker_theme.accent.close,
+                    .ok_open = picker_theme.ok.open,
+                    .ok_close = picker_theme.ok.close,
+                },
             });
             try terminal_module.SignalRestore.restore();
             restoration_owned = false;

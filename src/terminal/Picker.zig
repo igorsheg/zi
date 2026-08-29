@@ -160,7 +160,8 @@ const Picker = struct {
                 };
                 sequence[length] = value;
                 length += 1;
-                if ((value >= 0x40 and value <= 0x7e) or value < 0x20 or value > 0x7e) break;
+                if ((value >= 0x40 and value <= 0x7e) or value == '$' or
+                    value < 0x20 or value > 0x7e) break;
             }
         }
         applyAction(&self.core, LineEditor.decodeEscape(sequence[0..length]).action);
@@ -184,6 +185,7 @@ const Picker = struct {
         if (self.painted) try frame.writer.writeByte('\r');
         if (self.title_lines != 0) try renderTitle(&frame, self.options.title.?, self.title_lines);
         try renderSearch(&frame, self);
+        try frame.emit();
         try frame.emit();
         var selected_label_clipped = false;
         if (self.core.match_count == 0) {

@@ -91,8 +91,12 @@ pub fn parse(
         const item_kind = optionalString(object, "kind") orelse continue;
         if (!std.mem.eql(u8, item_kind, "user")) continue;
         if (optionalString(object, "origin")) |origin| {
-            if (std.mem.eql(u8, origin, "compact_seed")) saw_compaction_seed = true;
-            continue;
+            if (std.mem.eql(u8, origin, "compact_seed")) {
+                saw_compaction_seed = true;
+                continue;
+            }
+            if (std.mem.eql(u8, origin, "continuation") or
+                std.mem.eql(u8, origin, "task_note")) continue;
         }
         if (optionalString(object, "text")) |prompt| {
             const flattened = try flatten(allocator, prompt);
@@ -219,6 +223,16 @@ test "label uses opening selection and first typed prompt" {
     try std.testing.expectEqualStrings("work", label.preset.?);
     try std.testing.expectEqualStrings("main", label.git_branch.?);
     try std.testing.expectEqualStrings("subject", label.git_subject.?);
+}
+
+test "unknown user origins remain typed prompts" {
+    var label = try parse(
+        std.testing.allocator,
+        "{\"kind\":\"user\",\"text\":\"kept\",\"origin\":\"future\"}\n",
+        default_prompt_cells,
+    );
+    defer label.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("kept", label.prompt.?);
 }
 
 test "synthetic users are skipped and compaction is the fallback" {

@@ -121,15 +121,15 @@ pub fn moveRight(editor: *LineEditor) void {
 
 pub fn moveWordBack(editor: *LineEditor) void {
     var target = editor.cursor;
-    while (target > 0 and std.ascii.isWhitespace(editor.buffer.items[target - 1])) target -= 1;
-    while (target > 0 and !std.ascii.isWhitespace(editor.buffer.items[target - 1])) target -= 1;
+    while (target > 0 and !isWordByte(editor.buffer.items[target - 1])) target -= 1;
+    while (target > 0 and isWordByte(editor.buffer.items[target - 1])) target -= 1;
     editor.cursor = target;
 }
 
 pub fn moveWordForward(editor: *LineEditor) void {
     var target = editor.cursor;
-    while (target < editor.buffer.items.len and !std.ascii.isWhitespace(editor.buffer.items[target])) target += 1;
-    while (target < editor.buffer.items.len and std.ascii.isWhitespace(editor.buffer.items[target])) target += 1;
+    while (target < editor.buffer.items.len and !isWordByte(editor.buffer.items[target])) target += 1;
+    while (target < editor.buffer.items.len and isWordByte(editor.buffer.items[target])) target += 1;
     editor.cursor = target;
 }
 
@@ -373,7 +373,7 @@ pub fn decodeEscape(input: []const u8) EscapeDecode {
     var end = sequence_start;
     while (end < cap) : (end += 1) {
         const byte = input[end];
-        if (byte < 0x40 or byte > 0x7e) continue;
+        if ((byte < 0x40 or byte > 0x7e) and byte != '$') continue;
         const sequence = input[sequence_start .. end + 1];
         const action = if (leader == '[') decodeCsi(sequence, meta) else decodeSs3(sequence, meta);
         return .{ .action = action, .consumed = end + 1 };
@@ -434,15 +434,25 @@ fn arrowAction(final: u8, word: bool) EscapeAction {
 
 fn parseModifier(sequence: []const u8) u16 {
     if (sequence.len < 3) return 0;
-    const separator = std.mem.lastIndexOfScalar(u8, sequence[0 .. sequence.len - 1], ';') orelse return 0;
+    const separator = std.mem.findScalar(u8, sequence[0 .. sequence.len - 1], ';') orelse return 0;
     if (separator + 1 >= sequence.len - 1) return 0;
+    const parameter_end = std.mem.findScalarPos(
+        u8,
+        sequence[0 .. sequence.len - 1],
+        separator + 1,
+        ';',
+    ) orelse sequence.len - 1;
     var value: u16 = 0;
-    for (sequence[separator + 1 .. sequence.len - 1]) |byte| {
+    for (sequence[separator + 1 .. parameter_end]) |byte| {
         if (byte < '0' or byte > '9') return 0;
         value = std.math.mul(u16, value, 10) catch return 0;
         value = std.math.add(u16, value, byte - '0') catch return 0;
     }
     return value;
+}
+
+fn isWordByte(byte: u8) bool {
+    return byte >= 0x80 or std.ascii.isAlphanumeric(byte);
 }
 
 fn modifierImpliesWord(modifier: u16) bool {
@@ -578,6 +588,18 @@ test "replace shrinks a middle span and supports aliased replacements" {
     try std.testing.expectEqualStrings("acf", editor.bytes());
 }
 
+test "Meta word motion uses alphanumeric boundaries" {
+    var editor = init(std.testing.allocator, false);
+    defer editor.deinit();
+    try editor.setBuffer("foo-bar");
+    editor.moveWordBack();
+    try std.testing.expectEqual(@as(usize, 4), editor.cursor);
+    editor.moveWordBack();
+    try std.testing.expectEqual(@as(usize, 0), editor.cursor);
+    editor.moveWordForward();
+    try std.testing.expectEqual(@as(usize, 3), editor.cursor);
+}
+
 test "UTF-8 motion and deletion tolerate malformed bytes" {
     var editor = init(std.testing.allocator, false);
     defer editor.deinit();
@@ -605,7 +627,7 @@ test "control keys edit lines and enforce empty submit and consecutive ctrl-c" {
     try std.testing.expectEqual(Outcome.submit, try editor.handleByte('\r'));
 }
 
-test "whitespace word actions move and delete in both directions" {
+test "alphanumeric Meta actions and whitespace Ctrl-W remain distinct" {
     var editor = init(std.testing.allocator, false);
     defer editor.deinit();
     try editor.setBuffer("one  two three");
@@ -615,10 +637,13 @@ test "whitespace word actions move and delete in both directions" {
     try std.testing.expectEqual(Outcome.edited, editor.applyAction(.delete_word_back));
     try std.testing.expectEqualStrings("two three", editor.bytes());
     try std.testing.expectEqual(Outcome.edited, editor.applyAction(.delete_word_forward));
-    try std.testing.expectEqualStrings("three", editor.bytes());
+    try std.testing.expectEqualStrings(" three", editor.bytes());
     editor.cursor = 0;
     try std.testing.expectEqual(Outcome.edited, editor.applyAction(.move_word_right));
-    try std.testing.expectEqual(@as(usize, 5), editor.cursor);
+    try std.testing.expectEqual(@as(usize, 6), editor.cursor);
+    try editor.setBuffer("one  two");
+    try std.testing.expectEqual(Outcome.edited, try editor.handleByte(0x17));
+    try std.testing.expectEqualStrings("one  ", editor.bytes());
 }
 
 test "escape actions break incomplete UTF-8 sequences" {
@@ -644,6 +669,10 @@ test "escape decoder recognizes editing keys and paste begin" {
     try std.testing.expectEqual(EscapeAction.page_down, decodeEscape("[6~").action);
     try std.testing.expectEqual(EscapeAction.history_previous, decodeEscape("[a").action);
     try std.testing.expectEqual(EscapeAction.move_word_left, decodeEscape("O1;5D").action);
+    try std.testing.expectEqual(EscapeAction.move_word_left, decodeEscape("[1;5;2D").action);
+    try std.testing.expectEqual(EscapeAction.line_start, decodeEscape("[7$").action);
+    try std.testing.expectEqual(EscapeAction.line_end, decodeEscape("[8$").action);
+    try std.testing.expectEqual(EscapeAction.delete_forward, decodeEscape("[3$").action);
     try std.testing.expectEqual(EscapeAction.history_next, decodeEscape("\x1b\x1b[B").action);
     try std.testing.expectEqual(EscapeAction.paste_begin, decodeEscape("[200~tail").action);
     try std.testing.expectEqual(@as(usize, 0), decodeEscape("[20").consumed);
