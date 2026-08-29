@@ -203,7 +203,9 @@ pub fn emit(self: *MarkdownStreamRenderer, event: ai.StreamEvent.StreamEvent) vo
     if (self.terminal or self.write_error != null or self.render_error != null) return;
     switch (event) {
         .retry => {},
-        else => if (self.spinner) |spinner| spinner.clearRetry(),
+        else => if (self.spinner) |spinner| spinner.finishRetry() catch {
+            if (self.render_error == null) self.render_error = error.OutOfMemory;
+        },
     }
     switch (event) {
         .text_delta => |bytes| {

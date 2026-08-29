@@ -112,7 +112,9 @@ pub fn toolObserver(self: *PlainInteractiveRenderer) ?agent.Loop.ToolObserver {
 pub fn emit(self: *PlainInteractiveRenderer, event: ai.StreamEvent.StreamEvent) void {
     switch (event) {
         .retry => {},
-        else => if (self.spinner) |spinner| spinner.clearRetry(),
+        else => if (self.spinner) |spinner| spinner.finishRetry() catch {
+            self.spinner_allocation_failed = true;
+        },
     }
     switch (event) {
         .reasoning_delta => |maybe_bytes| {
@@ -137,9 +139,10 @@ pub fn emit(self: *PlainInteractiveRenderer, event: ai.StreamEvent.StreamEvent) 
                 self.spinner_allocation_failed = true;
             };
             if (self.spinner) |spinner| spinner.show();
+            const abandoned_text = self.stream.abandonAttempt();
             const abandoned_reasoning = self.reasoning_stream_wrote_text;
             self.closeReasoning();
-            if (abandoned_reasoning) {
+            if (abandoned_text or abandoned_reasoning) {
                 self.consumeReasoningSeparator();
                 self.write("\x1b[2m[unexpected end]\x1b[0m\n");
             }
@@ -287,6 +290,25 @@ test "plain interactive reasoning is optional sanitized and style bounded" {
         output.written(),
     );
     try std.testing.expect(renderer.wroteAssistantText());
+}
+
+test "plain retry marks and separates abandoned assistant text" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const theme = try Theme.resolve(.{ .configured_theme = "ansi", .configured_tint = "teal" });
+    var renderer = init(std.testing.allocator, &output.writer, theme, 80);
+    defer renderer.deinit();
+    const observer = try renderer.begin();
+    observer.emit(.{ .text_delta = "partial" });
+    observer.emit(.{ .retry = .{ .attempt = 1, .maximum_attempts = 3, .delay_ms = 1000 } });
+    observer.emit(.{ .text_delta = "replacement" });
+    observer.emit(.{ .done = .{} });
+    try renderer.close(.complete);
+    try renderer.check();
+    try std.testing.expectEqualStrings(
+        "partial\n\x1b[2m[unexpected end]\x1b[0m\nreplacement\n",
+        output.written(),
+    );
 }
 
 test "plain interactive renderer exposes tool presentation without Markdown" {

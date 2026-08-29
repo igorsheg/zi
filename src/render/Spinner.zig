@@ -195,7 +195,17 @@ pub const Spinner = struct {
             next_attempt,
             maximum_attempts,
         );
-        try self.requestLabel("retry", label);
+        try self.setLabel("retry", label);
+    }
+
+    pub fn finishRetry(self: *Spinner) error{OutOfMemory}!void {
+        self.mutex.lockUncancelable(self.io);
+        const active = self.retry_deadline_ms != 0;
+        self.retry_deadline_ms = 0;
+        self.retry_next_attempt = 0;
+        self.retry_maximum_attempts = 0;
+        self.mutex.unlock(self.io);
+        if (active) try self.setLabel(default_key, default_label);
     }
 
     pub fn clearRetry(self: *Spinner) void {
@@ -424,10 +434,22 @@ pub const Spinner = struct {
                 }
             }
         }
-        const end = cellPrefixEnd(label, budget);
-        self.write(label[0..end]);
+        self.writeClippedLabel(label, budget);
         self.write(reset ++ erase_line);
         self.flush();
+    }
+
+    fn writeClippedLabel(self: *Spinner, label: []const u8, budget: usize) void {
+        if (text.DisplayWidth.visibleWidth(label, budget +| 1) <= budget) {
+            self.write(label);
+            return;
+        }
+        if (budget < 4) {
+            self.write(label[0..cellPrefixEnd(label, budget)]);
+            return;
+        }
+        self.write(label[0..cellPrefixEnd(label, budget - 3)]);
+        self.write("...");
     }
 
     fn drawToolViewLocked(self: *Spinner, glyph: []const u8) void {

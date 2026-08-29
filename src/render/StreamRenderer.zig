@@ -54,6 +54,14 @@ pub const StreamRenderer = struct {
         }
     }
 
+    /// Abandons one retrying provider attempt and reports whether it wrote visible text.
+    pub fn abandonAttempt(self: *StreamRenderer) bool {
+        if (self.terminal) return false;
+        const wrote_text = self.stream_wrote_text;
+        self.closeStream();
+        return wrote_text;
+    }
+
     /// Ends the current provider item without closing the outer user turn.
     pub fn boundary(self: *StreamRenderer) void {
         if (self.terminal) return;
