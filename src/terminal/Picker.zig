@@ -110,8 +110,8 @@ const Picker = struct {
             0x0e => self.core.moveSelection(.next),
             0x10 => self.core.moveSelection(.previous),
             0x1b => return self.processEscape(),
-            0x00...0x1f => {},
             else => {
+                if (byte < 0x20) return .continue_running;
                 var sequence: [4]u8 = undefined;
                 sequence[0] = byte;
                 var length: usize = 1;

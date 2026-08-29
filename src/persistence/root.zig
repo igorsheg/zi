@@ -6,6 +6,7 @@ pub const PrivateFileStore = @import("PrivateFileStore.zig");
 pub const SessionCut = @import("SessionCut.zig");
 pub const SessionFile = @import("SessionFile.zig");
 pub const SessionIndex = @import("SessionIndex.zig");
+pub const SessionLabel = @import("SessionLabel.zig");
 pub const SessionResolver = @import("SessionResolver.zig");
 pub const SessionRetention = @import("SessionRetention.zig");
 
@@ -18,6 +19,7 @@ test {
     _ = SessionCut;
     _ = SessionFile;
     _ = SessionIndex;
+    _ = SessionLabel;
     _ = SessionResolver;
     _ = SessionRetention;
 }

@@ -235,6 +235,7 @@ test "run failure keeps an already written answer before its diagnostic" {
 
 test {
     _ = @import("DiagnosticText.zig");
+    _ = @import("SessionPicker.zig");
 }
 
 test "argument collector retains one bounded overflow witness and stops" {

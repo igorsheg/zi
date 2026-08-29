@@ -24,6 +24,7 @@ const Args = @import("Args.zig");
 const ProcessAdapters = @import("ProcessAdapters.zig");
 const ProcessFacts = @import("ProcessFacts.zig");
 const CodexFiles = @import("CodexFiles.zig");
+const SessionPicker = @import("SessionPicker.zig");
 const SessionStartup = @import("SessionStartup.zig");
 const StartupConfig = @import("StartupConfig.zig");
 const LocalStartup = @import("LocalStartup.zig");
@@ -87,6 +88,9 @@ pub fn run(
     const now_epoch_seconds = ProcessAdapters.wallEpochSeconds(io);
     const resume_cutoff = retentionCutoff(now_epoch_seconds, retention_days);
 
+    if (options.resume_state == .select and
+        (!ProcessAdapters.isTty(io, .stdin()) or !ProcessAdapters.isTty(io, .stdout()))) return 0;
+
     var resolved: ?*SessionStartup.Resolved = null;
     const resolution = try SessionStartup.resolve(.{
         .allocator = allocator,
@@ -102,7 +106,60 @@ pub fn run(
         .not_found => return diagnostic(stderr, "no matching session found"),
         .ambiguous => return diagnostic(stderr, "session id is ambiguous"),
         .id_is_path => return diagnostic(stderr, "--resume expects a session id, not a path"),
-        .requires_picker => return diagnostic(stderr, "interactive session selection is not implemented yet"),
+        .candidates => |candidates| {
+            var candidates_owned = true;
+            defer if (candidates_owned) candidates.deinit();
+            if (candidates.entries().len == 0) {
+                try stdout.writeAll("no past conversations in this directory\n");
+                try stdout.flush();
+                return 0;
+            }
+            var configured_width = try config.Settings.getString(
+                prepared.storeBeforeResume(),
+                allocator,
+                "display_width",
+            );
+            defer configured_width.deinit(allocator);
+            const display_columns = try terminal_module.DisplayColumns.Policy.parse(
+                configured_width.value orelse "auto",
+            );
+            const stdin_file: std.Io.File = .stdin();
+            const stdout_file: std.Io.File = .stdout();
+            const original = try std.posix.tcgetattr(stdin_file.handle);
+            try terminal_module.SignalRestore.install(.{
+                .terminal_fd = stdin_file.handle,
+                .output_fd = stdout_file.handle,
+                .saved_termios = original,
+                .terminal_active = true,
+                .interactive_terminal = true,
+            });
+            var restoration_owned = true;
+            defer if (restoration_owned) terminal_module.SignalRestore.restore() catch |err|
+                ignoreTerminalCleanupError(err);
+            const outcome = try SessionPicker.run(.{
+                .allocator = allocator,
+                .io = io,
+                .stdin = stdin_file,
+                .stdout = stdout_file,
+                .writer = stdout,
+                .entries = candidates.entries(),
+                .now_epoch_seconds = now_epoch_seconds,
+                .display_columns = display_columns,
+            });
+            try terminal_module.SignalRestore.restore();
+            restoration_owned = false;
+            switch (outcome) {
+                .selected => |selected_index| {
+                    resolved = try candidates.resolve(
+                        io,
+                        SessionStartup.Toucher.standard,
+                        selected_index,
+                    );
+                    candidates_owned = false;
+                },
+                .canceled, .empty => return 0,
+            }
+        },
     }
     defer if (resolved) |value| value.deinit();
     var retention: ?*SessionRetentionService.Owner = null;

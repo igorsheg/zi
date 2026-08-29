@@ -97,13 +97,47 @@ pub const Resolved = struct {
     }
 };
 
+pub const Candidates = struct {
+    allocator: std.mem.Allocator,
+    index: persistence.SessionIndex.Index,
+
+    pub fn deinit(self: *Candidates) void { // ziglint-ignore: Z030
+        const allocator = self.allocator;
+        self.index.deinit(allocator);
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
+    pub fn entries(self: *const Candidates) []const persistence.SessionIndex.Entry {
+        return self.index.entries;
+    }
+
+    pub fn resolve(
+        self: *Candidates,
+        io: std.Io,
+        toucher: Toucher,
+        selected_index: usize,
+    ) error{OutOfMemory}!*Resolved {
+        std.debug.assert(selected_index < self.index.entries.len);
+        const owner = self.allocator.create(Resolved) catch return error.OutOfMemory;
+        toucher.touch(io, self.index.entries[selected_index].path) catch {}; // ziglint-ignore: Z026
+        owner.* = .{
+            .allocator = self.allocator,
+            .index = self.index,
+            .selected_index = selected_index,
+        };
+        self.allocator.destroy(self);
+        return owner;
+    }
+};
+
 pub const ResolveResult = union(enum) {
     absent,
     found: *Resolved,
+    candidates: *Candidates,
     not_found,
     ambiguous,
     id_is_path,
-    requires_picker,
 };
 
 /// Resolves only explicit resume requests. `.absent` performs no filesystem
@@ -112,7 +146,23 @@ pub const ResolveResult = union(enum) {
 pub fn resolve(inputs: ResolveInputs) ResolveError!ResolveResult {
     const selector: persistence.SessionResolver.Selector = switch (inputs.resume_state) {
         .absent => return .absent,
-        .select => return .requires_picker,
+        .select => {
+            const owner = inputs.allocator.create(Candidates) catch return error.OutOfMemory;
+            errdefer inputs.allocator.destroy(owner);
+            const index = if (inputs.state_root) |state_root|
+                try persistence.SessionIndex.list(
+                    inputs.allocator,
+                    inputs.io,
+                    state_root,
+                    inputs.cwd,
+                    inputs.cutoff_epoch_seconds,
+                    inputs.limits,
+                )
+            else
+                persistence.SessionIndex.Index{ .entries = &.{}, .recovery = .{} };
+            owner.* = .{ .allocator = inputs.allocator, .index = index };
+            return .{ .candidates = owner };
+        },
         .latest => .latest,
         .id => |id| id_selector: {
             // hax is Unix-only: a slash means a path was supplied where an ID
@@ -397,7 +447,7 @@ test {
     _ = SessionStartup;
 }
 
-test "absent and picker resolution do not need a state root" {
+test "absent and picker candidates do not need a state root" {
     const base: ResolveInputs = .{
         .allocator = std.testing.allocator,
         .io = std.testing.io,
@@ -409,7 +459,9 @@ test "absent and picker resolution do not need a state root" {
     try std.testing.expect((try resolve(base)) == .absent);
     var picker = base;
     picker.resume_state = .select;
-    try std.testing.expect((try resolve(picker)) == .requires_picker);
+    const picker_result = try resolve(picker);
+    defer picker_result.candidates.deinit();
+    try std.testing.expectEqual(@as(usize, 0), picker_result.candidates.entries().len);
     var latest = base;
     latest.resume_state = .latest;
     try std.testing.expect((try resolve(latest)) == .not_found);
@@ -481,6 +533,30 @@ fn materializeTestSession(
     };
     try log_value.appendSnapshot(0, &item);
     return allocator.dupe(u8, log_value.path());
+}
+
+test "picker candidates transfer the accepted index into resolved" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const path = try materializeTestSession(allocator, io, root, "/work", test_uuid, "picked");
+    defer allocator.free(path);
+    const result = try resolve(.{
+        .allocator = allocator,
+        .io = io,
+        .state_root = root,
+        .cwd = "/work",
+        .resume_state = .select,
+        .cutoff_epoch_seconds = 0,
+    });
+    const candidates = result.candidates;
+    try std.testing.expectEqual(@as(usize, 1), candidates.entries().len);
+    const selected = try candidates.resolve(io, .standard, 0);
+    defer selected.deinit();
+    try std.testing.expectEqualStrings(path, selected.path());
 }
 
 test "resolve is cwd isolated and accepts an exact or unique prefix" {
