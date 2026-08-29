@@ -5,6 +5,7 @@ const Theme = @import("Theme.zig");
 const frame_interval_ms: u64 = 80;
 const label_settle_ms: i64 = 2000;
 const label_show_grace_ms: i64 = 300;
+const timer_minimum_ms: i64 = 30_000;
 const default_label = "working...";
 const default_key = "working";
 const sync_begin = "\x1b[?2026h";
@@ -84,6 +85,10 @@ pub const Spinner = struct {
     pending_key: ?[]u8 = null,
     pending_since_ms: i64 = 0,
     contradicted_since_ms: i64 = 0,
+    timer_started_at_ms: i64 = 0,
+    retry_deadline_ms: i64 = 0,
+    retry_next_attempt: u16 = 0,
+    retry_maximum_attempts: u16 = 0,
 
     parked_rows: usize = 0,
     origin_col: usize = 0,
@@ -158,6 +163,49 @@ pub const Spinner = struct {
         self.requestLabelShowLocked(if (cursor_col > 0) 2 else 1, cursor_col);
     }
 
+    pub fn setTimerNow(self: *Spinner) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.timer_started_at_ms = self.nowMs();
+    }
+
+    pub fn clearTimer(self: *Spinner) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.timer_started_at_ms = 0;
+    }
+
+    pub fn setRetry(
+        self: *Spinner,
+        delay_ms: u64,
+        attempt: u16,
+        maximum_attempts: u16,
+    ) error{OutOfMemory}!void {
+        const next_attempt = attempt +| 1;
+        self.mutex.lockUncancelable(self.io);
+        const bounded_delay: i64 = @intCast(@min(delay_ms, std.math.maxInt(i64)));
+        self.retry_deadline_ms = std.math.add(i64, self.nowMs(), bounded_delay) catch std.math.maxInt(i64);
+        self.retry_next_attempt = next_attempt;
+        self.retry_maximum_attempts = maximum_attempts;
+        self.mutex.unlock(self.io);
+        var label_buffer: [96]u8 = undefined;
+        const label = formatRetryLabel(
+            &label_buffer,
+            delay_ms,
+            next_attempt,
+            maximum_attempts,
+        );
+        try self.requestLabel("retry", label);
+    }
+
+    pub fn clearRetry(self: *Spinner) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.retry_deadline_ms = 0;
+        self.retry_next_attempt = 0;
+        self.retry_maximum_attempts = 0;
+    }
+
     pub fn hide(self: *Spinner) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -205,7 +253,8 @@ pub const Spinner = struct {
         const requested_key = if (key.len == 0) default_key else key;
         const requested_label = if (label.len == 0) default_label else label;
         self.mutex.lockUncancelable(self.io);
-        const unchanged = (std.mem.eql(u8, self.displayed_key, requested_key) and
+        const unchanged = (self.pending_key == null and
+            std.mem.eql(u8, self.displayed_key, requested_key) and
             std.mem.eql(u8, self.displayed_label, requested_label)) or
             (self.pending_key != null and self.pending_label != null and
                 std.mem.eql(u8, self.pending_key.?, requested_key) and
@@ -348,12 +397,35 @@ pub const Spinner = struct {
 
     fn drawLabelLocked(self: *Spinner, glyph: []const u8) void {
         const terminal_columns = self.width_source.resolve();
-        const budget = terminal_columns -| 3;
-        const end = cellPrefixEnd(self.displayed_label, budget);
+        var budget = terminal_columns -| 3;
+        var retry_buffer: [96]u8 = undefined;
+        const label = if (self.retry_deadline_ms != 0 and std.mem.eql(u8, self.displayed_key, "retry"))
+            formatRetryLabel(
+                &retry_buffer,
+                @intCast(@max(1, self.retry_deadline_ms - self.nowMs())),
+                self.retry_next_attempt,
+                self.retry_maximum_attempts,
+            )
+        else
+            self.displayed_label;
         self.write("\r\x1b[2m");
         self.write(glyph);
         self.write(" ");
-        self.write(self.displayed_label[0..end]);
+        if (self.timer_started_at_ms != 0) {
+            const elapsed_ms = self.nowMs() - self.timer_started_at_ms;
+            if (elapsed_ms >= timer_minimum_ms) {
+                var duration_buffer: [32]u8 = undefined;
+                const duration = formatDurationSteady(&duration_buffer, elapsed_ms);
+                const prefix_cells = duration.len + 3;
+                if (prefix_cells + text.DisplayWidth.visibleWidth(label, budget) <= budget) {
+                    self.write(duration);
+                    self.write(" · ");
+                    budget -|= prefix_cells;
+                }
+            }
+        }
+        const end = cellPrefixEnd(label, budget);
+        self.write(label[0..end]);
         self.write(reset ++ erase_line);
         self.flush();
     }
@@ -528,6 +600,30 @@ pub fn buildToolFrame(
     try writer.writeAll(reset ++ sync_end);
 }
 
+fn formatRetryLabel(
+    buffer: []u8,
+    remaining_ms: u64,
+    next_attempt: u16,
+    maximum_attempts: u16,
+) []const u8 {
+    const seconds = @max((remaining_ms +| 999) / 1000, 1);
+    return std.fmt.bufPrint(
+        buffer,
+        "retrying in {d}s (attempt {d}/{d})...",
+        .{ seconds, next_attempt, maximum_attempts },
+    ) catch "retrying...";
+}
+
+fn formatDurationSteady(buffer: []u8, duration_ms: i64) []const u8 {
+    const positive_ms: u64 = @intCast(@max(duration_ms, 0));
+    const seconds = positive_ms / 1000 + @intFromBool(positive_ms % 1000 >= 500);
+    if (seconds < 60) return std.fmt.bufPrint(buffer, "{d}s", .{seconds}) catch "";
+    if (seconds < 3600) {
+        return std.fmt.bufPrint(buffer, "{d}m {d:0>2}s", .{ seconds / 60, seconds % 60 }) catch "";
+    }
+    return std.fmt.bufPrint(buffer, "{d}h {d:0>2}m", .{ seconds / 3600, seconds % 3600 / 60 }) catch "";
+}
+
 fn physicalRows(widths: []const usize, columns: usize) usize {
     var rows: usize = 0;
     const safe_columns = @max(1, columns);
@@ -545,6 +641,17 @@ fn cellPrefixEnd(bytes: []const u8, maximum_cells: usize) usize {
         cells += glyph.width;
     }
     return end;
+}
+
+test "spinner duration and retry labels match hax rounding" {
+    var buffer: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("30s", formatDurationSteady(&buffer, 30_499));
+    try std.testing.expectEqualStrings("1m 00s", formatDurationSteady(&buffer, 59_500));
+    try std.testing.expectEqualStrings("1h 01m", formatDurationSteady(&buffer, 3_660_000));
+    try std.testing.expectEqualStrings(
+        "retrying in 2s (attempt 2/5)...",
+        formatRetryLabel(&buffer, 1001, 2, 5),
+    );
 }
 
 test "tool frame paints rows and accounts for previous reflow" {

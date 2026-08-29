@@ -79,6 +79,7 @@ pub fn begin(self: *PlainInteractiveRenderer) !agent.Loop.Observer {
     self.write_error = null;
     self.spinner_allocation_failed = false;
     if (self.spinner) |spinner| {
+        spinner.clearRetry();
         try spinner.setLabel("working", "working...");
         spinner.show();
     }
@@ -110,6 +111,10 @@ pub fn toolObserver(self: *PlainInteractiveRenderer) ?agent.Loop.ToolObserver {
 
 pub fn emit(self: *PlainInteractiveRenderer, event: ai.StreamEvent.StreamEvent) void {
     switch (event) {
+        .retry => {},
+        else => if (self.spinner) |spinner| spinner.clearRetry(),
+    }
+    switch (event) {
         .reasoning_delta => |maybe_bytes| {
             self.requestSpinnerLabel("thinking", "thinking...");
             if (self.show_reasoning) if (maybe_bytes) |bytes| {
@@ -124,14 +129,13 @@ pub fn emit(self: *PlainInteractiveRenderer, event: ai.StreamEvent.StreamEvent) 
             self.stream.emit(event);
         },
         .retry => |retry| {
-            var label_buffer: [96]u8 = undefined;
-            const seconds = (retry.delay_ms +| 999) / 1000;
-            const label = std.fmt.bufPrint(
-                &label_buffer,
-                "retrying in {d}s (attempt {d}/{d})...",
-                .{ seconds, retry.attempt, retry.maximum_attempts },
-            ) catch "retrying...";
-            self.requestSpinnerLabel("retry", label);
+            if (self.spinner) |spinner| spinner.setRetry(
+                retry.delay_ms,
+                retry.attempt,
+                retry.maximum_attempts,
+            ) catch {
+                self.spinner_allocation_failed = true;
+            };
             if (self.spinner) |spinner| spinner.show();
             const abandoned_reasoning = self.reasoning_stream_wrote_text;
             self.closeReasoning();

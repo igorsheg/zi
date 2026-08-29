@@ -136,6 +136,7 @@ pub fn begin(self: *MarkdownStreamRenderer) !agent.Loop.Observer {
     self.wrap_width = self.resolveWidth();
     self.tool_presentation.resetTurn(self.wrap_width);
     if (self.spinner) |spinner| {
+        spinner.clearRetry();
         try spinner.setLabel("working", "working...");
         spinner.show();
     }
@@ -201,6 +202,10 @@ pub fn endTool(
 pub fn emit(self: *MarkdownStreamRenderer, event: ai.StreamEvent.StreamEvent) void {
     if (self.terminal or self.write_error != null or self.render_error != null) return;
     switch (event) {
+        .retry => {},
+        else => if (self.spinner) |spinner| spinner.clearRetry(),
+    }
+    switch (event) {
         .text_delta => |bytes| {
             self.closeReasoning();
             self.tool_presentation.closeCluster();
@@ -231,14 +236,13 @@ pub fn emit(self: *MarkdownStreamRenderer, event: ai.StreamEvent.StreamEvent) vo
         // abandons the partial attempt: hax marks it so the replacement
         // stream does not read as a continuation of the truncated text.
         .retry => |retry| {
-            var label_buffer: [96]u8 = undefined;
-            const seconds = (retry.delay_ms +| 999) / 1000;
-            const label = std.fmt.bufPrint(
-                &label_buffer,
-                "retrying in {d}s (attempt {d}/{d})...",
-                .{ seconds, retry.attempt, retry.maximum_attempts },
-            ) catch "retrying...";
-            self.requestSpinnerLabel("retry", label);
+            if (self.spinner) |spinner| spinner.setRetry(
+                retry.delay_ms,
+                retry.attempt,
+                retry.maximum_attempts,
+            ) catch {
+                if (self.render_error == null) self.render_error = error.OutOfMemory;
+            };
             if (self.spinner) |spinner| spinner.show();
             const abandoned_text = self.stream_wrote_text or self.reasoning_stream_wrote_text;
             self.closeReasoning();

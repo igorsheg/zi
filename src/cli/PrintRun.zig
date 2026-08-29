@@ -981,6 +981,7 @@ const RawPresentation = struct {
     usage: *agent.UsageStats.UsageStats,
     catalog_hook: ?*CatalogHook,
     stdout_fd: std.posix.fd_t,
+    spinner: ?*render.Spinner.Spinner = null,
 
     pub fn beforePrompt(self: *RawPresentation, reason: Interactive.ResumeReason) !void {
         try self.frame.openBlock();
@@ -1000,12 +1001,14 @@ const RawPresentation = struct {
     }
 
     pub fn beforeGeneration(self: *RawPresentation) !void {
+        if (self.spinner) |spinner| spinner.setTimerNow();
         self.frame.syncExternal(1);
         try self.frame.openBlock();
         try self.frame.flush();
     }
 
     pub fn afterTurn(self: *RawPresentation, summary: Interactive.TurnSummary) !void {
+        if (self.spinner) |spinner| spinner.clearTimer();
         if (summary.wrote_assistant_text) self.frame.syncExternal(1);
         if (self.catalog_hook) |hook| {
             const maximum_wait_ms: u64 = if (self.usage.has_unpriced) 5_000 else 0;
@@ -1173,9 +1176,11 @@ fn runRawInteractive(
         theme,
         .from(&spinner_width),
     );
+    presentation.spinner = spinner;
     markdown_renderer.setSpinner(spinner);
     plain_renderer.setSpinner(spinner);
     defer {
+        presentation.spinner = null;
         markdown_renderer.setSpinner(null);
         plain_renderer.setSpinner(null);
         spinner.destroy();
