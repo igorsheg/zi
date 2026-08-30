@@ -4,6 +4,7 @@ pub const CookedLineInput = @import("CookedLineInput.zig");
 pub const DisplayColumns = @import("DisplayColumns.zig");
 pub const GenerationInterrupt = @import("GenerationInterrupt.zig");
 pub const Picker = @import("Picker.zig");
+pub const PromptHistory = @import("PromptHistory.zig");
 pub const RawLineInput = @import("RawLineInput.zig");
 pub const SignalRestore = @import("SignalRestore.zig");
 pub const Size = @import("Size.zig");
@@ -18,6 +19,7 @@ test {
     _ = DisplayColumns;
     _ = GenerationInterrupt;
     _ = Picker;
+    _ = PromptHistory;
     _ = RawLineInput;
     _ = SignalRestore;
     _ = Size;

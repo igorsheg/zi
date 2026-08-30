@@ -110,6 +110,43 @@ pub const PromptInput = struct {
     }
 };
 
+pub const RecallKind = enum {
+    session,
+    persistent,
+};
+
+/// Synchronous prompt-recall admission. Submitted bytes are borrowed only for
+/// the call; implementations copy anything they retain.
+pub const PromptRecall = struct {
+    context: *anyopaque,
+    admit_fn: *const fn (*anyopaque, []const u8, RecallKind) anyerror!void,
+
+    pub fn admit(self: PromptRecall, line: []const u8, kind: RecallKind) !void {
+        return self.admit_fn(self.context, line, kind);
+    }
+
+    pub fn from(implementation: anytype) PromptRecall {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one or
+            pointer_info.pointer.is_const)
+        {
+            @compileError("PromptRecall.from expects a mutable single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn admit(context: *anyopaque, line: []const u8, kind: RecallKind) anyerror!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return switch (kind) {
+                    .session => self.admitSession(line),
+                    .persistent => self.admitPersistent(line),
+                };
+            }
+        };
+        return .{ .context = implementation, .admit_fn = Adapter.admit };
+    }
+};
+
 /// Erased synchronous renderer for one outer user turn.
 ///
 /// The implementation and observer returned by `begin` are borrowed through
@@ -333,6 +370,7 @@ pub const Inputs = struct {
     image_input_source: ?agent.ImageInputSource.ImageInputSource = null,
     reader: *std.Io.Reader,
     prompt_input: ?PromptInput = null,
+    prompt_recall: ?PromptRecall = null,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     show_prompt: bool,
@@ -424,6 +462,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
                     continue;
                 },
             };
+            if (inputs.prompt_recall) |recall| try recall.admit(submitted, .persistent);
             try inputs.session.addUser(sanitized.?);
             if (inputs.seam_hook) |seam| try seam.call(inputs.session, .prompt, false);
         }
@@ -838,17 +877,34 @@ test "empty submit resumes a failed turn without adding another user message" {
     try std.testing.expectEqualStrings("resumed\n", stdout.written());
 }
 
-test "submitted input is UTF-8 and NUL sanitized before session storage" {
+test "submitted input is recalled exactly before sanitized session storage" {
+    const Recall = struct {
+        const Self = @This();
+
+        called: bool = false,
+
+        pub fn admitSession(_: *Self, _: []const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+
+        pub fn admitPersistent(self: *Self, line: []const u8) !void {
+            try std.testing.expectEqualSlices(u8, &.{ 'a', 0, 0xff, 'b' }, line);
+            self.called = true;
+        }
+    };
     const Provider = struct {
         const Self = @This();
+
+        recall: *const Recall,
 
         pub fn stream(
             _: std.mem.Allocator,
             _: std.Io,
-            _: *Self,
+            self: *Self,
             request: ai.Provider.Request,
             sink: ai.Provider.EventSink,
         ) ai.Provider.StreamError!void {
+            if (!self.recall.called) return error.InvalidRequest;
             const expected = "a" ++ "\xef\xbf\xbd" ** 2 ++ "b";
             const user = request.context.items[1].user_message.text;
             if (!std.mem.eql(u8, expected, user)) return error.InvalidRequest;
@@ -856,7 +912,8 @@ test "submitted input is UTF-8 and NUL sanitized before session storage" {
         }
     };
 
-    var provider: Provider = .{};
+    var recall: Recall = .{};
+    var provider: Provider = .{ .recall = &recall };
     var session = try agent.Session.Session.init(std.testing.allocator, .{});
     defer session.deinit();
     const bytes = [_]u8{ 'a', 0, 0xff, 'b', '\n' };
@@ -872,10 +929,12 @@ test "submitted input is UTF-8 and NUL sanitized before session storage" {
         .model = "model",
         .system_prompt = "",
         .reader = &reader,
+        .prompt_recall = PromptRecall.from(&recall),
         .stdout = &stdout.writer,
         .stderr = &stderr.writer,
         .show_prompt = false,
     });
+    try std.testing.expect(recall.called);
 }
 
 test "configured turn bound pauses and empty submit continues the tool tail" {

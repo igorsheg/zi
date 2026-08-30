@@ -827,6 +827,11 @@ pub fn run(
                 stdin_terminal_file,
                 stdout_terminal_file,
                 interactive_inputs,
+                .{
+                    .state_root = paths.state_root,
+                    .writable = !no_session,
+                    .nonce_source = random.nonceSource(),
+                },
                 http,
                 &compaction,
                 &terminal,
@@ -960,6 +965,53 @@ fn effectiveThemeTint(
     return nonEmpty(preset) orelse nonEmpty(configured) orelse "teal";
 }
 
+const PromptRecallStartup = struct {
+    state_root: ?[]const u8,
+    writable: bool,
+    nonce_source: persistence.PrivateFileStore.NonceSource,
+};
+
+comptime {
+    if (persistence.PromptHistoryFile.compact_after_records !=
+        3 * terminal_module.PromptHistory.maximum_entries)
+    {
+        @compileError("prompt history persistence and retention limits disagree");
+    }
+}
+
+const HistoryEntriesAdapter = struct {
+    history: *terminal_module.PromptHistory,
+
+    pub fn seed(self: *HistoryEntriesAdapter, entry_bytes: []const u8) error{OutOfMemory}!void {
+        return self.history.seed(entry_bytes);
+    }
+
+    pub fn count(self: *HistoryEntriesAdapter) usize {
+        return self.history.count();
+    }
+
+    pub fn entry(self: *HistoryEntriesAdapter, index: usize) ?[]const u8 {
+        return self.history.entry(index);
+    }
+};
+
+const HistoryAppenderAdapter = struct {
+    owner: *persistence.PromptHistoryFile.Owner,
+
+    pub fn append(
+        self: *HistoryAppenderAdapter,
+        allocator: std.mem.Allocator,
+        entry: []const u8,
+    ) error{OutOfMemory}!terminal_module.PromptHistory.AppendOutcome {
+        const outcome = try self.owner.append(allocator, entry);
+        return switch (outcome) {
+            .written => .written,
+            .too_large => .too_large,
+            .unavailable => .unavailable,
+        };
+    }
+};
+
 const RawBannerFallbacks = struct {
     provider: ?[]const u8,
     model: ?[]const u8,
@@ -1080,6 +1132,7 @@ fn runRawInteractive(
     stdin_file: std.Io.File,
     stdout_file: std.Io.File,
     inputs_value: Interactive.Inputs,
+    prompt_recall_startup: PromptRecallStartup,
     http: *ai.HttpTransport.Runtime,
     compaction: *AutoCompact,
     terminal_owner: *Terminal,
@@ -1093,6 +1146,36 @@ fn runRawInteractive(
     usage: *agent.UsageStats.UsageStats,
     catalog_hook: ?*CatalogHook,
 ) !u8 {
+    var history = terminal_module.PromptHistory.init(allocator);
+    var history_file_owner: ?persistence.PromptHistoryFile.Owner = null;
+    defer {
+        history.setAppender(null);
+        history.deinit();
+        if (history_file_owner) |*owner| owner.deinit();
+    }
+
+    var entries_adapter: HistoryEntriesAdapter = .{ .history = &history };
+    if (prompt_recall_startup.state_root) |state_root| {
+        const history_open = try persistence.PromptHistoryFile.open(
+            allocator,
+            io,
+            state_root,
+            if (prompt_recall_startup.writable) .writable else .read_only,
+            persistence.PromptHistoryFile.Entries.from(&entries_adapter),
+            prompt_recall_startup.nonce_source,
+        );
+        switch (history_open) {
+            .unavailable, .read_only => {},
+            .writable => |owner| history_file_owner = owner,
+        }
+    }
+
+    var appender_adapter: HistoryAppenderAdapter = undefined;
+    if (history_file_owner) |*owner| {
+        appender_adapter = .{ .owner = owner };
+        history.setAppender(terminal_module.PromptHistory.Appender.from(&appender_adapter));
+    }
+
     const original = try std.posix.tcgetattr(stdin_file.handle);
     try terminal_module.SignalRestore.install(.{
         .terminal_fd = stdin_file.handle,
@@ -1143,6 +1226,7 @@ fn runRawInteractive(
             .submission_style_open = theme.accent.open,
             .submission_style_close = theme.accent.close,
             .display_columns = display_columns,
+            .history = &history,
         },
     );
     var presentation: RawPresentation = .{
@@ -1218,6 +1302,7 @@ fn runRawInteractive(
 
     var inputs = inputs_value;
     inputs.prompt_input = Interactive.PromptInput.from(&raw_input);
+    inputs.prompt_recall = Interactive.PromptRecall.from(&raw_input);
     inputs.show_prompt = false;
     inputs.generation = Interactive.Generation.from(&interrupt);
     inputs.checkpoint = agent.Loop.Checkpoint.from(&checkpoint);

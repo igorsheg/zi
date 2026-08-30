@@ -186,6 +186,8 @@ pub fn handleByte(editor: *LineEditor, byte: u8) Error!Outcome {
         0x0a => editor.insertAndReport("\n"),
         0x0b => editor.killAndReport(.line_end),
         0x0d => if (editor.buffer.items.len > 0 or editor.empty_submit) .submit else .none,
+        0x0e => .history_next,
+        0x10 => .history_previous,
         0x15 => editor.killAndReport(.line_start),
         0x17 => editor.killAndReport(.word_back),
         0x20...0x7e => editor.insertAndReport(&.{byte}),
@@ -659,6 +661,16 @@ test "escape actions break incomplete UTF-8 sequences" {
     try std.testing.expectEqual(Outcome.none, editor.applyAction(.none));
     try std.testing.expectEqual(Outcome.none, try editor.handleByte(0xa9));
     try std.testing.expectEqualStrings("", editor.bytes());
+}
+
+test "control history keys report navigation without editing" {
+    var editor = init(std.testing.allocator, false);
+    defer editor.deinit();
+    try editor.setBuffer("draft");
+
+    try std.testing.expectEqual(Outcome.history_previous, try editor.handleByte(0x10));
+    try std.testing.expectEqual(Outcome.history_next, try editor.handleByte(0x0e));
+    try std.testing.expectEqualStrings("draft", editor.bytes());
 }
 
 test "escape decoder recognizes editing keys and paste begin" {

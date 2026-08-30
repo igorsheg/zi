@@ -3,6 +3,7 @@ pub const CredentialStore = @import("CredentialStore.zig");
 pub const ItemJson = @import("ItemJson.zig");
 pub const Paths = @import("Paths.zig");
 pub const PrivateFileStore = @import("PrivateFileStore.zig");
+pub const PromptHistoryFile = @import("PromptHistoryFile.zig");
 pub const SessionCut = @import("SessionCut.zig");
 pub const SessionFile = @import("SessionFile.zig");
 pub const SessionIndex = @import("SessionIndex.zig");
@@ -16,6 +17,7 @@ test {
     _ = ItemJson;
     _ = Paths;
     _ = PrivateFileStore;
+    _ = PromptHistoryFile;
     _ = SessionCut;
     _ = SessionFile;
     _ = SessionIndex;

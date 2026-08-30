@@ -7,6 +7,7 @@ const DisplayColumns = @import("DisplayColumns.zig");
 const Size = @import("Size.zig");
 const PosixMode = @import("PosixMode.zig");
 const CookedLineInput = @import("CookedLineInput.zig");
+const PromptHistory = @import("PromptHistory.zig");
 
 pub const max_prompt_bytes = LineEditor.max_prompt_bytes;
 pub const OwnedLine = CookedLineInput.OwnedLine;
@@ -33,6 +34,7 @@ empty_submit: bool = false,
 submission_style_open: []const u8 = "",
 submission_style_close: []const u8 = "",
 display_columns: DisplayColumns.Policy = .terminal,
+history: ?*PromptHistory = null,
 mode: PosixMode,
 screen_cursor_row: usize = 0,
 screen_rows: usize = 1,
@@ -49,9 +51,11 @@ pub const Options = struct {
     submission_style_open: []const u8 = "",
     submission_style_close: []const u8 = "",
     display_columns: DisplayColumns.Policy = .terminal,
+    /// Borrowed for the input's lifetime.
+    history: ?*PromptHistory = null,
 };
 
-/// The files and writer remain owned by the caller. `prompt` and submission style bytes are borrowed.
+/// The files and writer remain owned by the caller. Prompt, style bytes, and history are borrowed.
 pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -72,6 +76,7 @@ pub fn init(
         .submission_style_open = options.submission_style_open,
         .submission_style_close = options.submission_style_close,
         .display_columns = options.display_columns,
+        .history = options.history,
         .mode = PosixMode.init(stdin),
     };
 }
@@ -81,12 +86,23 @@ pub fn setEmptySubmit(input: *RawLineInput, enabled: bool) void {
     input.empty_submit = enabled;
 }
 
+pub fn admitSession(input: *RawLineInput, line: []const u8) error{OutOfMemory}!void {
+    const history = input.history orelse return;
+    try history.admit(line, .session);
+}
+
+pub fn admitPersistent(input: *RawLineInput, line: []const u8) error{OutOfMemory}!void {
+    const history = input.history orelse return;
+    try history.admit(line, .persistent);
+}
+
 /// Reads directly from the stdin descriptor. A submitted result owns its bytes.
 /// EOF owns no storage. All terminal state is restored before this function returns.
 pub fn read(input: *RawLineInput) !Result {
     var editor = LineEditor.init(input.allocator, input.empty_submit);
     defer editor.deinit();
 
+    if (input.history) |history| history.beginRead();
     try input.enter();
     errdefer input.cleanupIgnoringErrors();
     try input.repaint(&editor, false, false);
@@ -119,12 +135,23 @@ pub fn read(input: *RawLineInput) !Result {
         const outcome = if (byte == 0x1b)
             try input.handleEscape(&editor)
         else
-            try editor.handleByte(byte);
+            try input.handleEditorByte(&editor, byte);
 
         switch (outcome) {
-            .none, .history_previous, .history_next => {
+            .none => {
                 if (was_armed and !editor.exit_armed)
                     try input.repaint(&editor, false, false);
+            },
+            .history_previous, .history_next => |navigation| {
+                const direction: PromptHistory.Direction = if (navigation == .history_previous)
+                    .older
+                else
+                    .newer;
+                if (try input.navigateHistory(&editor, direction)) {
+                    try input.repaint(&editor, false, false);
+                } else if (was_armed and !editor.exit_armed) {
+                    try input.repaint(&editor, false, false);
+                }
             },
             .edited => try input.repaint(&editor, false, false),
             .exit_armed => try input.repaint(&editor, true, false),
@@ -142,6 +169,35 @@ pub fn read(input: *RawLineInput) !Result {
             },
         }
     }
+}
+
+fn handleEditorByte(
+    input: *RawLineInput,
+    editor: *LineEditor,
+    byte: u8,
+) LineEditor.Error!LineEditor.Outcome {
+    if (byte == 0x03 and editor.bytes().len != 0) {
+        if (input.history) |history| {
+            try history.admit(editor.bytes(), .session);
+            history.beginRead();
+        }
+    }
+    return editor.handleByte(byte);
+}
+
+fn navigateHistory(
+    input: *RawLineInput,
+    editor: *LineEditor,
+    direction: PromptHistory.Direction,
+) LineEditor.Error!bool {
+    const history = input.history orelse return false;
+    var prepared = (try history.prepareNavigation(editor.bytes(), direction)) orelse return false;
+    editor.setBuffer(prepared.target) catch |err| {
+        prepared.deinit(history.allocator);
+        return err;
+    };
+    history.commitNavigation(&prepared);
+    return true;
 }
 
 fn enter(input: *RawLineInput) !void {
@@ -413,8 +469,8 @@ fn commonModifiedAction(sequence: []const u8) LineEditor.EscapeAction {
         'D' => .move_word_left,
         'H' => .line_start,
         'F' => .line_end,
-        // Up and Down are intentionally consumed without local history state.
-        'A', 'B' => .none,
+        'A' => .history_previous,
+        'B' => .history_next,
         else => .none,
     };
 }
@@ -725,12 +781,131 @@ test "meta word actions classify and unknown input stays inert" {
     try std.testing.expectEqual(LineEditor.EscapeAction.none, metaAction('x'));
 }
 
-test "modified CSI actions are bounded and Up and Down stay inert" {
+test "modified CSI actions include history navigation" {
     try std.testing.expectEqual(LineEditor.EscapeAction.move_word_left, commonModifiedAction("[1;5D"));
     try std.testing.expectEqual(LineEditor.EscapeAction.move_word_right, commonModifiedAction("[1;5C"));
     try std.testing.expectEqual(LineEditor.EscapeAction.line_end, commonModifiedAction("[1;2F"));
-    try std.testing.expectEqual(LineEditor.EscapeAction.none, commonModifiedAction("[1;2A"));
+    try std.testing.expectEqual(LineEditor.EscapeAction.history_previous, commonModifiedAction("[1;2A"));
+    try std.testing.expectEqual(LineEditor.EscapeAction.history_next, commonModifiedAction("[1;5B"));
     try std.testing.expectEqual(LineEditor.EscapeAction.none, commonModifiedAction("[xD"));
+}
+
+fn testInput(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    history: ?*PromptHistory,
+) RawLineInput {
+    const invalid_file: std.Io.File = .{
+        .handle = -1,
+        .flags = .{ .nonblocking = false },
+    };
+    return init(
+        allocator,
+        std.testing.io,
+        invalid_file,
+        invalid_file,
+        writer,
+        "> ",
+        .{ .history = history },
+    );
+}
+
+test "null history keeps admission navigation and ctrl-c safe" {
+    var output: [1]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    var input = testInput(std.testing.allocator, &writer, null);
+    var editor = LineEditor.init(std.testing.allocator, false);
+    defer editor.deinit();
+    try editor.setBuffer("draft");
+
+    try input.admitSession("session");
+    try input.admitPersistent("persistent");
+    try std.testing.expect(!try input.navigateHistory(&editor, .older));
+    try std.testing.expectEqual(LineEditor.Outcome.edited, try input.handleEditorByte(&editor, 0x03));
+    try std.testing.expectEqualStrings("", editor.bytes());
+}
+
+test "history navigation restores the live draft transactionally" {
+    var history = PromptHistory.init(std.testing.allocator);
+    defer history.deinit();
+    try history.seed("oldest");
+    try history.seed("newest");
+    history.beginRead();
+
+    var output: [1]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    var input = testInput(std.testing.allocator, &writer, &history);
+    var editor = LineEditor.init(std.testing.allocator, false);
+    defer editor.deinit();
+    try editor.setBuffer("live draft");
+
+    try std.testing.expect(try input.navigateHistory(&editor, .older));
+    try std.testing.expectEqualStrings("newest", editor.bytes());
+    try std.testing.expect(try input.navigateHistory(&editor, .older));
+    try std.testing.expectEqualStrings("oldest", editor.bytes());
+    try std.testing.expect(try input.navigateHistory(&editor, .newer));
+    try std.testing.expectEqualStrings("newest", editor.bytes());
+    try std.testing.expect(try input.navigateHistory(&editor, .newer));
+    try std.testing.expectEqualStrings("live draft", editor.bytes());
+    try std.testing.expect(!try input.navigateHistory(&editor, .newer));
+}
+
+test "history navigation OOM preserves editor and history state" {
+    var history = PromptHistory.init(std.testing.allocator);
+    defer history.deinit();
+    try history.seed("history entry too long for editor storage");
+    history.beginRead();
+
+    var output: [1]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    var input = testInput(std.testing.allocator, &writer, &history);
+    var editor_storage: [5]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&editor_storage);
+    var editor = LineEditor.init(fixed.allocator(), false);
+    defer editor.deinit();
+    try editor.setBuffer("draft");
+
+    try std.testing.expectError(error.OutOfMemory, input.navigateHistory(&editor, .older));
+    try std.testing.expectEqualStrings("draft", editor.bytes());
+    try std.testing.expectEqual(history.count(), history.currentPosition());
+    try std.testing.expect(history.draft == null);
+}
+
+test "nonempty ctrl-c admits a session entry before clearing" {
+    var history = PromptHistory.init(std.testing.allocator);
+    defer history.deinit();
+    try history.seed("older");
+    history.beginRead();
+
+    var output: [1]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    var input = testInput(std.testing.allocator, &writer, &history);
+    var editor = LineEditor.init(std.testing.allocator, false);
+    defer editor.deinit();
+    try editor.setBuffer("draft");
+
+    try std.testing.expectEqual(LineEditor.Outcome.edited, try input.handleEditorByte(&editor, 0x03));
+    try std.testing.expectEqualStrings("", editor.bytes());
+    try std.testing.expectEqualStrings("draft", history.entry(history.count() - 1).?);
+    try std.testing.expectEqual(history.count(), history.currentPosition());
+}
+
+test "ctrl-c admission OOM keeps the editor intact" {
+    var history_storage: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&history_storage);
+    var history = PromptHistory.init(fixed.allocator());
+    defer history.deinit();
+
+    var output: [1]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    var input = testInput(std.testing.allocator, &writer, &history);
+    var editor = LineEditor.init(std.testing.allocator, false);
+    defer editor.deinit();
+    try editor.setBuffer("keep me");
+
+    try std.testing.expectError(error.OutOfMemory, input.handleEditorByte(&editor, 0x03));
+    try std.testing.expectEqualStrings("keep me", editor.bytes());
+    try std.testing.expectEqual(@as(usize, 0), history.count());
 }
 
 const TestPasteSource = struct {
