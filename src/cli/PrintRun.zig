@@ -21,6 +21,7 @@ const SessionRetentionService = @import("../SessionRetentionService.zig");
 const PromptAssembly = @import("../PromptAssembly.zig");
 const GitProbe = @import("../GitProbe.zig");
 const Args = @import("Args.zig");
+const InteractiveCommands = @import("InteractiveCommands.zig");
 const ProcessAdapters = @import("ProcessAdapters.zig");
 const ProcessFacts = @import("ProcessFacts.zig");
 const CodexFiles = @import("CodexFiles.zig");
@@ -811,16 +812,25 @@ pub fn run(
                 else
                     null,
             };
-            if (!interactive_terminal)
-                break :interactive runInteractiveWithFinish(allocator, io, interactive_inputs, &terminal);
-
-            const markdown_enabled = (try config.Settings.getBool(store, allocator, "markdown")).value;
-            const show_reasoning = (try config.Settings.getBool(store, allocator, "show_reasoning")).value;
             var configured_display_width = try config.Settings.getString(store, allocator, "display_width");
             defer configured_display_width.deinit(allocator);
             const display_columns = try terminal_module.DisplayColumns.Policy.parse(
                 configured_display_width.value orelse "auto",
             );
+            if (!interactive_terminal) {
+                var commands = InteractiveCommands.Owner.init(
+                    stdout,
+                    theme,
+                    false,
+                    display_columns.resolve(terminal_module.Size.presentationColumns(stdout_terminal_file.handle)),
+                );
+                var cooked_inputs = interactive_inputs;
+                cooked_inputs.command_gateway = commands.gateway();
+                break :interactive runInteractiveWithFinish(allocator, io, cooked_inputs, &terminal);
+            }
+
+            const markdown_enabled = (try config.Settings.getBool(store, allocator, "markdown")).value;
+            const show_reasoning = (try config.Settings.getBool(store, allocator, "show_reasoning")).value;
             break :interactive runRawInteractive(
                 allocator,
                 io,
@@ -1246,6 +1256,14 @@ fn runRawInteractive(
         .display_columns = display_columns,
         .stdout_fd = stdout_file.handle,
     };
+    var commands = InteractiveCommands.Owner.init(
+        inputs_value.stdout,
+        theme,
+        true,
+        markdown_width.resolve(),
+    );
+    commands.setWidthSource(.from(&markdown_width));
+    commands.setFrame(&frame);
     var markdown_renderer = render.MarkdownStreamRenderer.init(
         allocator,
         inputs_value.stdout,
@@ -1307,6 +1325,7 @@ fn runRawInteractive(
     var inputs = inputs_value;
     inputs.prompt_input = Interactive.PromptInput.from(&raw_input);
     inputs.prompt_recall = Interactive.PromptRecall.from(&raw_input);
+    inputs.command_gateway = commands.gateway();
     inputs.show_prompt = false;
     inputs.generation = Interactive.Generation.from(&interrupt);
     inputs.checkpoint = agent.Loop.Checkpoint.from(&checkpoint);

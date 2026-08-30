@@ -147,6 +147,66 @@ pub const PromptRecall = struct {
     }
 };
 
+pub const CommandOutcome = enum {
+    handled,
+    exit,
+};
+
+pub const CommandUsage = enum {
+    valid,
+    unknown,
+    bad_usage,
+};
+
+/// Non-owning command token. Registry state is owned by `context`; name and
+/// argument borrow the sanitized submitted line through synchronous execution.
+pub const CommandToken = struct {
+    context: *anyopaque,
+    execute_fn: *const fn (*anyopaque, CommandToken) anyerror!CommandOutcome,
+    registry_index: ?usize,
+    name: []const u8,
+    argument: ?[]const u8,
+    usage: CommandUsage,
+
+    pub fn execute(self: CommandToken) !CommandOutcome {
+        return self.execute_fn(self.context, self);
+    }
+};
+
+pub const CommandClassification = union(enum) {
+    prompt,
+    command: CommandToken,
+};
+
+/// Allocation-free command classifier. Classification performs no output or
+/// handler callback; a returned token executes synchronously.
+pub const CommandGateway = struct {
+    context: *anyopaque,
+    classify_fn: *const fn (*anyopaque, []const u8) CommandClassification,
+
+    pub fn classify(self: CommandGateway, line: []const u8) CommandClassification {
+        return self.classify_fn(self.context, line);
+    }
+
+    pub fn from(implementation: anytype) CommandGateway {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one or
+            pointer_info.pointer.is_const)
+        {
+            @compileError("CommandGateway.from expects a mutable single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn classify(context: *anyopaque, line: []const u8) CommandClassification {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.classifyCommand(line);
+            }
+        };
+        return .{ .context = implementation, .classify_fn = Adapter.classify };
+    }
+};
+
 /// Erased synchronous renderer for one outer user turn.
 ///
 /// The implementation and observer returned by `begin` are borrowed through
@@ -371,6 +431,7 @@ pub const Inputs = struct {
     reader: *std.Io.Reader,
     prompt_input: ?PromptInput = null,
     prompt_recall: ?PromptRecall = null,
+    command_gateway: ?CommandGateway = null,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     show_prompt: bool,
@@ -462,7 +523,22 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
                     continue;
                 },
             };
-            if (inputs.prompt_recall) |recall| try recall.admit(submitted, .persistent);
+            const classification: CommandClassification = if (inputs.command_gateway) |gateway|
+                gateway.classify(sanitized.?)
+            else
+                .prompt;
+            switch (classification) {
+                .command => |command| {
+                    if (inputs.prompt_recall) |recall| try recall.admit(submitted, .session);
+                    switch (try command.execute()) {
+                        .handled => continue,
+                        .exit => return 0,
+                    }
+                },
+                .prompt => {
+                    if (inputs.prompt_recall) |recall| try recall.admit(submitted, .persistent);
+                },
+            }
             try inputs.session.addUser(sanitized.?);
             if (inputs.seam_hook) |seam| try seam.call(inputs.session, .prompt, false);
         }
@@ -707,6 +783,213 @@ test "interactive reuses one session across prompts and exits on EOF" {
     try std.testing.expectEqual(@as(usize, 2), seam.completions);
     try std.testing.expectEqualStrings("first\nsecond\n", stdout.written());
     try std.testing.expectEqualStrings("", stderr.written());
+}
+
+test "commands are classified before recall and bypass session provider flow" {
+    const Recall = struct {
+        const Self = @This();
+
+        session_calls: usize = 0,
+        persistent_calls: usize = 0,
+
+        pub fn admitSession(self: *Self, line: []const u8) !void {
+            try std.testing.expectEqualStrings("/help", line);
+            self.session_calls += 1;
+        }
+
+        pub fn admitPersistent(self: *Self, line: []const u8) !void {
+            try std.testing.expectEqualStrings("prompt", line);
+            self.persistent_calls += 1;
+        }
+    };
+    const Gateway = struct {
+        const Self = @This();
+
+        recall: *const Recall,
+        classifications: usize = 0,
+        executions: usize = 0,
+
+        pub fn classifyCommand(self: *Self, line: []const u8) CommandClassification {
+            self.classifications += 1;
+            if (!std.mem.eql(u8, line, "/help")) return .prompt;
+            return .{ .command = .{
+                .context = self,
+                .execute_fn = execute,
+                .registry_index = 0,
+                .name = line[1..],
+                .argument = null,
+                .usage = .valid,
+            } };
+        }
+
+        fn execute(context: *anyopaque, token: CommandToken) anyerror!CommandOutcome {
+            const self: *Self = @ptrCast(@alignCast(context));
+            try std.testing.expectEqualStrings("help", token.name);
+            try std.testing.expectEqual(@as(usize, 1), self.recall.session_calls);
+            try std.testing.expectEqual(@as(usize, 0), self.recall.persistent_calls);
+            self.executions += 1;
+            return .handled;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+
+        recall: *const Recall,
+        calls: usize = 0,
+        valid: bool = true,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.calls += 1;
+            self.valid = self.valid and self.recall.session_calls == 1 and
+                self.recall.persistent_calls == 1;
+            var users: usize = 0;
+            for (request.context.items) |item| switch (item) {
+                .user_message => |user| {
+                    users += 1;
+                    self.valid = self.valid and std.mem.eql(u8, user.text, "prompt");
+                },
+                else => {},
+            };
+            self.valid = self.valid and users == 1;
+            try sink.emit(.{ .text_delta = "answer" });
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const Seam = struct {
+        const Self = @This();
+
+        prompts: usize = 0,
+
+        pub fn call(
+            self: *Self,
+            _: *const agent.Session.Session,
+            kind: agent.Loop.SeamKind,
+            _: bool,
+        ) agent.Loop.HookError!void {
+            if (kind == .prompt) self.prompts += 1;
+        }
+    };
+
+    var recall: Recall = .{};
+    var gateway: Gateway = .{ .recall = &recall };
+    var provider: Provider = .{ .recall = &recall };
+    var seam: Seam = .{};
+    var session = try agent.Session.Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var reader = std.Io.Reader.fixed("/help\nprompt\n");
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "",
+        .reader = &reader,
+        .prompt_recall = PromptRecall.from(&recall),
+        .command_gateway = CommandGateway.from(&gateway),
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .show_prompt = false,
+        .seam_hook = agent.Loop.SeamHook.from(&seam),
+    }));
+    try std.testing.expectEqual(@as(usize, 2), gateway.classifications);
+    try std.testing.expectEqual(@as(usize, 1), gateway.executions);
+    try std.testing.expectEqual(@as(usize, 1), recall.session_calls);
+    try std.testing.expectEqual(@as(usize, 1), recall.persistent_calls);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expect(provider.valid);
+    try std.testing.expectEqual(@as(usize, 1), seam.prompts);
+    try std.testing.expectEqualStrings("answer\n", stdout.written());
+}
+
+test "command admission precedes failing execution" {
+    const Recall = struct {
+        const Self = @This();
+
+        calls: usize = 0,
+
+        pub fn admitSession(self: *Self, line: []const u8) !void {
+            try std.testing.expectEqualStrings("/fail", line);
+            self.calls += 1;
+        }
+
+        pub fn admitPersistent(_: *Self, _: []const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const Gateway = struct {
+        const Self = @This();
+
+        recall: *const Recall,
+
+        pub fn classifyCommand(self: *Self, line: []const u8) CommandClassification {
+            return .{ .command = .{
+                .context = self,
+                .execute_fn = execute,
+                .registry_index = 0,
+                .name = line[1..],
+                .argument = null,
+                .usage = .valid,
+            } };
+        }
+
+        fn execute(context: *anyopaque, _: CommandToken) anyerror!CommandOutcome {
+            const self: *Self = @ptrCast(@alignCast(context));
+            try std.testing.expectEqual(@as(usize, 1), self.recall.calls);
+            return error.CommandFailed;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+
+        calls: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ai.Provider.Request,
+            _: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.calls += 1;
+        }
+    };
+
+    var recall: Recall = .{};
+    var gateway: Gateway = .{ .recall = &recall };
+    var provider: Provider = .{};
+    var session = try agent.Session.Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var reader = std.Io.Reader.fixed("/fail\n");
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+
+    try std.testing.expectError(error.CommandFailed, run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "",
+        .reader = &reader,
+        .prompt_recall = PromptRecall.from(&recall),
+        .command_gateway = CommandGateway.from(&gateway),
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .show_prompt = false,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), recall.calls);
+    try std.testing.expectEqual(@as(usize, 0), provider.calls);
+    try std.testing.expectEqual(@as(usize, 0), session.items().len);
 }
 
 test "interactive disarms generation when the agent loop fails" {

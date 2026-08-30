@@ -15,6 +15,14 @@ pub const LocalStartup = @import("LocalStartup.zig");
 pub const Stats = @import("Stats.zig");
 pub const SubagentDepth = @import("SubagentDepth.zig");
 
+const InteractiveCommands = @import("InteractiveCommands.zig");
+const Slash = @import("Slash.zig");
+
+test {
+    _ = InteractiveCommands;
+    _ = Slash;
+}
+
 fn collectArguments(
     allocator: std.mem.Allocator,
     iterator: anytype,
