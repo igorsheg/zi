@@ -15,9 +15,10 @@ pub const InitError = ProviderConfig.ResolveError;
 /// stable heap addresses, so moving the handle does not invalidate a provider
 /// returned by `provider`.
 ///
-/// The transport implementation and its context are borrowed and must outlive
-/// this value and every provider call. `Inputs.codex_source`, when present, is
-/// also borrowed under `ProviderConfig.Inputs`' lifetime rule. Provider calls
+/// The streaming and optional JSON transport implementations and contexts are
+/// borrowed. They must outlive this value, every returned erased handle, and
+/// each synchronous call. `Inputs.codex_source`, when present, is also borrowed
+/// under `ProviderConfig.Inputs`' lifetime rule. Provider and listing calls
 /// are serialized with catalog replacement and input-token updates. Catalog or
 /// token mutation from a transport or sink callback is not allowed. Call
 /// `deinit` exactly once, after all copied provider handles have stopped being used.
@@ -25,6 +26,9 @@ pub const Owned = struct {
     allocator: std.mem.Allocator,
     config: *ProviderConfig.Owned,
     factory: *Factory.Owner,
+    /// Optional borrowed JSON transport. Its implementation and context must
+    /// outlive this value, every model source, and each synchronous listing call.
+    json_transport: ?ai.JsonTransport.Transport,
     model: []const u8,
     effort: ?[]const u8,
     metadata: *const Registry.StableMetadata,
@@ -34,6 +38,75 @@ pub const Owned = struct {
     /// Returns a borrowed erased handle tied to this composition's factory.
     pub fn provider(self: *Owned) Provider.Provider {
         return self.factory.provider();
+    }
+
+    /// Returns a borrowed model-list source tied to this handle's current
+    /// address. Move the Owned value before taking this source, and stop using
+    /// the source before `deinit`.
+    pub fn modelSource(self: *Owned) ai.ModelListing.Source {
+        return ai.ModelListing.Source.from(self);
+    }
+
+    /// Lists models through the resolved adapter. The JSON transport, adapter
+    /// configuration, and returned source inputs are borrowed only for this
+    /// synchronous call. Listing is serialized with streaming and plan changes.
+    pub fn listModels(
+        self: *Owned,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        tick: ?Provider.Tick,
+    ) ai.ModelListing.Error!ai.ModelListing.Outcome {
+        self.factory.lockPlan(io);
+        defer self.factory.unlockPlan(io);
+
+        const json_transport = self.json_transport orelse return .unsupported;
+        const stable_provider_id = self.config.resolved.metadata.provider_id;
+        switch (self.config.resolved.adapter) {
+            .codex => |config| {
+                var client = ai.CodexOperations.Client.init(json_transport, .{
+                    .source = config.source,
+                    .user_agent = config.user_agent,
+                    .extra_headers = config.extra_headers,
+                    .maximum_access_token_bytes = config.maximum_access_token_bytes,
+                    .maximum_account_id_bytes = config.maximum_account_id_bytes,
+                });
+                return client.listModels(allocator, io, tick);
+            },
+            .openai_chat => |config| {
+                var client = ai.OpenAiModels.Client.init(json_transport, .{
+                    .provider_id = stable_provider_id,
+                    .endpoint = config.endpoint,
+                    .api_key = config.api_key,
+                    .extra_headers = config.extra_headers,
+                    .privileged_header_policy = config.privileged_header_policy,
+                    .dialect = openAiDialect(stable_provider_id),
+                });
+                return client.listModels(allocator, io, tick);
+            },
+            .openai_responses => |config| {
+                var client = ai.OpenAiModels.Client.init(json_transport, .{
+                    .provider_id = stable_provider_id,
+                    .endpoint = config.endpoint,
+                    .api_key = config.api_key,
+                    .extra_headers = config.extra_headers,
+                    .privileged_header_policy = config.privileged_header_policy,
+                    .dialect = openAiDialect(stable_provider_id),
+                });
+                return client.listModels(allocator, io, tick);
+            },
+            .anthropic_messages => |config| {
+                var client = ai.AnthropicModels.Client.init(json_transport, .{
+                    .provider_id = stable_provider_id,
+                    .endpoint = config.endpoint,
+                    .api_key = config.api_key,
+                    .version = config.version,
+                    .extra_headers = config.extra_headers,
+                    .privileged_header_policy = config.privileged_header_policy,
+                });
+                return client.listModels(allocator, io, tick);
+            },
+            .mock => return .unsupported,
+        }
     }
 
     pub fn setInputTokens(self: *Owned, io: std.Io, input_tokens: u64) void {
@@ -84,6 +157,18 @@ pub fn init(
     transport: Transport.Transport,
     initial_input_tokens: u64,
 ) InitError!Owned {
+    return initWithJson(inputs, transport, null, initial_input_tokens);
+}
+
+/// Resolves configuration and installs borrowed streaming and optional JSON
+/// transports without performing a network operation. The transport
+/// implementations and contexts must outlive the returned owner and calls.
+pub fn initWithJson(
+    inputs: ProviderConfig.Inputs,
+    transport: Transport.Transport,
+    json_transport: ?ai.JsonTransport.Transport,
+    initial_input_tokens: u64,
+) InitError!Owned {
     const config = try ProviderConfig.resolve(inputs);
     errdefer config.deinit();
 
@@ -94,12 +179,19 @@ pub fn init(
         .allocator = inputs.allocator,
         .config = config,
         .factory = factory,
+        .json_transport = json_transport,
         .model = config.model,
         .effort = config.effort,
         .metadata = &config.resolved.metadata,
         .keep_model_order = config.keep_model_order,
         .provider_autoselected = config.provider_autoselected,
     };
+}
+
+fn openAiDialect(provider_id: []const u8) ai.OpenAiModels.Dialect {
+    if (std.mem.eql(u8, provider_id, "llamacpp")) return .llamacpp;
+    if (std.mem.eql(u8, provider_id, "openrouter")) return .openrouter;
+    return .generic;
 }
 
 const config_module = @import("config/root.zig");
@@ -210,6 +302,63 @@ const FakeTransport = struct {
     }
 };
 
+const FakeListingTransport = struct {
+    const Route = enum { openai_chat, openai_responses, anthropic, codex };
+
+    route: Route = .openai_chat,
+    transport_error: ?ai.JsonTransport.Error = null,
+    calls: usize = 0,
+    valid: bool = true,
+
+    pub fn request(
+        allocator: std.mem.Allocator,
+        _: std.Io,
+        self: *FakeListingTransport,
+        value: ai.JsonTransport.Request,
+    ) ai.JsonTransport.Error!ai.JsonTransport.Response {
+        self.calls += 1;
+        if (self.transport_error) |err| return err;
+        self.valid = self.valid and value.method == .get;
+        const body = switch (self.route) {
+            .openai_chat => body: {
+                self.valid = self.valid and std.mem.eql(u8, value.url, "https://listing.test/v1/models");
+                self.valid = self.valid and hasHeader(value.headers, "authorization", "Bearer runtime-secret");
+                break :body "{\"data\":[{\"id\":\"chat-model\"}]}";
+            },
+            .openai_responses => body: {
+                self.valid = self.valid and std.mem.eql(u8, value.url, "https://listing.test/v1/models");
+                self.valid = self.valid and hasHeader(value.headers, "authorization", "Bearer runtime-secret");
+                break :body "{\"data\":[{\"id\":\"responses-model\"}]}";
+            },
+            .anthropic => body: {
+                self.valid = self.valid and
+                    std.mem.eql(u8, value.url, "https://listing.test/v1/models?limit=1000");
+                self.valid = self.valid and hasHeader(value.headers, "x-api-key", "runtime-secret");
+                self.valid = self.valid and hasHeader(
+                    value.headers,
+                    "anthropic-version",
+                    ai.AnthropicModels.default_version,
+                );
+                break :body "{\"data\":[{\"id\":\"anthropic-model\"}]}";
+            },
+            .codex => body: {
+                self.valid = self.valid and std.mem.eql(u8, value.url, ai.CodexOperations.models_url);
+                self.valid = self.valid and hasHeader(value.headers, "authorization", "Bearer codex-token");
+                self.valid = self.valid and hasHeader(value.headers, "chatgpt-account-id", "account");
+                break :body "{\"models\":[{\"slug\":\"codex-model\"}]}";
+            },
+        };
+        return .{ .status = 200, .body = try allocator.dupe(u8, body) };
+    }
+
+    fn hasHeader(headers: []const ai.JsonTransport.Header, name: []const u8, value: []const u8) bool {
+        for (headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, name) and std.mem.eql(u8, header.value, value)) return true;
+        }
+        return false;
+    }
+};
+
 const Collector = struct {
     done: usize = 0,
 
@@ -228,6 +377,157 @@ fn streamRuntime(runtime: *Owned, collector: *Collector) !void {
         },
         Provider.EventSink.from(collector),
     );
+}
+
+test "model listing routes resolved adapters through public source after moving the owner" {
+    const Definition = config_module.ProviderDefinitions.Definition;
+    const Api = config_module.ProviderDefinitions.Api;
+    const cases = [_]struct {
+        id: []const u8,
+        api: Api,
+        route: FakeListingTransport.Route,
+        expected_model: []const u8,
+    }{
+        .{ .id = "listing-chat", .api = .openai_completions, .route = .openai_chat, .expected_model = "chat-model" },
+        .{
+            .id = "listing-responses",
+            .api = .openai_responses,
+            .route = .openai_responses,
+            .expected_model = "responses-model",
+        },
+        .{
+            .id = "listing-anthropic",
+            .api = .anthropic_messages,
+            .route = .anthropic,
+            .expected_model = "anthropic-model",
+        },
+    };
+    const environment: TestEnvironment = .{};
+    var stream_transport: FakeTransport = .{};
+
+    for (cases) |case| {
+        var document = try config_module.Document.parse(std.testing.allocator, "{\"model\":\"model\"}", .{});
+        defer document.deinit();
+        const definition: Definition = .{
+            .id = @constCast(case.id),
+            .api = case.api,
+            .base_url = @constCast("https://listing.test/v1"),
+            .api_key = @constCast("runtime-secret"),
+        };
+        var json_transport: FakeListingTransport = .{ .route = case.route };
+        const original = try initWithJson(.{
+            .allocator = std.testing.allocator,
+            .store = testStore(&document, &environment),
+            .api_key_environment = .from(&environment),
+            .provider_override = case.id,
+            .provider_definitions = &.{definition},
+        }, Transport.Transport.from(&stream_transport), ai.JsonTransport.Transport.from(&json_transport), 0);
+        const factory_address = original.factory;
+        var moved = original;
+        defer moved.deinit();
+        try std.testing.expectEqual(@intFromPtr(factory_address), @intFromPtr(moved.factory));
+
+        const source = moved.modelSource();
+        var outcome = try source.listModels(std.testing.allocator, std.testing.io, null);
+        defer outcome.deinit();
+        try std.testing.expect(outcome == .models);
+        try std.testing.expectEqualStrings(case.expected_model, outcome.models.models[0].id);
+        try std.testing.expect(json_transport.valid);
+        try std.testing.expectEqual(@as(usize, 1), json_transport.calls);
+    }
+
+    var codex_document = try config_module.Document.parse(std.testing.allocator, "{}", .{});
+    defer codex_document.deinit();
+    var credential_source: TestCodexSource = .{};
+    var codex_json: FakeListingTransport = .{ .route = .codex };
+    var codex = try initWithJson(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&codex_document, &environment),
+        .api_key_environment = .from(&environment),
+        .codex_available = true,
+        .codex_source = .from(&credential_source),
+        .default_model = "model",
+        .session_cache_key = "12345678-1234-4234-8234-123456789abc",
+    }, Transport.Transport.from(&stream_transport), ai.JsonTransport.Transport.from(&codex_json), 0);
+    defer codex.deinit();
+    var codex_outcome = try codex.listModels(std.testing.allocator, std.testing.io, null);
+    defer codex_outcome.deinit();
+    try std.testing.expectEqualStrings("codex-model", codex_outcome.models.models[0].id);
+    try std.testing.expect(codex_json.valid);
+}
+
+test "model listing is unsupported without JSON and for the mock adapter" {
+    const environment: TestEnvironment = .{};
+    var stream_transport: FakeTransport = .{};
+    var document = try config_module.Document.parse(std.testing.allocator, "{\"model\":\"model\"}", .{});
+    defer document.deinit();
+    const definition: config_module.ProviderDefinitions.Definition = .{
+        .id = @constCast("listing-unsupported"),
+        .api = .openai_responses,
+        .base_url = @constCast("https://listing.test/v1"),
+    };
+    var without_json = try init(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "listing-unsupported",
+        .provider_definitions = &.{definition},
+    }, Transport.Transport.from(&stream_transport), 0);
+    defer without_json.deinit();
+    var unsupported = try without_json.listModels(std.testing.allocator, std.testing.io, null);
+    defer unsupported.deinit();
+    try std.testing.expect(unsupported == .unsupported);
+
+    var mock_document = try config_module.Document.parse(
+        std.testing.allocator,
+        "{\"provider\":\"mock\"}",
+        .{},
+    );
+    defer mock_document.deinit();
+    var json_transport: FakeListingTransport = .{};
+    var mock = try initWithJson(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&mock_document, &environment),
+        .api_key_environment = .from(&environment),
+    }, Transport.Transport.from(&stream_transport), ai.JsonTransport.Transport.from(&json_transport), 0);
+    defer mock.deinit();
+    var mock_outcome = try mock.modelSource().listModels(std.testing.allocator, std.testing.io, null);
+    defer mock_outcome.deinit();
+    try std.testing.expect(mock_outcome == .unsupported);
+    try std.testing.expectEqual(@as(usize, 0), json_transport.calls);
+}
+
+test "model listing preserves typed transport errors and stable dialect selection" {
+    try std.testing.expectEqual(ai.OpenAiModels.Dialect.llamacpp, openAiDialect("llamacpp"));
+    try std.testing.expectEqual(ai.OpenAiModels.Dialect.openrouter, openAiDialect("openrouter"));
+    try std.testing.expectEqual(ai.OpenAiModels.Dialect.generic, openAiDialect("compatible"));
+
+    const environment: TestEnvironment = .{};
+    var document = try config_module.Document.parse(std.testing.allocator, "{\"model\":\"model\"}", .{});
+    defer document.deinit();
+    const definition: config_module.ProviderDefinitions.Definition = .{
+        .id = @constCast("listing-errors"),
+        .api = .openai_responses,
+        .base_url = @constCast("https://listing.test/v1"),
+    };
+    var stream_transport: FakeTransport = .{};
+    var json_transport: FakeListingTransport = .{ .route = .openai_responses };
+    var runtime = try initWithJson(.{
+        .allocator = std.testing.allocator,
+        .store = testStore(&document, &environment),
+        .api_key_environment = .from(&environment),
+        .provider_override = "listing-errors",
+        .provider_definitions = &.{definition},
+    }, Transport.Transport.from(&stream_transport), ai.JsonTransport.Transport.from(&json_transport), 0);
+    defer runtime.deinit();
+
+    inline for (.{ error.OutOfMemory, error.Cancelled, error.InvalidRequest }) |expected| {
+        json_transport.transport_error = expected;
+        try std.testing.expectError(
+            expected,
+            runtime.listModels(std.testing.allocator, std.testing.io, null),
+        );
+    }
 }
 
 test "composition streams every wire family and remains stable when its handle moves" {

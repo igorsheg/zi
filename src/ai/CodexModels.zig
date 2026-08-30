@@ -1,11 +1,12 @@
 const std = @import("std");
 const Effort = @import("Effort.zig");
 const ModelMeta = @import("ModelMeta.zig");
+const ModelListing = @import("ModelListing.zig");
 
 pub const maximum_input_bytes: usize = 4 * 1024 * 1024;
-pub const maximum_models: usize = 4_096;
-pub const maximum_id_bytes: usize = 1_024;
-pub const maximum_description_bytes: usize = 16 * 1024;
+pub const maximum_models: usize = ModelListing.maximum_models;
+pub const maximum_id_bytes: usize = ModelListing.maximum_id_bytes;
+pub const maximum_description_bytes: usize = ModelListing.maximum_description_bytes;
 pub const maximum_json_depth: usize = 64;
 pub const maximum_json_fields: usize = 65_536;
 pub const maximum_json_work: usize = 262_144;
@@ -28,26 +29,7 @@ pub const Error = error{
     ResponseTooLarge,
 };
 
-pub const ListedModel = struct {
-    id: []u8,
-    description: ?[]u8 = null,
-    metadata: ModelMeta.Metadata = .{},
-};
-
-/// Owns every model id and description. `deinit` invalidates the whole list.
-pub const OwnedList = struct {
-    allocator: std.mem.Allocator,
-    models: []ListedModel,
-
-    pub fn deinit(self: *OwnedList) void {
-        for (self.models) |model| {
-            self.allocator.free(model.id);
-            if (model.description) |description| self.allocator.free(description);
-        }
-        self.allocator.free(self.models);
-        self.* = undefined;
-    }
-};
+pub const OwnedList = ModelListing.OwnedList;
 
 /// Parses the exact object returned by the Codex model catalog endpoint.
 /// Unknown members and wrong-shaped optional fields are ignored, matching
@@ -76,9 +58,12 @@ pub fn parse(
     const entries = models_value.array.items;
     if (entries.len > limits.max_models) return error.ResponseTooLarge;
 
-    var result: std.ArrayList(ListedModel) = .empty;
-    errdefer deinitModels(allocator, &result);
-    try result.ensureTotalCapacity(allocator, entries.len);
+    const owner = ModelListing.Owner.init(allocator) catch return error.OutOfMemory;
+    errdefer owner.destroy();
+    const result_allocator = owner.arenaAllocator();
+    var result: std.ArrayList(ModelListing.Model) = .empty;
+    defer result.deinit(result_allocator);
+    result.ensureTotalCapacity(result_allocator, entries.len) catch return error.OutOfMemory;
 
     var slug_count: usize = 0;
     for (entries) |entry_value| {
@@ -91,20 +76,14 @@ pub fn parse(
         const visibility = optionalString(entry, "visibility");
         if (visibility != null and std.mem.eql(u8, visibility.?, "hide")) continue;
 
-        var listed: ListedModel = .{
-            .id = allocator.dupe(u8, slug.?) catch return error.OutOfMemory,
-        };
-        errdefer {
-            allocator.free(listed.id);
-            if (listed.description) |description| allocator.free(description);
-        }
-        try parseMetadata(allocator, entry, limits, &listed);
+        var listed: ModelListing.Model = .{ .id = slug.? };
+        try parseMetadata(entry, limits, &listed);
         result.appendAssumeCapacity(listed);
     }
     if (entries.len != 0 and slug_count == 0) return error.InvalidResponse;
-    return .{
-        .allocator = allocator,
-        .models = result.toOwnedSlice(allocator) catch return error.OutOfMemory,
+    return owner.finish(result.items) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidRequest => return error.ResponseTooLarge,
     };
 }
 
@@ -164,10 +143,9 @@ fn validateJsonWork(json: []const u8, limits: Limits) Error!void {
 }
 
 fn parseMetadata(
-    allocator: std.mem.Allocator,
     entry: std.json.ObjectMap,
     limits: Limits,
-    listed: *ListedModel,
+    listed: *ModelListing.Model,
 ) Error!void {
     const context = positiveIntegerOrFallback(entry, "context_window", "max_context_window");
     listed.metadata.context_window = context;
@@ -188,7 +166,7 @@ fn parseMetadata(
     if (optionalString(entry, "description")) |description| {
         if (description.len > limits.max_description_bytes) return error.ResponseTooLarge;
         if (description.len != 0) {
-            listed.description = allocator.dupe(u8, description) catch return error.OutOfMemory;
+            listed.description = description;
         }
     }
 
@@ -235,14 +213,6 @@ fn optionalString(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
 
 fn valueObject(value: std.json.Value) ?std.json.ObjectMap {
     return if (value == .object) value.object else null;
-}
-
-fn deinitModels(allocator: std.mem.Allocator, models: *std.ArrayList(ListedModel)) void {
-    for (models.items) |model| {
-        allocator.free(model.id);
-        if (model.description) |description| allocator.free(description);
-    }
-    models.deinit(allocator);
 }
 
 const golden_catalog =

@@ -418,7 +418,7 @@ pub fn run(
         "http.idle_timeout",
     )).value;
 
-    var provider_runtime = try ProviderRuntime.init(.{
+    var provider_runtime = try ProviderRuntime.initWithJson(.{
         .allocator = allocator,
         .store = startup.store(),
         .api_key_environment = environment.apiKey(),
@@ -444,7 +444,7 @@ pub fn run(
             .retry_base_ms = http_retry_base,
             .idle_timeout_ms = http_idle_timeout,
         },
-    }, http_transport.streaming(), 0);
+    }, http_transport.streaming(), http_transport.json(), 0);
     defer provider_runtime.deinit();
     try renderProviderHeaderWarnings(
         stderr,

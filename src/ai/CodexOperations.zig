@@ -5,6 +5,7 @@ const Codex = @import("Codex.zig");
 const CodexModels = @import("CodexModels.zig");
 const CodexUsage = @import("CodexUsage.zig");
 const JsonTransport = @import("JsonTransport.zig");
+const ModelListing = @import("ModelListing.zig");
 const Provider = @import("Provider.zig");
 const StreamingTransport = @import("Transport.zig");
 
@@ -41,18 +42,7 @@ pub const Failure = struct {
     }
 };
 
-pub const ModelOutcome = union(enum) {
-    success: CodexModels.OwnedList,
-    failure: Failure,
-
-    pub fn deinit(self: *ModelOutcome) void {
-        switch (self.*) {
-            .success => |*value| value.deinit(),
-            .failure => |*value| value.deinit(),
-        }
-        self.* = undefined;
-    }
-};
+pub const ModelOutcome = ModelListing.Outcome;
 
 pub const UsageOutcome = union(enum) {
     success: CodexUsage.Usage,
@@ -86,7 +76,11 @@ pub const Client = struct {
         try validateConfig(self.config);
         const operation = try Operation.begin(allocator, io, self.config, tick);
         return switch (operation) {
-            .failure => |failure| .{ .failure = failure },
+            .failure => |failure_value| failure: {
+                var owned_failure = failure_value;
+                defer owned_failure.deinit();
+                break :failure try modelFailure(allocator, owned_failure.message);
+            },
             .ready => |credential| self.listModelsWithCredential(allocator, io, tick, credential),
         };
     }
@@ -131,16 +125,14 @@ pub const Client = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Cancelled => return error.Cancelled,
                 error.InvalidRequest => return error.InvalidRequest,
-                error.InvalidResponse => return .{ .failure = try failureOwned(
+                error.InvalidResponse => return modelFailure(
                     allocator,
                     "codex sent an empty or truncated model catalog response",
-                    null,
-                ) },
-                else => return .{ .failure = try failureOwned(
+                ),
+                else => return modelFailure(
                     allocator,
                     "could not reach chatgpt.com to list models: check your network",
-                    null,
-                ) },
+                ),
             };
             var owned_response = response;
             defer owned_response.deinit(allocator);
@@ -160,20 +152,18 @@ pub const Client = struct {
                         const replacement_borrowed = replacement.credential();
                         validateCredential(self.config, replacement_borrowed) catch {
                             self.config.source.noteUnauthorized(credential.value.credential());
-                            return .{ .failure = try failureOwned(
+                            return modelFailure(
                                 allocator,
                                 "authentication recovery returned invalid credentials",
-                                401,
-                            ) };
+                            );
                         };
                         if (!std.mem.eql(u8, replacement_borrowed.account_id, pinned_account)) {
                             self.config.source.noteUnauthorized(credential.value.credential());
-                            return .{ .failure = try failureOwned(
+                            return modelFailure(
                                 allocator,
                                 "the codex login belongs to a different account: " ++
                                     "restart with the intended Codex CLI account or choose another --provider",
-                                401,
-                            ) };
+                            );
                         }
                         const replacement_owned = try OwnedCredential.init(allocator, replacement_borrowed);
                         credential.deinit();
@@ -183,35 +173,33 @@ pub const Client = struct {
                     .use_response => {},
                     .fail => |failure| {
                         defer self.config.source.noteUnauthorized(credential.value.credential());
-                        const owned_failure = try failureFromOverride(allocator, failure, 401);
-                        return .{ .failure = owned_failure };
+                        var owned_failure = try failureFromOverride(allocator, failure, 401);
+                        defer owned_failure.deinit();
+                        return modelFailure(allocator, owned_failure.message);
                     },
                 }
             }
             if (owned_response.status == 401) self.config.source.noteUnauthorized(credential.value.credential());
             if (owned_response.status < 200 or owned_response.status >= 300) {
-                return .{ .failure = try modelHttpFailure(allocator, owned_response.status) };
+                return modelHttpFailure(allocator, owned_response.status);
             }
-            if (owned_response.body.len == 0) return .{ .failure = try failureOwned(
+            if (owned_response.body.len == 0) return modelFailure(
                 allocator,
                 "codex sent an empty or truncated model catalog response",
-                owned_response.status,
-            ) };
+            );
 
             const models = CodexModels.parse(allocator, owned_response.body, .{}) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.ResponseTooLarge => return .{ .failure = try failureOwned(
+                error.ResponseTooLarge => return modelFailure(
                     allocator,
                     "codex sent an empty or truncated model catalog response",
-                    owned_response.status,
-                ) },
-                error.InvalidResponse => return .{ .failure = try failureOwned(
+                ),
+                error.InvalidResponse => return modelFailure(
                     allocator,
                     try classifyModelParseFailure(allocator, owned_response.body),
-                    owned_response.status,
-                ) },
+                ),
             };
-            return .{ .success = models };
+            return .{ .models = models };
         }
     }
 
@@ -486,19 +474,29 @@ fn failureFromOverride(
     return .{ .allocator = allocator, .message = message, .http_status = status };
 }
 
-fn modelHttpFailure(allocator: std.mem.Allocator, status: u16) error{OutOfMemory}!Failure {
-    if (status == 401) return failureOwned(
+fn modelFailure(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+) error{OutOfMemory}!ModelOutcome {
+    return ModelListing.failure(allocator, message) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidRequest => unreachable,
+        error.Cancelled => unreachable,
+    };
+}
+
+fn modelHttpFailure(allocator: std.mem.Allocator, status: u16) error{OutOfMemory}!ModelOutcome {
+    if (status == 401) return modelFailure(
         allocator,
         "codex login expired: authenticate with the Codex CLI again",
-        status,
     );
-    if (status >= 200 and status < 300) return failureOwned(
+    if (status >= 200 and status < 300) return modelFailure(
         allocator,
         "codex sent an empty or truncated model catalog response",
-        status,
     );
     const message = try std.fmt.allocPrint(allocator, "codex model catalog fetch failed (HTTP {d})", .{status});
-    return .{ .allocator = allocator, .message = message, .http_status = status };
+    defer allocator.free(message);
+    return modelFailure(allocator, message);
 }
 
 fn classifyModelParseFailure(allocator: std.mem.Allocator, body: []const u8) error{OutOfMemory}![]const u8 {
@@ -655,8 +653,8 @@ test "model operation uses exact request and rotates one 401 on the pinned accou
     var client = testClient(&source, &transport);
     var outcome = try client.listModels(std.testing.allocator, std.testing.io, null);
     defer outcome.deinit();
-    try std.testing.expect(outcome == .success);
-    try std.testing.expectEqualStrings("gpt-5.4", outcome.success.models[0].id);
+    try std.testing.expect(outcome == .models);
+    try std.testing.expectEqualStrings("gpt-5.4", outcome.models.models[0].id);
     try std.testing.expect(transport.valid);
     try std.testing.expectEqual(@as(usize, 2), transport.calls);
     try std.testing.expectEqual(@as(usize, 1), source.recoveries);
@@ -669,7 +667,7 @@ test "operation credential copies reach allocator release as zeros" {
     var transport: TestTransport = .{};
     var client = testClient(&source, &transport);
     var outcome = try client.listModels(observer.allocator(), std.testing.io, null);
-    try std.testing.expect(outcome == .success);
+    try std.testing.expect(outcome == .models);
     outcome.deinit();
     // Old and rotated credentials, pinned account, and two Authorization values.
     try std.testing.expect(observer.zero_frees >= 7);

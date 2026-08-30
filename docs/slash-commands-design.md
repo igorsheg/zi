@@ -224,9 +224,15 @@ pub const OwnedList = struct {
     pub fn deinit(self: *OwnedList) void;
 };
 
+pub const OwnedFailure = struct {
+    owner: *Owner,
+    message: []const u8,
+    pub fn deinit(self: *OwnedFailure) void;
+};
+
 pub const Outcome = union(enum) {
     unsupported,
-    failure: []const u8,
+    failure: OwnedFailure,
     models: OwnedList,
 };
 
@@ -242,7 +248,8 @@ pub const Source = struct {
 ```
 
 `Owner` is heap-stable and contains an arena. IDs, descriptions, the failure message,
-and the model slice share one bounded lifetime. `deinit` destroys the arena and owner
+and the model slice share one bounded lifetime. Failure outcomes carry their owner explicitly;
+they never reconstruct ownership from a public message slice. `deinit` destroys the arena and owner
 and sets the public handle to `undefined`.
 
 `CodexModels` keeps protocol parsing but builds this common owner. OpenAI-compatible
