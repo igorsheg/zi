@@ -98,10 +98,18 @@ pub const Parse = union(enum) {
 
 pub fn parse(line: []const u8) Parse;
 
-pub const Outcome = enum {
-    not_command,
-    handled,
-    exit,
+pub const Usage = enum { valid, unknown, bad_usage };
+
+pub const ClassifiedCommand = struct {
+    registry_index: ?usize,
+    name: []const u8,
+    argument: ?[]const u8,
+    usage: Usage,
+};
+
+pub const Classification = union(enum) {
+    prompt,
+    command: ClassifiedCommand,
 };
 
 pub const Handler = struct {
@@ -116,12 +124,18 @@ pub const Call = struct {
 
 pub const HandlerOutcome = enum { handled, exit };
 
-pub fn dispatch(line: []const u8, specs: []const Spec, output: Output) !Outcome;
+pub fn classify(line: []const u8, specs: []const Spec) Classification;
+pub fn execute(
+    command: ClassifiedCommand,
+    specs: []const Spec,
+    output: Output,
+) !HandlerOutcome;
 ```
 
-`Output` is a tiny erased synchronous diagnostic renderer. Slash does not own a
-writer or allocate output. Unknown and bad-usage messages pass untrusted command
-names through the existing safe diagnostic text path.
+`classify` is allocation-free and performs no output or callback. `Output` is a tiny
+erased synchronous diagnostic renderer used only by `execute`. Slash does not own a
+writer or allocate output. Unknown and bad-usage messages pass parsed safe-ASCII names
+through the existing diagnostic path.
 
 Parser tests cover every hax fixture, controls, invalid UTF-8 bytes, names at the
 line boundary, trailing whitespace, and exact argument borrowing.
@@ -129,9 +143,23 @@ line boundary, trailing whitespace, and exact argument borrowing.
 ## Interactive seams
 
 ```zig
+pub const CommandToken = struct {
+    context: *anyopaque,
+    execute_fn: *const fn (*anyopaque, CommandToken) anyerror!CommandOutcome,
+    registry_index: ?usize,
+    name: []const u8,
+    argument: ?[]const u8,
+    usage: CommandUsage,
+};
+
+pub const CommandClassification = union(enum) {
+    prompt,
+    command: CommandToken,
+};
+
 pub const CommandGateway = struct {
     context: *anyopaque,
-    dispatch_fn: *const fn (*anyopaque, []const u8) anyerror!Slash.Outcome,
+    classify_fn: *const fn (*anyopaque, []const u8) CommandClassification,
 };
 
 pub const TurnSnapshot = struct {
@@ -162,10 +190,12 @@ The prompt path changes as follows:
  Interactive.run
    read terminal result
    sanitize non-empty input
-+  command_gateway.dispatch(sanitized)
-+    handled -> continue prompt loop
-+    exit -> return 0
-+    not_command -> continue below
++  command_gateway.classify(sanitized)
++    command -> prompt_recall.admit(original, session)
++               token.execute
++                 handled -> continue prompt loop
++                 exit -> return 0
++    prompt -> prompt_recall.admit(original, persistent)
    Session.addUser
    durability seam
    before-first-send hook
@@ -173,7 +203,9 @@ The prompt path changes as follows:
    agent.Loop.run(turn)
 ```
 
-A gateway never sees empty resume input. `first_send` remains true after commands.
+A gateway never sees empty resume input. Classification happens before session-only or
+persistent prompt-recall admission as specified by `docs/prompt-recall-design.md`.
+`first_send` remains true after commands.
 
 ## Model listing
 

@@ -19,7 +19,8 @@ Add these commands to the interactive REPL:
 - `/effort`
 
 A command runs between turns. It never reaches the model and never appears as a
-conversation item. It remains available in prompt recall, matching hax.
+conversation item. It remains available in process-local prompt recall, matching
+`docs/prompt-recall-product.md`, and is never written to persistent prompt history.
 
 This milestone does not add `/new`, `/resume`, `/undo`, `/fork`, `/compact`, preset
 or config commands, task and usage commands, clipboard commands, or managed login.

@@ -32,8 +32,9 @@ argument policy, display policy, and one erased synchronous handler. Registry or
 is help order. Startup validation rejects duplicate names and aliases before the REPL
 can dispatch anything.
 
-The parser is allocation-free and returns borrowed name and argument slices. Dispatch
-returns a tagged outcome:
+The parser is allocation-free and returns borrowed name and argument slices. The
+gateway classifies before executing so terminal history can admit consumed commands
+before a fallible handler runs. Execution returns a tagged outcome:
 
 - `not_command`, send the original line as a prompt;
 - `handled`, return to the prompt;
@@ -44,16 +45,20 @@ session commands do not force a callback redesign.
 
 ### Interactive command gateway
 
-`Interactive.run` receives one erased command gateway. It calls the gateway after
-UTF-8 sanitation and before `Session.addUser`.
+`Interactive.run` receives one erased command gateway with separate allocation-free
+classification and fallible execution operations. It classifies after UTF-8 sanitation
+and before prompt-history or `Session.addUser` admission.
 
-The gateway borrows the submitted bytes only for the synchronous call. It owns no
-terminal line and may not retain the argument without copying it. A handled command
-skips session admission, durability hooks, first-send setup, rendering, and provider
-execution.
+The gateway borrows submitted bytes only through synchronous classification and
+execution. It owns no terminal line and may not retain the argument without copying
+it. A consumed command is admitted to `terminal.PromptHistory` as session-only before
+execution, then skips session admission, durability hooks, first-send setup, model
+rendering, and provider execution. Ordinary prompts are admitted as persistable before
+`Session.addUser`.
 
-Prompt recall remains terminal-owned. Command handling does not add a second history
-store.
+Prompt recall has one terminal-owned store described by
+`docs/prompt-recall-architecture.md`; command handling reaches it only through the
+erased CLI admission seam.
 
 ### Per-turn source
 
