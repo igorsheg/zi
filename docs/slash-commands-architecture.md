@@ -1,6 +1,6 @@
 # Slash-command system architecture
 
-Status: awaiting review
+Status: approved
 
 References:
 

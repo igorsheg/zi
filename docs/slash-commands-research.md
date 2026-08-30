@@ -1,6 +1,6 @@
 # Slash-command research
 
-Status: awaiting review
+Status: approved
 
 References:
 

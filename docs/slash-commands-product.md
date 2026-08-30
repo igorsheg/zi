@@ -1,6 +1,6 @@
 # Slash-command product contract
 
-Status: awaiting review
+Status: approved
 
 ## Problem
 

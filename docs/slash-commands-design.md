@@ -1,6 +1,6 @@
 # Slash-command program design
 
-Status: awaiting review
+Status: approved
 
 References:
 
