@@ -8,6 +8,8 @@ const Size = @import("Size.zig");
 const PosixMode = @import("PosixMode.zig");
 const CookedLineInput = @import("CookedLineInput.zig");
 const PromptHistory = @import("PromptHistory.zig");
+const PromptSearch = @import("PromptSearch.zig");
+const DisplayWidth = @import("../text/root.zig").DisplayWidth;
 
 pub const max_prompt_bytes = LineEditor.max_prompt_bytes;
 pub const OwnedLine = CookedLineInput.OwnedLine;
@@ -35,6 +37,10 @@ submission_style_open: []const u8 = "",
 submission_style_close: []const u8 = "",
 display_columns: DisplayColumns.Policy = .terminal,
 history: ?*PromptHistory = null,
+search_style_open: []const u8 = "",
+search_style_close: []const u8 = "",
+search_no_match_style_open: []const u8 = "",
+search_no_match_style_close: []const u8 = "",
 mode: PosixMode,
 screen_cursor_row: usize = 0,
 screen_rows: usize = 1,
@@ -53,6 +59,11 @@ pub const Options = struct {
     display_columns: DisplayColumns.Policy = .terminal,
     /// Borrowed for the input's lifetime.
     history: ?*PromptHistory = null,
+    /// Borrowed terminal bytes. The caller keeps them valid for the input's lifetime.
+    search_style_open: []const u8 = "",
+    search_style_close: []const u8 = "",
+    search_no_match_style_open: []const u8 = "",
+    search_no_match_style_close: []const u8 = "",
 };
 
 /// The files and writer remain owned by the caller. Prompt, style bytes, and history are borrowed.
@@ -77,6 +88,10 @@ pub fn init(
         .submission_style_close = options.submission_style_close,
         .display_columns = options.display_columns,
         .history = options.history,
+        .search_style_open = options.search_style_open,
+        .search_style_close = options.search_style_close,
+        .search_no_match_style_open = options.search_no_match_style_open,
+        .search_no_match_style_close = options.search_no_match_style_close,
         .mode = PosixMode.init(stdin),
     };
 }
@@ -105,7 +120,7 @@ pub fn read(input: *RawLineInput) !Result {
     if (input.history) |history| history.beginRead();
     try input.enter();
     errdefer input.cleanupIgnoringErrors();
-    try input.repaint(&editor, false, false);
+    try input.repaint(&editor, .{});
 
     while (true) {
         const byte = switch (try input.readByte(250)) {
@@ -117,13 +132,16 @@ pub fn read(input: *RawLineInput) !Result {
             .timeout => {
                 const size = input.querySize();
                 if (size.columns != input.columns or size.rows != input.rows)
-                    try input.repaint(&editor, editor.exit_armed, false);
+                    try input.repaint(&editor, .{ .show_notice = editor.exit_armed });
                 continue;
             },
         };
 
         if (byte == 0x0c) {
-            try input.repaint(&editor, editor.exit_armed, true);
+            try input.repaint(&editor, .{
+                .show_notice = editor.exit_armed,
+                .clear_screen = true,
+            });
             continue;
         }
         if (byte == 0x1a) {
@@ -140,7 +158,7 @@ pub fn read(input: *RawLineInput) !Result {
         switch (outcome) {
             .none => {
                 if (was_armed and !editor.exit_armed)
-                    try input.repaint(&editor, false, false);
+                    try input.repaint(&editor, .{});
             },
             .history_previous, .history_next => |navigation| {
                 const direction: PromptHistory.Direction = if (navigation == .history_previous)
@@ -148,15 +166,29 @@ pub fn read(input: *RawLineInput) !Result {
                 else
                     .newer;
                 if (try input.navigateHistory(&editor, direction)) {
-                    try input.repaint(&editor, false, false);
+                    try input.repaint(&editor, .{});
                 } else if (was_armed and !editor.exit_armed) {
-                    try input.repaint(&editor, false, false);
+                    try input.repaint(&editor, .{});
                 }
             },
-            .edited => try input.repaint(&editor, false, false),
-            .exit_armed => try input.repaint(&editor, true, false),
+            .history_search => {
+                if (input.history) |history| {
+                    switch (try input.searchHistory(&editor, history)) {
+                        .editing => try input.repaint(&editor, .{}),
+                        .submit => return input.submitAndFinish(&editor),
+                        .eof => {
+                            try input.finish();
+                            return .eof;
+                        },
+                    }
+                } else if (was_armed and !editor.exit_armed) {
+                    try input.repaint(&editor, .{});
+                }
+            },
+            .edited => try input.repaint(&editor, .{}),
+            .exit_armed => try input.repaint(&editor, .{ .show_notice = true }),
             .paste_begin => switch (try input.collectPaste(&editor)) {
-                .complete, .idle => try input.repaint(&editor, false, false),
+                .complete, .idle => try input.repaint(&editor, .{}),
                 .eof => {
                     try input.finish();
                     return .eof;
@@ -225,7 +257,7 @@ fn submitAndFinish(input: *RawLineInput, editor: *LineEditor) !Result {
     if (nonempty) {
         const size = input.querySize();
         if (size.columns != input.columns or size.rows != input.rows)
-            try input.repaint(editor, editor.exit_armed, false);
+            try input.repaint(editor, .{ .show_notice = editor.exit_armed });
         try input.renderSubmitted(editor.bytes());
     }
 
@@ -401,7 +433,7 @@ fn suspendEditing(input: *RawLineInput, editor: *const LineEditor) !void {
     try input.cleanup();
     try std.posix.raise(.TSTP);
     try input.enter();
-    try input.repaint(editor, editor.exit_armed, false);
+    try input.repaint(editor, .{ .show_notice = editor.exit_armed });
 }
 
 fn handleEscape(input: *RawLineInput, editor: *LineEditor) !LineEditor.Outcome {
@@ -492,6 +524,16 @@ const PasteFinish = enum {
     eof,
 };
 
+const OwnedPaste = struct {
+    body: std.ArrayList(u8),
+    finish: PasteFinish,
+
+    fn deinit(paste: *OwnedPaste, allocator: std.mem.Allocator) void {
+        paste.body.deinit(allocator);
+        paste.* = undefined;
+    }
+};
+
 fn readPasteByte(raw_context: *anyopaque) anyerror!ReadSample {
     const input: *RawLineInput = @ptrCast(@alignCast(raw_context));
     return input.readByte(5000);
@@ -506,16 +548,14 @@ const PasteByteSource = struct {
     }
 };
 
-fn collectPasteFrom(
+fn collectPasteBodyFrom(
     collector_allocator: std.mem.Allocator,
-    editor: *LineEditor,
+    maximum: usize,
     source: PasteByteSource,
-) !PasteFinish {
-    const remaining = max_prompt_bytes - editor.bytes().len;
-    // Match hax: retain and commit the bounded prefix, but keep consuming through
-    // the end marker so discarded paste bytes cannot become editor commands.
-    var collector = LineEditor.PasteCollector.init(collector_allocator, remaining);
-    defer collector.deinit();
+) !OwnedPaste {
+    // Retain only a bounded prefix, but always consume through the exact marker.
+    var collector = LineEditor.PasteCollector.init(collector_allocator, maximum);
+    errdefer collector.deinit();
     var retention_error: ?anyerror = null;
 
     while (true) {
@@ -529,29 +569,48 @@ fn collectPasteFrom(
                     collector.max_bytes = collector.body.items.len;
                     continue;
                 };
-                try editor.insert(collector.bytes());
-                return if (sample == .timeout) .idle else .eof;
+                const body = collector.body;
+                collector.body = .empty;
+                collector.deinit();
+                return .{
+                    .body = body,
+                    .finish = if (sample == .timeout) .idle else .eof,
+                };
             },
         };
         const result: LineEditor.PasteCollector.FeedResult = collector.feed(&.{byte}) catch |err| result: {
             if (retention_error == null) retention_error = err;
             collector.max_bytes = collector.body.items.len;
             if (collector.marker_len == paste_end_marker_len) {
-                // The complete marker was recognized before flushing a pending CR
-                // failed. Discard that CR and commit the already consumed marker.
                 collector.pending_cr = false;
                 collector.complete = true;
-                break :result LineEditor.PasteCollector.FeedResult{ .consumed = 1, .complete = true };
+                break :result .{ .consumed = 1, .complete = true };
             }
-            // The failed byte was not necessarily retained or classified. Replay it
-            // after entering discard mode so a marker beginning here is not lost.
+            // Replay the failed byte in discard mode. It may begin the end marker.
             break :result try collector.feed(&.{byte});
         };
         if (result.complete) break;
     }
     if (retention_error) |err| return err;
-    try editor.insert(collector.bytes());
-    return .complete;
+    const body = collector.body;
+    collector.body = .empty;
+    collector.deinit();
+    return .{ .body = body, .finish = .complete };
+}
+
+fn collectPasteFrom(
+    collector_allocator: std.mem.Allocator,
+    editor: *LineEditor,
+    source: PasteByteSource,
+) !PasteFinish {
+    var paste = try collectPasteBodyFrom(
+        collector_allocator,
+        max_prompt_bytes - editor.bytes().len,
+        source,
+    );
+    defer paste.deinit(collector_allocator);
+    try editor.insert(paste.body.items);
+    return paste.finish;
 }
 
 const ReadSample = union(enum) {
@@ -559,6 +618,198 @@ const ReadSample = union(enum) {
     timeout,
     eof,
 };
+
+const SearchFinish = enum { editing, submit, eof };
+
+const SearchByteSource = struct {
+    context: *anyopaque,
+    read_fn: *const fn (*anyopaque, i32) anyerror!ReadSample,
+
+    fn read(source: SearchByteSource, timeout_ms: i32) !ReadSample {
+        return source.read_fn(source.context, timeout_ms);
+    }
+};
+
+fn readSearchByte(raw_context: *anyopaque, timeout_ms: i32) anyerror!ReadSample {
+    const input: *RawLineInput = @ptrCast(@alignCast(raw_context));
+    return input.readByte(timeout_ms);
+}
+
+fn searchHistory(
+    input: *RawLineInput,
+    editor: *LineEditor,
+    history: *PromptHistory,
+) !SearchFinish {
+    const source: SearchByteSource = .{
+        .context = input,
+        .read_fn = readSearchByte,
+    };
+    return input.searchHistoryFrom(editor, history, source);
+}
+
+fn searchHistoryFrom(
+    input: *RawLineInput,
+    editor: *LineEditor,
+    history: *PromptHistory,
+    source: SearchByteSource,
+) !SearchFinish {
+    var search = try PromptSearch.init(input.allocator, editor, history);
+    defer search.deinit();
+    errdefer _ = search.finish(history, editor, .cancel) catch .editing;
+    var needs_paint = true;
+
+    while (true) {
+        if (needs_paint) {
+            const view = search.view(history);
+            try editor.setBufferAtCursor(view.buffer, view.cursor);
+            var prompt = try input.buildSearchPrompt(&search, input.querySize().columns);
+            defer prompt.deinit(input.allocator);
+            try input.repaint(editor, .{
+                .prompt = prompt.items,
+                .continuation_column = 0,
+            });
+            needs_paint = false;
+        }
+
+        const sample = source.read(250) catch |err| {
+            _ = try search.finish(history, editor, .cancel);
+            return err;
+        };
+        const key = switch (sample) {
+            .timeout => {
+                const size = input.querySize();
+                needs_paint = size.columns != input.columns or size.rows != input.rows;
+                continue;
+            },
+            .eof => {
+                _ = try search.finish(history, editor, .cancel);
+                return .eof;
+            },
+            .byte => |byte| byte,
+        };
+        needs_paint = true;
+
+        switch (key) {
+            0x12 => search.repeat(history, .older),
+            0x13 => search.repeat(history, .newer),
+            0x08, 0x7f => search.backspace(history),
+            0x03, 0x07 => {
+                _ = try search.finish(history, editor, .cancel);
+                return .editing;
+            },
+            '\r' => return switch (try search.finish(history, editor, .submit)) {
+                .editing => .editing,
+                .submit => .submit,
+            },
+            '\n' => {
+                _ = try search.finish(history, editor, .accept);
+                return .editing;
+            },
+            0x1b => {
+                if (try consumeSearchEscape(source)) {
+                    try input.appendSearchPaste(&search, history, source);
+                    continue;
+                }
+                _ = try search.finish(history, editor, .accept);
+                return .editing;
+            },
+            0x20...0x7e, 0x80...0xff => try appendTypedSearchBytes(&search, history, key, source),
+            else => {},
+        }
+    }
+}
+
+fn appendTypedSearchBytes(
+    search: *PromptSearch,
+    history: *const PromptHistory,
+    first: u8,
+    source: SearchByteSource,
+) !void {
+    var bytes: [4]u8 = undefined;
+    bytes[0] = first;
+    const expected = std.unicode.utf8ByteSequenceLength(first) catch 1;
+    var len: usize = 1;
+    while (len < expected) : (len += 1) {
+        bytes[len] = switch (try source.read(50)) {
+            .byte => |byte| byte,
+            .timeout, .eof => break,
+        };
+    }
+    try search.append(history, bytes[0..len]);
+}
+
+/// Consumes one bounded escape sequence. Only bracketed-paste begin returns true.
+fn consumeSearchEscape(source: SearchByteSource) !bool {
+    var sequence: [70]u8 = undefined;
+    var len: usize = 0;
+    var leader: u8 = 0;
+    var stripped: usize = 0;
+    while (stripped < 5 and len < sequence.len) : (stripped += 1) {
+        leader = switch (try source.read(50)) {
+            .byte => |byte| byte,
+            .timeout, .eof => return false,
+        };
+        sequence[len] = leader;
+        len += 1;
+        if (leader != 0x1b) break;
+    }
+    if (leader == '[' or leader == 'O') {
+        while (len < sequence.len) {
+            const byte = switch (try source.read(50)) {
+                .byte => |byte| byte,
+                .timeout, .eof => break,
+            };
+            sequence[len] = byte;
+            len += 1;
+            if ((byte >= 0x40 and byte <= 0x7e) or byte == '$' or byte < 0x20 or byte > 0x7e) break;
+        }
+    }
+    return LineEditor.decodeEscape(sequence[0..len]).action == .paste_begin;
+}
+
+const SearchPasteAdapter = struct {
+    source: SearchByteSource,
+
+    fn pasteSource(adapter: *SearchPasteAdapter) PasteByteSource {
+        return .{ .context = adapter, .read_fn = SearchPasteAdapter.read };
+    }
+
+    fn read(raw_context: *anyopaque) anyerror!ReadSample {
+        const adapter: *SearchPasteAdapter = @ptrCast(@alignCast(raw_context));
+        return switch (try adapter.source.read(5000)) {
+            .byte => |byte| .{ .byte = if (byte == 0) 1 else byte },
+            .timeout => .timeout,
+            .eof => .eof,
+        };
+    }
+};
+
+fn appendSearchPaste(
+    input: *RawLineInput,
+    search: *PromptSearch,
+    history: *const PromptHistory,
+    source: SearchByteSource,
+) !void {
+    var adapter: SearchPasteAdapter = .{ .source = source };
+    var paste = collectPasteBodyFrom(
+        input.allocator,
+        max_prompt_bytes - search.query.items.len,
+        adapter.pasteSource(),
+    ) catch |err| {
+        input.flush_input_on_cleanup = true;
+        return err;
+    };
+    defer paste.deinit(input.allocator);
+
+    var retained: usize = 0;
+    for (paste.body.items) |byte| {
+        if (byte >= 0x20 and byte != 0x7f) {
+            paste.body.items[retained] = byte;
+            retained += 1;
+        }
+    }
+    try search.append(history, paste.body.items[0..retained]);
+}
 
 /// A nonnegative timeout bounds the wait. EOF and timeout remain distinct.
 fn readByte(input: *RawLineInput, timeout_ms: i32) !ReadSample {
@@ -573,19 +824,94 @@ fn readByte(input: *RawLineInput, timeout_ms: i32) !ReadSample {
     return if (count == 0) .eof else .{ .byte = byte[0] };
 }
 
+const PaintOptions = struct {
+    prompt: ?[]const u8 = null,
+    continuation_column: ?usize = null,
+    show_notice: bool = false,
+    clear_screen: bool = false,
+};
+
+fn buildSearchPrompt(
+    input: *const RawLineInput,
+    search: *const PromptSearch,
+    columns: usize,
+) error{OutOfMemory}!std.ArrayList(u8) {
+    const label = if (search.direction == .older) "reverse-search" else "forward-search";
+    var plain: std.ArrayList(u8) = .empty;
+    errdefer plain.deinit(input.allocator);
+    try plain.appendSlice(input.allocator, label);
+    if (search.query.items.len != 0) {
+        try plain.appendSlice(input.allocator, " · ");
+        var glyphs = DisplayWidth.iterator(search.query.items);
+        while (glyphs.next()) |glyph| try plain.appendSlice(input.allocator, glyph.bytes);
+    }
+    try plain.appendSlice(input.allocator, " → ");
+    const suffix_start = plain.items.len;
+    if (search.no_match) try plain.appendSlice(input.allocator, "(no match)");
+
+    const budget = if (columns > 1) columns - 1 else 1;
+    const total_width = DisplayWidth.visibleWidth(plain.items, std.math.maxInt(usize));
+    var keep_from: usize = 0;
+    const clipped = total_width > budget;
+    if (clipped) {
+        var kept_width: usize = 0;
+        var offset = plain.items.len;
+        const tail_budget = budget - 1;
+        keep_from = offset;
+        while (offset != 0) {
+            const previous = LineEditor.previousCodepoint(plain.items, offset);
+            const glyph = DisplayWidth.next(plain.items, previous) orelse unreachable;
+            if (glyph.width > tail_budget -| kept_width) break;
+            kept_width += glyph.width;
+            keep_from = previous;
+            offset = previous;
+        }
+    }
+
+    var styled: std.ArrayList(u8) = .empty;
+    errdefer styled.deinit(input.allocator);
+    const starts_in_suffix = keep_from >= suffix_start and search.no_match;
+    if (starts_in_suffix) {
+        try styled.appendSlice(input.allocator, input.search_no_match_style_open);
+    } else {
+        try styled.appendSlice(input.allocator, input.search_style_open);
+    }
+    if (clipped) try styled.appendSlice(input.allocator, "…");
+    if (!starts_in_suffix and search.no_match and keep_from < suffix_start) {
+        try styled.appendSlice(input.allocator, plain.items[keep_from..suffix_start]);
+        try styled.appendSlice(input.allocator, input.search_style_close);
+        try styled.appendSlice(input.allocator, input.search_no_match_style_open);
+        try styled.appendSlice(input.allocator, plain.items[suffix_start..]);
+        try styled.appendSlice(input.allocator, input.search_no_match_style_close);
+    } else {
+        try styled.appendSlice(input.allocator, plain.items[keep_from..]);
+        try styled.appendSlice(
+            input.allocator,
+            if (starts_in_suffix)
+                input.search_no_match_style_close
+            else
+                input.search_style_close,
+        );
+    }
+    plain.deinit(input.allocator);
+    return styled;
+}
+
 fn repaint(
     input: *RawLineInput,
     editor: *const LineEditor,
-    show_notice: bool,
-    clear_screen: bool,
+    options: PaintOptions,
 ) !void {
+    const prompt = options.prompt orelse input.prompt;
+    const prompt_width = EditLayout.promptWidth(prompt);
+    const continuation_column = options.continuation_column orelse prompt_width;
     const size = input.querySize();
     const geometry_changed = input.geometry_valid and
         (size.columns != input.columns or size.rows != input.rows);
     input.columns = size.columns;
     input.rows = size.rows;
 
-    if (clear_screen) {
+    if (options.clear_screen) {
         try input.writer.writeAll(cursor_hide ++ "\x1b[2J\x1b[H");
         input.screen_cursor_row = 0;
     } else if (geometry_changed) {
@@ -601,11 +927,10 @@ fn repaint(
     }
     try input.writer.writeAll("\r\x1b[J");
 
-    const prompt_width = EditLayout.promptWidth(input.prompt);
     const layout = EditLayout.compute(editor.bytes(), editor.cursor, prompt_width, input.columns);
-    const display_notice = show_notice and input.rows > 1;
+    const display_notice = options.show_notice and input.rows > 1;
     const window = visibleWindow(layout, input.rows, display_notice);
-    if (window.start_row == 0) try input.writer.writeAll(input.prompt);
+    if (window.start_row == 0) try input.writer.writeAll(prompt);
 
     var sink_context: ClippedPaintSink = .{
         .writer = input.writer,
@@ -615,7 +940,7 @@ fn repaint(
     };
     _ = EditLayout.render(editor.bytes(), editor.cursor, .{
         .prompt_width = prompt_width,
-        .continuation_column = prompt_width,
+        .continuation_column = continuation_column,
         .columns = input.columns,
     }, sink_context.sink());
     if (sink_context.failed) return error.WriteFailed;
@@ -994,6 +1319,293 @@ test "injected paste source inserts normalized body atomically" {
     );
     try std.testing.expectEqualStrings("ab\nc", editor.bytes());
     try std.testing.expectEqual(@as(usize, 10), test_source.index);
+}
+
+const TestSearchSource = struct {
+    bytes: []const u8,
+    index: usize = 0,
+    ending: ReadSample = .eof,
+    timeouts: usize = 0,
+
+    fn source(test_source: *TestSearchSource) SearchByteSource {
+        return .{ .context = test_source, .read_fn = TestSearchSource.read };
+    }
+
+    fn read(raw_context: *anyopaque, _: i32) anyerror!ReadSample {
+        const test_source: *TestSearchSource = @ptrCast(@alignCast(raw_context));
+        if (test_source.timeouts != 0) {
+            test_source.timeouts -= 1;
+            return .timeout;
+        }
+        if (test_source.index == test_source.bytes.len) return test_source.ending;
+        defer test_source.index += 1;
+        return .{ .byte = test_source.bytes[test_source.index] };
+    }
+};
+
+fn makeSearchHistory(allocator: std.mem.Allocator) !PromptHistory {
+    var history = PromptHistory.init(allocator);
+    errdefer history.deinit();
+    try history.seed("old alpha");
+    try history.seed("middle alpha");
+    try history.seed("new alpha\nsecond row");
+    history.beginRead();
+    return history;
+}
+
+fn testSearchInput(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    history: *PromptHistory,
+) RawLineInput {
+    const invalid_file: std.Io.File = .{
+        .handle = -1,
+        .flags = .{ .nonblocking = false },
+    };
+    return init(
+        allocator,
+        std.testing.io,
+        invalid_file,
+        invalid_file,
+        writer,
+        "> ",
+        .{
+            .history = history,
+            .search_style_open = "<a>",
+            .search_style_close = "</a>",
+            .search_no_match_style_open = "<n>",
+            .search_no_match_style_close = "</n>",
+        },
+    );
+}
+
+fn runSearchScript(
+    script: []const u8,
+    editor: *LineEditor,
+    history: *PromptHistory,
+    output: []u8,
+) !SearchFinish {
+    var writer = std.Io.Writer.fixed(output);
+    var input = testSearchInput(std.testing.allocator, &writer, history);
+    var source: TestSearchSource = .{ .bytes = script };
+    return input.searchHistoryFrom(editor, history, source.source());
+}
+
+test "injected search scripts cover CR LF cancel escape and EOF outcomes" {
+    const cases = [_]struct {
+        script: []const u8,
+        finish: SearchFinish,
+        expected: []const u8,
+        cursor: usize,
+    }{
+        .{ .script = "alpha\r", .finish = .submit, .expected = "new alpha\nsecond row", .cursor = 4 },
+        .{ .script = "alpha\n", .finish = .editing, .expected = "new alpha\nsecond row", .cursor = 4 },
+        .{ .script = "alpha\x03", .finish = .editing, .expected = "draft", .cursor = 2 },
+        .{ .script = "alpha\x07", .finish = .editing, .expected = "draft", .cursor = 2 },
+        .{ .script = "alpha\x1b", .finish = .editing, .expected = "new alpha\nsecond row", .cursor = 4 },
+        .{ .script = "missing\r", .finish = .editing, .expected = "draft", .cursor = 2 },
+        .{ .script = "", .finish = .eof, .expected = "draft", .cursor = 2 },
+    };
+
+    for (cases) |case| {
+        var history = try makeSearchHistory(std.testing.allocator);
+        defer history.deinit();
+        var editor = LineEditor.init(std.testing.allocator, false);
+        defer editor.deinit();
+        try editor.setBufferAtCursor("draft", 2);
+        var output: [8192]u8 = undefined;
+
+        try std.testing.expectEqual(
+            case.finish,
+            try runSearchScript(case.script, &editor, &history, &output),
+        );
+        try std.testing.expectEqualStrings(case.expected, editor.bytes());
+        try std.testing.expectEqual(case.cursor, editor.cursorOffset());
+    }
+}
+
+test "injected search traverses both directions and retains typed UTF-8 sequences" {
+    var history = try makeSearchHistory(std.testing.allocator);
+    defer history.deinit();
+    try history.seed("unicode café");
+    history.beginRead();
+    var editor = LineEditor.init(std.testing.allocator, false);
+    defer editor.deinit();
+    var output: [16384]u8 = undefined;
+
+    try std.testing.expectEqual(
+        SearchFinish.editing,
+        try runSearchScript("alpha\x12\x13\n", &editor, &history, &output),
+    );
+    try std.testing.expectEqualStrings("new alpha\nsecond row", editor.bytes());
+
+    history.beginRead();
+    try editor.setBuffer("draft");
+    try std.testing.expectEqual(
+        SearchFinish.editing,
+        try runSearchScript("café\n", &editor, &history, &output),
+    );
+    try std.testing.expectEqualStrings("unicode café", editor.bytes());
+}
+
+test "injected search backspace recovers from no match and empty Ctrl-S searches forward" {
+    var history = try makeSearchHistory(std.testing.allocator);
+    defer history.deinit();
+    var editor = LineEditor.init(std.testing.allocator, false);
+    defer editor.deinit();
+    try editor.setBuffer("draft");
+    var output: [16384]u8 = undefined;
+
+    try std.testing.expectEqual(
+        SearchFinish.editing,
+        try runSearchScript("alphax\x7f\n", &editor, &history, &output),
+    );
+    try std.testing.expectEqualStrings("new alpha\nsecond row", editor.bytes());
+
+    history.beginRead();
+    try editor.setBuffer("draft");
+    try std.testing.expectEqual(
+        SearchFinish.editing,
+        try runSearchScript("\x13alpha\n", &editor, &history, &output),
+    );
+    try std.testing.expectEqualStrings("old alpha", editor.bytes());
+}
+
+test "search escape consumer drains non-paste sequences and only paste begin continues" {
+    var history = PromptHistory.init(std.testing.allocator);
+    defer history.deinit();
+    try history.seed("paste ab value");
+    history.beginRead();
+    var editor = LineEditor.init(std.testing.allocator, false);
+    defer editor.deinit();
+    try editor.setBuffer("draft");
+    var output: [16384]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    var input = testSearchInput(std.testing.allocator, &writer, &history);
+
+    var non_paste: TestSearchSource = .{ .bytes = "\x1b[Ax" };
+    try std.testing.expectEqual(
+        SearchFinish.editing,
+        try input.searchHistoryFrom(&editor, &history, non_paste.source()),
+    );
+    try std.testing.expectEqual(@as(usize, 3), non_paste.index);
+    try std.testing.expectEqualStrings("draft", editor.bytes());
+
+    history.beginRead();
+    try editor.setBuffer("draft");
+    var paste: TestSearchSource = .{
+        .bytes = "\x1b[200~a\x00\x03\r\nb\x7f\x1b[201~\n",
+    };
+    try std.testing.expectEqual(
+        SearchFinish.editing,
+        try input.searchHistoryFrom(&editor, &history, paste.source()),
+    );
+    try std.testing.expectEqualStrings("paste ab value", editor.bytes());
+    try std.testing.expectEqual(paste.bytes.len, paste.index);
+}
+
+test "search paste allocation failure drains through its marker" {
+    var history = PromptHistory.init(std.testing.allocator);
+    defer history.deinit();
+    var editor = LineEditor.init(std.testing.allocator, false);
+    defer editor.deinit();
+    var search = try PromptSearch.init(std.testing.allocator, &editor, &history);
+    defer search.deinit();
+    var output: [1]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    var storage: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var input = testSearchInput(fixed.allocator(), &writer, &history);
+    var source: TestSearchSource = .{ .bytes = "body\x1b[201~tail" };
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        input.appendSearchPaste(&search, &history, source.source()),
+    );
+    try std.testing.expectEqual(@as(usize, 10), source.index);
+    try std.testing.expect(input.flush_input_on_cleanup);
+    try std.testing.expectEqualStrings("", search.query.items);
+}
+
+test "search prompt is safe styled one-row output clipped from the left" {
+    var history = PromptHistory.init(std.testing.allocator);
+    defer history.deinit();
+    var editor = LineEditor.init(std.testing.allocator, false);
+    defer editor.deinit();
+    var search = try PromptSearch.init(std.testing.allocator, &editor, &history);
+    defer search.deinit();
+    try search.query.appendSlice(std.testing.allocator, "bad\x1b\xff界tail");
+    search.no_match = true;
+
+    var sink: [1]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&sink);
+    const input = testSearchInput(std.testing.allocator, &writer, &history);
+    var unstyled_input = input;
+    unstyled_input.search_style_open = "";
+    unstyled_input.search_style_close = "";
+    unstyled_input.search_no_match_style_open = "";
+    unstyled_input.search_no_match_style_close = "";
+    const widths = [_]usize{ 1, 8, 20, 80 };
+    for (widths) |columns| {
+        var prompt = try unstyled_input.buildSearchPrompt(&search, columns);
+        defer prompt.deinit(std.testing.allocator);
+        try std.testing.expect(std.mem.indexOfScalar(u8, prompt.items, '\n') == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, prompt.items, 0x1b) == null);
+        try std.testing.expect(EditLayout.promptWidth(prompt.items) <= @max(@as(usize, 1), columns -| 1));
+    }
+
+    search.query.clearRetainingCapacity();
+    try search.query.appendSlice(std.testing.allocator, "needle");
+    var wide = try input.buildSearchPrompt(&search, 80);
+    defer wide.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "<a>reverse-search · needle → </a><n>(no match)</n>",
+        wide.items,
+    );
+    var one = try input.buildSearchPrompt(&search, 1);
+    defer one.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("<n>…</n>", one.items);
+}
+
+fn searchAllocationFailureCase(allocator: std.mem.Allocator) !void {
+    var history = PromptHistory.init(allocator);
+    defer history.deinit();
+    try history.seed("history needle");
+    history.beginRead();
+    var editor = LineEditor.init(allocator, false);
+    defer editor.deinit();
+    try editor.setBuffer("draft");
+    var output: [16384]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    var input = testSearchInput(allocator, &writer, &history);
+    var source: TestSearchSource = .{ .bytes = "needle\n" };
+    _ = try input.searchHistoryFrom(&editor, &history, source.source());
+}
+
+test "all raw search allocations are leak-free" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        searchAllocationFailureCase,
+        .{},
+    );
+}
+
+test "search repaint uses column-zero continuation and never enters alternate screen" {
+    var history = PromptHistory.init(std.testing.allocator);
+    defer history.deinit();
+    var editor = LineEditor.init(std.testing.allocator, false);
+    defer editor.deinit();
+    try editor.setBuffer("first\nsecond");
+    var output: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    var input = testSearchInput(std.testing.allocator, &writer, &history);
+    input.columns = 80;
+    input.rows = 24;
+    input.geometry_valid = true;
+
+    try input.repaint(&editor, .{ .prompt = "search → ", .continuation_column = 0 });
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\r\nsecond") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\x1b[?1049") == null);
 }
 
 test "cursor moves use bounded direct decimal encoding" {

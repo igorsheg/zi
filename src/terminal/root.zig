@@ -28,5 +28,6 @@ test {
     _ = @import("LineEditor.zig");
     _ = @import("PickerCore.zig");
     _ = @import("PosixMode.zig");
+    _ = @import("PromptSearch.zig");
     _ = std;
 }

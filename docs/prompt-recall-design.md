@@ -1,6 +1,6 @@
 # Prompt-recall program design
 
-Status: awaiting review
+Status: approved
 
 References:
 
@@ -54,8 +54,8 @@ pub const AppendOutcome = enum { written, too_large, unavailable };
 pub const Appender = struct {
     context: *anyopaque,
     append_fn: *const fn (
-        *anyopaque,
         std.mem.Allocator,
+        *anyopaque,
         []const u8,
     ) error{OutOfMemory}!AppendOutcome,
 

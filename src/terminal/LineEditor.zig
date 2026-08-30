@@ -23,6 +23,7 @@ pub const Outcome = enum {
     paste_begin,
     history_previous,
     history_next,
+    history_search,
 };
 
 pub fn init(allocator: std.mem.Allocator, empty_submit: bool) LineEditor {
@@ -45,11 +46,20 @@ pub fn setEmptySubmit(editor: *LineEditor, enabled: bool) void {
 
 /// Atomically replaces the complete edit buffer and puts the cursor at its end.
 pub fn setBuffer(editor: *LineEditor, text: []const u8) Error!void {
+    try editor.setBufferAtCursor(text, text.len);
+}
+
+pub fn cursorOffset(editor: *const LineEditor) usize {
+    return editor.cursor;
+}
+
+/// Atomically replaces the complete buffer and clamps the requested byte cursor.
+pub fn setBufferAtCursor(editor: *LineEditor, text: []const u8, cursor_offset: usize) Error!void {
     if (text.len > max_prompt_bytes) return error.PromptTooLong;
     try editor.buffer.ensureTotalCapacityPrecise(editor.allocator, text.len);
     editor.buffer.clearRetainingCapacity();
     editor.buffer.appendSliceAssumeCapacity(text);
-    editor.cursor = text.len;
+    editor.cursor = @min(cursor_offset, text.len);
     editor.exit_armed = false;
     editor.clearPendingUtf8();
 }
@@ -188,6 +198,7 @@ pub fn handleByte(editor: *LineEditor, byte: u8) Error!Outcome {
         0x0d => if (editor.buffer.items.len > 0 or editor.empty_submit) .submit else .none,
         0x0e => .history_next,
         0x10 => .history_previous,
+        0x12 => .history_search,
         0x15 => editor.killAndReport(.line_start),
         0x17 => editor.killAndReport(.word_back),
         0x20...0x7e => editor.insertAndReport(&.{byte}),
@@ -320,7 +331,7 @@ fn nextCodepoint(input: []const u8, offset: usize) usize {
     return end;
 }
 
-fn previousCodepoint(input: []const u8, offset: usize) usize {
+pub fn previousCodepoint(input: []const u8, offset: usize) usize {
     if (offset == 0) return 0;
     const floor = offset - @min(offset, 4);
     var candidate = offset - 1;
@@ -670,6 +681,7 @@ test "control history keys report navigation without editing" {
 
     try std.testing.expectEqual(Outcome.history_previous, try editor.handleByte(0x10));
     try std.testing.expectEqual(Outcome.history_next, try editor.handleByte(0x0e));
+    try std.testing.expectEqual(Outcome.history_search, try editor.handleByte(0x12));
     try std.testing.expectEqualStrings("draft", editor.bytes());
 }
 

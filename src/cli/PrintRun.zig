@@ -1227,6 +1227,10 @@ fn runRawInteractive(
             .submission_style_close = theme.accent.close,
             .display_columns = display_columns,
             .history = &history,
+            .search_style_open = theme.accent.open,
+            .search_style_close = theme.accent.close,
+            .search_no_match_style_open = theme.chrome_dim.open,
+            .search_no_match_style_close = theme.chrome_dim.close,
         },
     );
     var presentation: RawPresentation = .{
