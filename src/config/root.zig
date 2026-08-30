@@ -7,6 +7,7 @@ pub const PromptValue = @import("PromptValue.zig");
 pub const SecureOpen = @import("SecureOpen.zig");
 pub const Selection = @import("Selection.zig");
 pub const Settings = @import("Settings.zig");
+pub const StateWriter = @import("StateWriter.zig");
 pub const Store = @import("Store.zig");
 
 test {
@@ -19,5 +20,6 @@ test {
     _ = SecureOpen;
     _ = Selection;
     _ = Settings;
+    _ = StateWriter;
     _ = Store;
 }

@@ -80,6 +80,7 @@ pub fn run(
         .selection = options.selection,
         .strict_one_shot = options.mode == .print,
         .provider_canonicalizer = config.Store.ProviderCanonicalizer.from(&canonicalizer),
+        .state_nonce_source = random.stateNonceSource(),
     });
     var prepared_owned = true;
     defer if (prepared_owned) prepared.deinit();
@@ -692,11 +693,17 @@ pub fn run(
         .image_policy = image_policy,
         .manual_context_limit = manual_context_limit,
     };
+    var live_provider_source: LiveProviderSource = .{
+        .allocator = allocator,
+        .inputs = provider_inputs,
+        .json_transport = http_transport.json(),
+    };
     var live_tool_selection: LiveToolSelection = .{ .tools = &tools };
     var live: RunSelection.Owner = .{
         .allocator = allocator,
         .config_source = RunSelection.ConfigSource.from(&startup),
         .builder = RunSelection.Builder.from(&live_builder),
+        .provider_source = RunSelection.ProviderSource.from(&live_provider_source),
         .tools = RunSelection.ToolSelection.from(&live_tool_selection),
         .session = session_run.session(),
         .durability = durability,
@@ -710,6 +717,7 @@ pub fn run(
         .model_hints_source = provider_inputs.hints_source,
         .reported_metadata = if (provider_inputs.hints.reported) |value| value.* else null,
         .sort_models = sort_models,
+        .state_writer = startup.stateWriter(),
     };
     provider_runtime_owned = false;
     provider_runtime = undefined;
@@ -1583,6 +1591,84 @@ const CatalogHints = struct {
     }
 };
 
+const LiveProviderSource = struct {
+    allocator: std.mem.Allocator,
+    inputs: ProviderConfig.Inputs,
+    json_transport: ai.JsonTransport.Transport,
+
+    pub fn providerChoices(
+        self: *LiveProviderSource,
+        allocator: std.mem.Allocator,
+    ) !ProviderConfig.ProviderChoices {
+        return ProviderConfig.providerChoices(allocator, self.inputs);
+    }
+
+    pub fn recheckProvider(
+        self: *LiveProviderSource,
+        io: std.Io,
+        provider: []const u8,
+        tick: ?ai.Provider.Tick,
+    ) !bool {
+        var choices = try ProviderConfig.providerChoices(self.allocator, self.inputs);
+        defer choices.deinit();
+        for (choices.values) |choice| {
+            if (!std.mem.eql(u8, choice.id, provider)) continue;
+            if (choice.available) return true;
+            break;
+        }
+        const headers = try LocalStartup.resolveHeaders(
+            self.allocator,
+            self.inputs.provider_definitions,
+            provider,
+            self.inputs.api_key_environment,
+        );
+        var owned_headers = headers;
+        defer owned_headers.deinit(self.allocator);
+        if (std.mem.eql(u8, provider, "llamacpp")) {
+            var prepared = try LocalStartup.PreparedLlama.init(
+                self.allocator,
+                self.inputs.store,
+                owned_headers.headers,
+                tick,
+            );
+            defer prepared.deinit();
+            return LocalStartup.executeReachability(
+                self.allocator,
+                io,
+                self.json_transport,
+                &prepared.probe,
+            );
+        }
+        if (std.mem.eql(u8, provider, "ollama")) {
+            var prepared = (try LocalStartup.prepareOllama(
+                self.allocator,
+                self.inputs.provider_definitions,
+                owned_headers.headers,
+                tick,
+            )) orelse return false;
+            defer prepared.deinit();
+            return LocalStartup.executeReachability(
+                self.allocator,
+                io,
+                self.json_transport,
+                &prepared,
+            );
+        }
+        return false;
+    }
+
+    pub fn buildProviderListing(
+        self: *LiveProviderSource,
+        store: config.Store,
+    ) !ProviderRuntime.ListingOwned {
+        var inputs = self.inputs;
+        inputs.store = store;
+        inputs.hints.reported = null;
+        inputs.llama_reconciliation = null;
+        return ProviderRuntime.initListing(inputs, self.json_transport);
+    }
+};
+
 const LiveBuilder = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1605,6 +1691,7 @@ const LiveBuilder = struct {
         var provider_inputs = self.provider_inputs;
         provider_inputs.store = store;
         provider_inputs.hints.reported = if (reported_metadata) |*value| value else null;
+        if (reported_metadata != null) provider_inputs.llama_reconciliation = null;
         var runtime = try ProviderRuntime.initWithJson(
             provider_inputs,
             self.streaming_transport,

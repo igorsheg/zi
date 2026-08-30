@@ -12,6 +12,8 @@ const SessionDurability = @import("../SessionDurability.zig");
 
 pub const ModelProvenance = enum {
     inherited,
+    concrete,
+    discovered,
     explicit,
 };
 
@@ -27,6 +29,7 @@ pub const RequestedSelection = struct {
     effort: ?[]const u8,
     reported_metadata: ReportedMetadataChange = .preserve,
     model_provenance: ModelProvenance = .inherited,
+    effort_selected: bool = false,
 };
 
 pub const Built = struct {
@@ -74,6 +77,74 @@ pub const Builder = struct {
             }
         };
         return .{ .context = implementation, .build_fn = Adapter.build };
+    }
+};
+
+pub const ProviderSource = struct {
+    context: *anyopaque,
+    choices_fn: *const fn (std.mem.Allocator, *anyopaque) anyerror!ProviderConfig.ProviderChoices,
+    recheck_fn: *const fn (std.Io, *anyopaque, []const u8, ?ai.Provider.Tick) anyerror!bool,
+    listing_fn: *const fn (*anyopaque, config.Store) anyerror!ProviderRuntime.ListingOwned,
+
+    pub fn choices(self: ProviderSource, allocator: std.mem.Allocator) !ProviderConfig.ProviderChoices {
+        return self.choices_fn(allocator, self.context);
+    }
+
+    pub fn recheck(self: ProviderSource, io: std.Io, provider: []const u8, tick: ?ai.Provider.Tick) !bool {
+        return self.recheck_fn(io, self.context, provider, tick);
+    }
+
+    pub fn listing(self: ProviderSource, store: config.Store) !ProviderRuntime.ListingOwned {
+        return self.listing_fn(self.context, store);
+    }
+
+    pub fn from(implementation: anytype) ProviderSource {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one or pointer_info.pointer.is_const) {
+            @compileError("RunSelection.ProviderSource.from expects a mutable single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn choices(allocator: std.mem.Allocator, context: *anyopaque) anyerror!ProviderConfig.ProviderChoices {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.providerChoices(allocator);
+            }
+
+            fn recheck(
+                io: std.Io,
+                context: *anyopaque,
+                provider: []const u8,
+                tick: ?ai.Provider.Tick,
+            ) anyerror!bool {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.recheckProvider(io, provider, tick);
+            }
+
+            fn listing(context: *anyopaque, store: config.Store) anyerror!ProviderRuntime.ListingOwned {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.buildProviderListing(store);
+            }
+        };
+        return .{
+            .context = implementation,
+            .choices_fn = Adapter.choices,
+            .recheck_fn = Adapter.recheck,
+            .listing_fn = Adapter.listing,
+        };
+    }
+};
+
+pub const ProviderListingCandidate = struct {
+    allocator: std.mem.Allocator,
+    config_run: config.Selection.PreparedRun,
+    runtime: ProviderRuntime.ListingOwned,
+    sort_models: bool,
+
+    pub fn deinit(self: *ProviderListingCandidate) void {
+        self.runtime.deinit();
+        self.config_run.deinit(self.allocator);
+        self.* = undefined;
     }
 };
 
@@ -205,6 +276,8 @@ pub const Candidate = struct {
     tool_selection: tool.Bash.RunSelection,
     reported_metadata: ?ai.ModelMeta.Metadata,
     model_provenance: ModelProvenance,
+    persistent_model: ?[]const u8,
+    persistent_effort: ?[]const u8,
     active: bool = true,
 
     pub fn deinit(self: *Candidate) void {
@@ -216,6 +289,8 @@ pub const Candidate = struct {
         self.* = undefined;
     }
 };
+
+pub const CommitResult = enum { written, unchanged, run_only };
 
 pub const CurrentSelection = struct {
     generation: u64 = 0,
@@ -230,6 +305,7 @@ pub const CurrentSelection = struct {
     model_metadata: ai.ModelMeta.Metadata,
     sort_models: bool = true,
     model_provenance: ModelProvenance = .inherited,
+    model_discovered: bool = false,
 };
 
 /// Heap-stable live interactive selection. The owner is the only writer of
@@ -238,6 +314,7 @@ pub const Owner = struct {
     allocator: std.mem.Allocator,
     config_source: ConfigSource,
     builder: Builder,
+    provider_source: ?ProviderSource = null,
     tools: ToolSelection,
     session: *agent.Session.Session,
     durability: ?*SessionDurability.Owner,
@@ -252,6 +329,7 @@ pub const Owner = struct {
     reported_metadata: ?ai.ModelMeta.Metadata = null,
     sort_models: bool = true,
     model_provenance: ModelProvenance = .inherited,
+    state_writer: ?config.StateWriter.Writer = null,
     views: ?Views = null,
     generation: u64 = 0,
     committing: bool = false,
@@ -288,6 +366,54 @@ pub const Owner = struct {
             .model_metadata = self.runtime.metadata.model,
             .sort_models = self.sort_models,
             .model_provenance = self.model_provenance,
+            .model_discovered = self.runtime.model_discovered,
+        };
+    }
+
+    pub fn providerChoices(self: *Owner) !ProviderConfig.ProviderChoices {
+        self.assertStable();
+        if (self.committing or self.catalog_lookup_active) return error.Reentrant;
+        const source = self.provider_source orelse return error.Unsupported;
+        return source.choices(self.allocator);
+    }
+
+    pub fn recheckProvider(
+        self: *Owner,
+        io: std.Io,
+        provider: []const u8,
+        tick: ?ai.Provider.Tick,
+    ) !bool {
+        self.assertStable();
+        if (self.committing or self.catalog_lookup_active) return error.Reentrant;
+        const source = self.provider_source orelse return false;
+        return source.recheck(io, provider, tick);
+    }
+
+    /// Builds a non-streaming runtime under provider defaults. Its prepared
+    /// config overlay is destroyed with it and can never be published.
+    pub fn prepareProviderListing(self: *Owner, provider: []const u8) !ProviderListingCandidate {
+        self.assertStable();
+        if (self.committing or self.catalog_lookup_active) return error.Reentrant;
+        const source = self.provider_source orelse return error.Unsupported;
+        var config_run = try self.config_source.prepare(.{
+            .provider = provider,
+            .model = config.Store.default_sentinel,
+            .effort = config.Store.default_sentinel,
+            .exit_preset = true,
+        });
+        errdefer config_run.deinit(self.allocator);
+        var runtime = try source.listing(config_run.store());
+        errdefer runtime.deinit();
+        const sort_models = try resolveSortModels(
+            self.allocator,
+            config_run.store(),
+            runtime.keepModelOrder(),
+        );
+        return .{
+            .allocator = self.allocator,
+            .config_run = config_run,
+            .runtime = runtime,
+            .sort_models = sort_models,
         };
     }
 
@@ -316,8 +442,28 @@ pub const Owner = struct {
         std.debug.assert(models.len <= ai.ModelListing.maximum_models);
         if (self.committing or self.catalog_lookup_active) return error.Reentrant;
         for (output) |*value| value.* = .{};
+        return self.catalogMetadataBatchFor(
+            allocator,
+            self.runtime.metadata.catalog_id,
+            models,
+            output,
+        );
+    }
+
+    pub fn catalogMetadataBatchFor(
+        self: *Owner,
+        allocator: std.mem.Allocator,
+        catalog_id_value: ?[]const u8,
+        models: []const ai.ModelListing.Model,
+        output: []ai.ModelMeta.Metadata,
+    ) error{ OutOfMemory, Reentrant, SelectionChanged }!void {
+        self.assertStable();
+        std.debug.assert(models.len == output.len);
+        std.debug.assert(models.len <= ai.ModelListing.maximum_models);
+        if (self.committing or self.catalog_lookup_active) return error.Reentrant;
+        for (output) |*value| value.* = .{};
         const source = self.model_hints_source orelse return;
-        const catalog_id = self.runtime.metadata.catalog_id orelse return;
+        const catalog_id = catalog_id_value orelse return;
         const generation = self.generation;
 
         self.catalog_lookup_active = true;
@@ -366,11 +512,18 @@ pub const Owner = struct {
         };
         var built = try self.builder.build(config_run.store(), reported_metadata);
         errdefer built.deinit(self.allocator);
+        const provider_changed = !std.mem.eql(
+            u8,
+            built.runtime.metadata.provider_id,
+            self.runtime.metadata.provider_id,
+        );
         const selection: agent.Session.Selection = .{
             .provider_id = built.runtime.metadata.provider_id,
             .model = built.runtime.model,
-            .model_label = requested.model_label orelse self.session.currentSelection().model_label orelse
-                built.runtime.model,
+            .model_label = requested.model_label orelse if (provider_changed)
+                built.runtime.model
+            else
+                self.session.currentSelection().model_label orelse built.runtime.model,
             .effort = built.runtime.effort,
             .preset = null,
         };
@@ -400,16 +553,24 @@ pub const Owner = struct {
             .session = prepared_session,
             .tool_selection = tool_selection,
             .reported_metadata = reported_metadata,
-            .model_provenance = if (requested.model_provenance == .inherited)
-                self.model_provenance
+            .model_provenance = switch (requested.model_provenance) {
+                .inherited => if (provider_changed) .inherited else self.model_provenance,
+                .concrete, .discovered, .explicit => requested.model_provenance,
+            },
+            .persistent_model = switch (requested.model_provenance) {
+                .concrete, .explicit => built.runtime.model,
+                .inherited, .discovered => null,
+            },
+            .persistent_effort = if (requested.effort_selected)
+                built.runtime.effort orelse config.Store.default_sentinel
             else
-                requested.model_provenance,
+                null,
         };
     }
 
-    /// Publishes a fully prepared candidate without allocation or callbacks
-    /// that can fail. Persistence intentionally starts in Slice 5.
-    pub fn commit(self: *Owner, candidate: *Candidate) void {
+    /// Publishes the live candidate first. Persistent failure never rolls back
+    /// the run and is represented only by run_only.
+    pub fn commit(self: *Owner, candidate: *Candidate) CommitResult {
         self.assertStable();
         std.debug.assert(candidate.active);
         std.debug.assert(!self.committing);
@@ -440,6 +601,18 @@ pub const Owner = struct {
 
         if (old_prompt) |*prompt| prompt.deinit(self.allocator);
         old_runtime.deinit();
+
+        const writer = self.state_writer orelse return .run_only;
+        const outcome = writer.write(.{
+            .provider = self.runtime.metadata.provider_id,
+            .model = candidate.persistent_model,
+            .effort = candidate.persistent_effort,
+        }) catch return .run_only;
+        return switch (outcome) {
+            .written => .written,
+            .unchanged => .unchanged,
+            .unavailable, .failed => .run_only,
+        };
     }
 
     fn assertStable(self: *const Owner) void {
@@ -459,6 +632,43 @@ pub const Owner = struct {
         };
     }
 };
+
+fn resolveSortModels(
+    allocator: std.mem.Allocator,
+    store: config.Store,
+    keep_provider_order: bool,
+) !bool {
+    var setting = try config.Settings.getString(store, allocator, "sort_models");
+    defer setting.deinit(allocator);
+    const value = setting.value orelse return !keep_provider_order;
+    if (std.ascii.eqlIgnoreCase(value, "auto")) return !keep_provider_order;
+    if (std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on")) return true;
+    if (std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "no") or
+        std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "off")) return false;
+    return !keep_provider_order;
+}
+
+test "prospective provider sorting honors global policy before provider order" {
+    const environment: TestEnvironment = .{};
+    var automatic_document = try config.Document.parse(std.testing.allocator, "{}", .{});
+    defer automatic_document.deinit();
+    const automatic = config.Store.init(.{
+        .run = &automatic_document,
+        .registry = config.Settings.storeRegistry(),
+        .environment = .from(&environment),
+    });
+    try std.testing.expect(!try resolveSortModels(std.testing.allocator, automatic, true));
+
+    var enabled_document = try config.Document.parse(std.testing.allocator, "{\"sort_models\":true}", .{});
+    defer enabled_document.deinit();
+    const enabled = config.Store.init(.{
+        .run = &enabled_document,
+        .registry = config.Settings.storeRegistry(),
+        .environment = .from(&environment),
+    });
+    try std.testing.expect(try resolveSortModels(std.testing.allocator, enabled, true));
+}
 
 const TestEnvironment = struct {
     pub fn get(_: *const TestEnvironment, _: []const u8) ?[]const u8 {
@@ -750,7 +960,7 @@ test "successful publication changes every next-turn and derived selection view"
     });
     defer candidate.deinit();
     try std.testing.expectEqualStrings("low", rig.live.snapshot().effort.?);
-    rig.live.commit(&candidate);
+    _ = rig.live.commit(&candidate);
 
     const turn = rig.live.snapshot();
     try std.testing.expectEqual(runtime_address, @intFromPtr(&rig.live.runtime));
@@ -839,7 +1049,7 @@ test "effort changes preserve reported metadata and model changes can reset it" 
         .reported_metadata = .{ .replace = .{ .context_window = 999, .tools = .no } },
     });
     defer selected.deinit();
-    rig.live.commit(&selected);
+    _ = rig.live.commit(&selected);
 
     var effort_only = try rig.live.prepare(.{
         .model_label = "old-model",
@@ -848,7 +1058,7 @@ test "effort changes preserve reported metadata and model changes can reset it" 
     defer effort_only.deinit();
     try std.testing.expectEqual(@as(u64, 999), effort_only.built.runtime.metadata.model.context_window);
     try std.testing.expectEqual(ai.ModelMeta.Support.no, effort_only.built.runtime.metadata.model.tools);
-    rig.live.commit(&effort_only);
+    _ = rig.live.commit(&effort_only);
     try std.testing.expectEqual(@as(u64, 999), rig.live.current().model_metadata.context_window);
 
     var reset = try rig.live.prepare(.{
@@ -859,6 +1069,132 @@ test "effort changes preserve reported metadata and model changes can reset it" 
     });
     defer reset.deinit();
     try std.testing.expectEqual(@as(u64, 0), reset.built.runtime.metadata.model.context_window);
-    rig.live.commit(&reset);
+    _ = rig.live.commit(&reset);
     try std.testing.expectEqual(@as(u64, 0), rig.live.current().model_metadata.context_window);
+}
+
+const TestStateWriter = struct {
+    outcome: config.StateWriter.Outcome,
+    expected_model: ?[]const u8,
+    expected_effort: ?[]const u8,
+    expected_live_effort: ?[]const u8,
+    live: *Owner,
+    calls: usize = 0,
+    valid: bool = false,
+
+    fn erasedWrite(
+        context: *anyopaque,
+        selection: config.StateWriter.Selection,
+    ) error{OutOfMemory}!config.StateWriter.Outcome {
+        const self: *TestStateWriter = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        self.valid = std.mem.eql(u8, selection.provider, "selection-test") and
+            optionalEqual(selection.model, self.expected_model) and
+            optionalEqual(selection.effort, self.expected_effort) and
+            optionalEqual(self.live.runtime.effort, self.expected_live_effort) and
+            selection.preset == null;
+        return self.outcome;
+    }
+
+    fn writer(self: *TestStateWriter) config.StateWriter.Writer {
+        return .{ .context = self, .write_fn = erasedWrite };
+    }
+};
+
+fn optionalEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left) |left_value| {
+        const right_value = right orelse return false;
+        return std.mem.eql(u8, left_value, right_value);
+    }
+    return right == null;
+}
+
+test "candidate owns temporary requested model and effort through commit" {
+    var rig = try TestRig.init(std.testing.allocator);
+    defer rig.deinit();
+    rig.stabilize();
+
+    var writer: TestStateWriter = .{
+        .outcome = .written,
+        .expected_model = "temporary-model",
+        .expected_effort = "high",
+        .expected_live_effort = "high",
+        .live = &rig.live,
+    };
+    rig.live.state_writer = writer.writer();
+    const requested_model = try std.testing.allocator.dupe(u8, "temporary-model");
+    const requested_effort = try std.testing.allocator.dupe(u8, "high");
+    var candidate = try rig.live.prepare(.{
+        .model = requested_model,
+        .model_label = requested_model,
+        .effort = requested_effort,
+        .model_provenance = .concrete,
+        .effort_selected = true,
+    });
+    defer candidate.deinit();
+    @memset(requested_model, 'x');
+    @memset(requested_effort, 'x');
+    std.testing.allocator.free(requested_model);
+    std.testing.allocator.free(requested_effort);
+
+    try std.testing.expectEqual(CommitResult.written, rig.live.commit(&candidate));
+    try std.testing.expect(writer.valid);
+    try std.testing.expectEqual(ModelProvenance.concrete, rig.live.current().model_provenance);
+}
+
+test "commit publishes first and maps persistence outcomes without rollback" {
+    var rig = try TestRig.init(std.testing.allocator);
+    defer rig.deinit();
+    rig.stabilize();
+
+    var writer: TestStateWriter = .{
+        .outcome = .written,
+        .expected_model = "old-model",
+        .expected_effort = config.Store.default_sentinel,
+        .expected_live_effort = null,
+        .live = &rig.live,
+    };
+    rig.live.state_writer = writer.writer();
+    var explicit = try rig.live.prepare(.{
+        .model = "old-model",
+        .model_label = "old-model",
+        .effort = null,
+        .model_provenance = .explicit,
+        .effort_selected = true,
+    });
+    defer explicit.deinit();
+    try std.testing.expectEqual(CommitResult.written, rig.live.commit(&explicit));
+    try std.testing.expect(writer.valid);
+
+    writer.outcome = .unchanged;
+    writer.expected_model = null;
+    writer.expected_effort = "low";
+    writer.expected_live_effort = "low";
+    writer.valid = false;
+    var inherited = try rig.live.prepare(.{
+        .model = "old-model",
+        .model_label = "old-model",
+        .effort = "low",
+        .model_provenance = .inherited,
+        .effort_selected = true,
+    });
+    defer inherited.deinit();
+    try std.testing.expectEqual(CommitResult.unchanged, rig.live.commit(&inherited));
+    try std.testing.expect(writer.valid);
+    try std.testing.expectEqual(ModelProvenance.explicit, rig.live.current().model_provenance);
+
+    writer.outcome = .failed;
+    writer.expected_effort = "high";
+    writer.expected_live_effort = "high";
+    writer.valid = false;
+    var failed = try rig.live.prepare(.{
+        .model_label = "old-model",
+        .effort = "high",
+        .effort_selected = true,
+    });
+    defer failed.deinit();
+    try std.testing.expectEqual(CommitResult.run_only, rig.live.commit(&failed));
+    try std.testing.expect(writer.valid);
+    try std.testing.expectEqualStrings("high", rig.live.current().effort.?);
+    try std.testing.expectEqual(@as(usize, 3), writer.calls);
 }

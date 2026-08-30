@@ -32,6 +32,7 @@ pub const PrepareInputs = struct {
     /// Its erased context must remain alive, immutable, and address-stable
     /// until Owner.deinit and across every Store call.
     provider_canonicalizer: ?config.Store.ProviderCanonicalizer = null,
+    state_nonce_source: ?config.StateWriter.NonceSource = null,
 };
 
 pub const Inputs = struct {
@@ -44,6 +45,7 @@ pub const Inputs = struct {
     resumed: ?config.Selection.RestoreMetadata = null,
     strict_one_shot: bool = false,
     provider_canonicalizer: ?config.Store.ProviderCanonicalizer = null,
+    state_nonce_source: ?config.StateWriter.NonceSource = null,
 };
 
 pub const DiagnosticContext = enum { explicit, recorded };
@@ -124,6 +126,7 @@ const StartupFacts = struct {
 const State = struct {
     allocator: std.mem.Allocator,
     tiers: config.Loader.InitialTiers,
+    state_writer: ?*config.StateWriter.Owner,
     base: config.Store.Options,
     facts: StartupFacts,
     selection: config.Selection,
@@ -139,6 +142,7 @@ fn deinitState(state: *State) void {
     state.providers.deinit();
     state.presets.deinit(allocator);
     state.selection.deinit();
+    if (state.state_writer) |writer| writer.deinit();
     deinitTiersSecure(allocator, &state.tiers);
     state.* = undefined;
     allocator.destroy(state);
@@ -211,8 +215,8 @@ pub const Owner = struct {
         return if (self.state.tiers.config) |*result| result else null;
     }
 
-    pub fn stateResult(self: *const Owner) ?*const config.Loader.Result {
-        return if (self.state.tiers.state) |*result| result else null;
+    pub fn stateWriter(self: *Owner) ?config.StateWriter.Writer {
+        return if (self.state.state_writer) |writer| writer.writer() else null;
     }
 
     pub fn configUnusable(self: *const Owner) bool {
@@ -322,7 +326,25 @@ pub fn prepare(inputs: PrepareInputs) Error!Prepared {
         result.outcome,
     );
 
-    const documents = persistentDocuments(&state.tiers);
+    var state_writer: ?*config.StateWriter.Owner = null;
+    errdefer if (state_writer) |writer| writer.deinit();
+    if (state.tiers.state) |result_value| {
+        state.tiers.state = null;
+        var result = result_value;
+        const initialized = config.StateWriter.Owner.init(inputs.allocator, inputs.io, &result, .{
+            .secure_open = inputs.file_access.secure_open,
+            .nonce_source = inputs.state_nonce_source,
+        }) catch |err| {
+            result.deinit(inputs.allocator);
+            return err;
+        };
+        switch (initialized) {
+            .unavailable => {},
+            .owner => |writer| state_writer = writer,
+        }
+    }
+
+    const documents = persistentDocuments(&state.tiers, state_writer);
     const prompt_roots: config.Preset.PromptRoots = .{
         .secure_open = inputs.file_access.secure_open,
         .config_root = if (state.tiers.config) |result| std.fs.path.dirname(result.path) else null,
@@ -358,6 +380,7 @@ pub fn prepare(inputs: PrepareInputs) Error!Prepared {
     try composeProvisional(inputs.allocator, facts, &presets, &selection);
     const warnings = try warning_builder.items.toOwnedSlice(inputs.allocator);
 
+    state.state_writer = state_writer;
     state.base = base;
     state.facts = facts;
     state.selection = selection;
@@ -369,6 +392,7 @@ pub fn prepare(inputs: PrepareInputs) Error!Prepared {
     selection = undefined;
     presets = undefined;
     providers = undefined;
+    state_writer = null;
     return .{ .state = state };
 }
 
@@ -424,6 +448,7 @@ pub fn init(inputs: Inputs) Error!InitResult {
         .selection = inputs.selection,
         .strict_one_shot = inputs.strict_one_shot,
         .provider_canonicalizer = inputs.provider_canonicalizer,
+        .state_nonce_source = inputs.state_nonce_source,
     });
     return finish(&prepared, inputs.resumed) catch |err| {
         prepared.deinit();
@@ -687,10 +712,13 @@ fn wipeValue(value: *std.json.Value) void {
     }
 }
 
-fn persistentDocuments(tiers: *const config.Loader.InitialTiers) config.Preset.Documents {
+fn persistentDocuments(
+    tiers: *const config.Loader.InitialTiers,
+    state_writer: ?*config.StateWriter.Owner,
+) config.Preset.Documents {
     return .{
         .config = if (tiers.config) |*result| if (result.document) |*document| document else null else null,
-        .state = if (tiers.state) |*result| if (result.document) |*document| document else null else null,
+        .state = if (state_writer) |writer| writer.document() else null,
     };
 }
 
@@ -942,6 +970,34 @@ test "owner forwards prospective run preparation and publication" {
     try expectSetting(&owner, "model", "new-m", .run);
     try expectSetting(&owner, "effort", "high", .run);
     try expectSetting(&owner, "preset", "", .run);
+}
+
+test "startup state writer publishes through the stable store slot and preserves unknown state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTiers(&tmp, "{}", "{\"provider\":\"old\",\"unknown\":{\"answer\":42}}");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    var environment = ProcessAdapters.Environment.init(testEnviron(&.{}));
+    var owner = try initOwner(testInputs(
+        std.testing.allocator,
+        base,
+        config.SecureOpen.Capability.from(&access),
+        &environment,
+    ));
+    defer owner.deinit();
+
+    const writer = owner.stateWriter().?;
+    try std.testing.expectEqual(config.StateWriter.Outcome.written, try writer.write(.{
+        .provider = "new",
+        .model = "chosen",
+        .effort = config.Store.default_sentinel,
+    }));
+    try expectSetting(&owner, "provider", "new", .state);
+    try expectSetting(&owner, "model", "chosen", .state);
+    const state_document = owner.state.state_writer.?.document();
+    try std.testing.expectEqual(@as(i64, 42), state_document.lookup("unknown.answer").?.integer);
 }
 
 test "empty environment preset suppresses a lower preset without replacing a resumed stance" {

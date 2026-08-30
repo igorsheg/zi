@@ -80,6 +80,20 @@ fn joinValidated(
         std.fmt.allocPrint(allocator, "{s}/{s}/zi/{s}", .{ base, middle, leaf });
 }
 
+pub const Fingerprint = struct {
+    inode: std.Io.File.INode,
+    nlink: std.Io.File.NLink,
+    size: u64,
+    mtime_ns: i96,
+    ctime_ns: i96,
+    digest: [std.crypto.hash.Blake3.digest_length]u8,
+
+    pub fn eql(left: Fingerprint, right: Fingerprint) bool {
+        return left.inode == right.inode and left.nlink == right.nlink and
+            left.size == right.size and std.mem.eql(u8, &left.digest, &right.digest);
+    }
+};
+
 pub const Outcome = enum {
     loaded,
     missing,
@@ -103,6 +117,8 @@ pub const Result = struct {
     path: []u8,
     outcome: Outcome,
     document: ?Document = null,
+    /// Present for coherently read loaded and whitespace-only files.
+    fingerprint: ?Fingerprint = null,
 
     pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
         if (self.document) |*document| document.deinit();
@@ -139,6 +155,7 @@ pub fn loadTierFile(
     defer file.close(io);
     const stat = file.stat(io) catch return resultWithoutDocument(owned_path, .unreadable);
     if (stat.kind != .file or stat.nlink == 0) return resultWithoutDocument(owned_path, .non_regular);
+    if (named_stat.inode != stat.inode) return resultWithoutDocument(owned_path, .unreadable);
     if (stat.size > maximum_file_bytes) return resultWithoutDocument(owned_path, .oversize);
 
     // The buffer can contain API keys, headers, and prompt text. Route its
@@ -151,14 +168,53 @@ pub fn loadTierFile(
     const count = file.readPositionalAll(io, buffer, 0) catch
         return resultWithoutDocument(owned_path, .unreadable);
     if (count > maximum_file_bytes) return resultWithoutDocument(owned_path, .oversize);
+    if (count != stat.size) return resultWithoutDocument(owned_path, .unreadable);
+    const final_stat = file.stat(io) catch return resultWithoutDocument(owned_path, .unreadable);
+    if (!sameDescriptorState(stat, final_stat)) return resultWithoutDocument(owned_path, .unreadable);
+    const final_named = secure_open.statFile(io, path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return resultWithoutDocument(owned_path, .unreadable),
+    };
+    if (!sameDescriptorState(final_stat, final_named)) {
+        return resultWithoutDocument(owned_path, .unreadable);
+    }
     const bytes = buffer[0..count];
-    if (isWhitespaceOnly(bytes)) return resultWithoutDocument(owned_path, .empty);
+    if (isWhitespaceOnly(bytes)) return .{
+        .path = owned_path,
+        .outcome = .empty,
+        .fingerprint = fingerprint(stat, bytes),
+    };
 
     const document = Document.parse(allocator, bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return resultWithoutDocument(owned_path, .invalid),
     };
-    return .{ .path = owned_path, .outcome = .loaded, .document = document };
+    return .{
+        .path = owned_path,
+        .outcome = .loaded,
+        .document = document,
+        .fingerprint = fingerprint(stat, bytes),
+    };
+}
+
+fn fingerprint(stat: std.Io.File.Stat, bytes: []const u8) Fingerprint {
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+    return .{
+        .inode = stat.inode,
+        .nlink = stat.nlink,
+        .size = stat.size,
+        .mtime_ns = stat.mtime.nanoseconds,
+        .ctime_ns = stat.ctime.nanoseconds,
+        .digest = digest,
+    };
+}
+
+fn sameDescriptorState(left: std.Io.File.Stat, right: std.Io.File.Stat) bool {
+    return left.kind == .file and right.kind == .file and left.inode == right.inode and
+        left.nlink == right.nlink and left.size == right.size and
+        left.mtime.nanoseconds == right.mtime.nanoseconds and
+        left.ctime.nanoseconds == right.ctime.nanoseconds;
 }
 
 fn resultWithoutDocument(path: []u8, outcome: Outcome) Result {
@@ -347,6 +403,10 @@ test "tier file missing empty valid malformed directory and oversize" {
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.outcome, result.outcome);
         try std.testing.expectEqual(case.outcome == .loaded, result.document != null);
+        try std.testing.expectEqual(
+            case.outcome == .loaded or case.outcome == .empty,
+            result.fingerprint != null,
+        );
     }
 }
 

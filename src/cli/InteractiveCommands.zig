@@ -4,6 +4,7 @@ const render = @import("../render/root.zig");
 const text = @import("../text/root.zig");
 const DiagnosticText = @import("DiagnosticText.zig");
 const Interactive = @import("Interactive.zig");
+const ProviderConfig = @import("../ProviderConfig.zig");
 const RunSelection = @import("RunSelection.zig");
 const SelectionPicker = @import("SelectionPicker.zig");
 const Slash = @import("Slash.zig");
@@ -55,6 +56,12 @@ const shortcuts = [_]Shortcut{
 
 const specs = [_]Slash.Spec{
     .{
+        .name = "provider",
+        .summary = "switch provider, then model and effort",
+        .display = .managed,
+        .handler_fn = runProvider,
+    },
+    .{
         .name = "model",
         .summary = "switch model, then effort",
         .display = .managed,
@@ -91,6 +98,7 @@ pub const Owner = struct {
     listing_generation: ?Interactive.Generation = null,
     listing_tick: ?ai.Provider.Tick = null,
     selection_picker: ?SelectionPicker.Runner = null,
+    persistence_warning_written: bool = false,
 
     pub fn init(
         writer: *std.Io.Writer,
@@ -268,6 +276,42 @@ pub const Owner = struct {
         try self.writeError(writer.buffered());
     }
 
+    fn writeProviderUnavailable(self: *Owner, choice: ProviderConfig.ProviderChoice) !void {
+        var buffer: [512]u8 = undefined;
+        const reason = choice.reason orelse
+            if (isLocalProvider(choice.id)) "server not reachable" else "unavailable";
+        const message = std.fmt.bufPrint(
+            &buffer,
+            "{s} is unavailable — {s}",
+            .{ choice.label, reason },
+        ) catch "that provider is unavailable";
+        try self.writeDiagnosticNote(message);
+    }
+
+    fn writeProviderListingUnsupported(self: *Owner, choice: ProviderConfig.ProviderChoice) !void {
+        var buffer: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &buffer,
+            "{s} can't list models — set one with HAX_MODEL or in config",
+            .{choice.label},
+        ) catch "that provider can't list models — set one with HAX_MODEL or in config";
+        try self.writeDiagnosticError(message);
+    }
+
+    fn writeProviderNoChoice(
+        self: *Owner,
+        before: RunSelection.CurrentSelection,
+        choice: ProviderConfig.ProviderChoice,
+    ) !void {
+        var buffer: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &buffer,
+            "staying on {s} — no model chosen for {s}",
+            .{ before.provider, choice.id },
+        ) catch "no model chosen — keeping the current selection";
+        try self.writeDiagnosticNote(message);
+    }
+
     fn writeDiagnosticNote(self: *Owner, message: []const u8) !void {
         var storage: [4096]u8 = undefined;
         var writer = std.Io.Writer.fixed(&storage);
@@ -354,6 +398,190 @@ pub const Owner = struct {
         return self.writer.flush();
     }
 };
+
+fn runProvider(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
+    const self: *Owner = @ptrCast(@alignCast(context));
+    const live = self.run_selection orelse return .handled;
+    const io = self.io orelse return .handled;
+    const picker = self.selection_picker orelse return .handled;
+    const before = live.current();
+
+    var choices = live.providerChoices() catch {
+        try self.writeError("couldn't prepare the provider list — keeping the current selection");
+        return .handled;
+    };
+    defer choices.deinit();
+    if (choices.values.len == 0) {
+        try self.writeNote("no providers are configured");
+        return .handled;
+    }
+    const provider_choice = SelectionPicker.provider(
+        live.allocator,
+        picker,
+        choices.values,
+        before.provider,
+    ) catch return .handled;
+    const selected_index = switch (provider_choice) {
+        .canceled => return .handled,
+        .selected => |index| index,
+    };
+    if (live.current().generation != before.generation) return .handled;
+    const selected_provider = choices.values[selected_index];
+    if (!selected_provider.available or isLocalProvider(selected_provider.id)) {
+        if (self.listing_generation) |generation| generation.arm() catch return .handled;
+        const available = live.recheckProvider(
+            io,
+            selected_provider.id,
+            self.listing_tick,
+        ) catch |err| {
+            if (self.listing_generation) |generation| try generation.disarm();
+            if (err == error.Cancelled) return .handled;
+            try self.writeProviderUnavailable(selected_provider);
+            return .handled;
+        };
+        if (self.listing_generation) |generation| try generation.disarm();
+        if (!available) {
+            try self.writeProviderUnavailable(selected_provider);
+            return .handled;
+        }
+    }
+    if (std.mem.eql(u8, selected_provider.id, before.provider)) {
+        return runModel(context, .{ .spec = &specs[1], .argument = null });
+    }
+
+    var prospective = live.prepareProviderListing(selected_provider.id) catch {
+        try self.writeError("couldn't prepare that provider — keeping the current selection");
+        return .handled;
+    };
+    defer prospective.deinit();
+    if (live.current().generation != before.generation) return .handled;
+
+    try self.writeNote("fetching models...");
+    if (self.listing_generation) |generation| generation.arm() catch return .handled;
+    var listing = prospective.runtime.listModels(
+        live.allocator,
+        io,
+        self.listing_tick,
+    ) catch |err| {
+        if (self.listing_generation) |generation| try generation.disarm();
+        if (err == error.Cancelled) return .handled;
+        try self.writeError("couldn't list models for that provider — keeping the current selection");
+        return .handled;
+    };
+    if (self.listing_generation) |generation| try generation.disarm();
+    defer listing.deinit();
+
+    var selected_model: ?ai.ModelListing.Model = null;
+    var selected_effort: ?[]const u8 = null;
+    var effort_selected = true;
+    var model_provenance: RunSelection.ModelProvenance = .inherited;
+    switch (listing) {
+        .unsupported => {
+            try self.writeProviderListingUnsupported(selected_provider);
+            if (prospective.runtime.defaultModel() == null) {
+                try self.writeProviderNoChoice(before, selected_provider);
+                return .handled;
+            }
+            const levels = prospective.runtime.efforts();
+            if (levels.count != 0) {
+                const effort_choice = SelectionPicker.effort(picker, &levels, null) catch return .handled;
+                effort_selected = true;
+                selected_effort = switch (effort_choice) {
+                    .canceled => return .handled,
+                    .selected => |value| value,
+                };
+            }
+        },
+        .failure => |failure| {
+            try self.writeDiagnosticError(failure.message);
+            try self.writeProviderNoChoice(before, selected_provider);
+            return .handled;
+        },
+        .models => |models_owner| {
+            const models = models_owner.models;
+            if (models.len == 0) {
+                try self.writeProviderNoChoice(before, selected_provider);
+                return .handled;
+            }
+            const catalog = live.allocator.alloc(ai.ModelMeta.Metadata, models.len) catch {
+                try self.writeError("couldn't prepare the model list — keeping the current selection");
+                return .handled;
+            };
+            defer live.allocator.free(catalog);
+            const merged = live.allocator.alloc(ai.ModelMeta.Metadata, models.len) catch {
+                try self.writeError("couldn't prepare the model list — keeping the current selection");
+                return .handled;
+            };
+            defer live.allocator.free(merged);
+            live.catalogMetadataBatchFor(
+                live.allocator,
+                prospective.runtime.catalogId(),
+                models,
+                catalog,
+            ) catch {
+                try self.writeError("couldn't prepare the model list — keeping the current selection");
+                return .handled;
+            };
+            for (models, merged, catalog) |model_value, *merged_value, *catalog_value| {
+                merged_value.* = ai.ModelMeta.merge(&model_value.metadata, catalog_value);
+            }
+            var model_index: usize = 0;
+            if (models.len > 1) {
+                const choice = SelectionPicker.model(
+                    live.allocator,
+                    picker,
+                    models,
+                    merged,
+                    "",
+                    prospective.sort_models,
+                ) catch return .handled;
+                model_index = switch (choice) {
+                    .canceled => return .handled,
+                    .selected => |index| index,
+                };
+                model_provenance = .explicit;
+            }
+            selected_model = models[model_index];
+            if (models.len == 1) model_provenance = singletonModelProvenance(
+                prospective.runtime.modelDiscovered() or
+                    (std.mem.eql(u8, selected_provider.id, "llamacpp") and
+                        prospective.runtime.defaultModel() == null),
+            );
+            const provider_efforts = prospective.runtime.providerEfforts();
+            const levels = ai.ModelMeta.resolveEfforts(
+                &provider_efforts,
+                &selected_model.?.metadata.efforts,
+                &catalog[model_index].efforts,
+            );
+            if (levels.count != 0) {
+                const effort_choice = SelectionPicker.effort(picker, &levels, null) catch return .handled;
+                effort_selected = true;
+                selected_effort = switch (effort_choice) {
+                    .canceled => return .handled,
+                    .selected => |value| value,
+                };
+            }
+        },
+    }
+    if (live.current().generation != before.generation) return .handled;
+
+    var candidate = live.prepare(.{
+        .provider = selected_provider.id,
+        .model = if (selected_model) |model_value| model_value.id else null,
+        .model_label = if (selected_model) |model_value| model_value.id else null,
+        .effort = selected_effort,
+        .reported_metadata = .{ .replace = if (selected_model) |model_value| model_value.metadata else null },
+        .model_provenance = model_provenance,
+        .effort_selected = effort_selected,
+    }) catch {
+        try self.writeError("couldn't switch provider — keeping the current selection");
+        return .handled;
+    };
+    defer candidate.deinit();
+    try commitAndWarn(self, live, &candidate);
+    try writeSelectionNotice(self, live.current());
+    return .handled;
+}
 
 fn runModel(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
     const self: *Owner = @ptrCast(@alignCast(context));
@@ -458,15 +686,18 @@ fn runModel(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
     if (live.current().generation != before.generation) return .handled;
 
     const selected_model = models[selected_index];
+    if (models.len == 1) provenance = singletonModelProvenance(before.model_discovered);
     const levels = ai.ModelMeta.resolveEfforts(
         &before.provider_efforts,
         &selected_model.metadata.efforts,
         &catalog[selected_index].efforts,
     );
     var selected_effort: ?[]const u8 = null;
+    var effort_selected = true;
     if (levels.count != 0) {
         const picker = self.selection_picker orelse return .handled;
         const effort_choice = SelectionPicker.effort(picker, &levels, before.effort) catch return .handled;
+        effort_selected = true;
         selected_effort = switch (effort_choice) {
             .canceled => return .handled,
             .selected => |value| value,
@@ -480,12 +711,13 @@ fn runModel(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
         .effort = selected_effort,
         .reported_metadata = .{ .replace = selected_model.metadata },
         .model_provenance = provenance,
+        .effort_selected = effort_selected,
     }) catch {
         try self.writeError("couldn't change model — keeping the current selection");
         return .handled;
     };
     defer candidate.deinit();
-    live.commit(&candidate);
+    try commitAndWarn(self, live, &candidate);
     try writeSelectionNotice(self, live.current());
     return .handled;
 }
@@ -515,15 +747,39 @@ fn runEffort(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
         .model = if (current.preset != null) current.model else null,
         .model_label = current.model_label orelse current.model,
         .effort = selected,
+        .model_provenance = if (current.preset != null) .explicit else .inherited,
+        .effort_selected = true,
     }) catch {
         try self.writeError("couldn't change reasoning effort — keeping the current selection");
         return .handled;
     };
     defer candidate.deinit();
-    live.commit(&candidate);
+    try commitAndWarn(self, live, &candidate);
 
     try writeSelectionNotice(self, live.current());
     return .handled;
+}
+
+fn isLocalProvider(provider_id: []const u8) bool {
+    return std.mem.eql(u8, provider_id, "llamacpp") or std.mem.eql(u8, provider_id, "ollama");
+}
+
+fn singletonModelProvenance(discovered: bool) RunSelection.ModelProvenance {
+    return if (discovered) .discovered else .concrete;
+}
+
+fn commitAndWarn(
+    self: *Owner,
+    live: *RunSelection.Owner,
+    candidate: *RunSelection.Candidate,
+) !void {
+    try writePersistenceWarning(self, live.commit(candidate));
+}
+
+fn writePersistenceWarning(self: *Owner, result: RunSelection.CommitResult) !void {
+    if (result != .run_only or self.persistence_warning_written) return;
+    self.persistence_warning_written = true;
+    try self.writeDiagnosticNote("couldn't save to state.json — this choice applies to this run only");
 }
 
 fn writeSelectionNotice(self: *Owner, committed: RunSelection.CurrentSelection) !void {
@@ -621,6 +877,7 @@ test "help lists only implemented commands and supported shortcuts" {
     try std.testing.expectEqual(Interactive.CommandOutcome.handled, try executeTestCommand(&owner, "/help"));
     try std.testing.expectEqualStrings(
         "commands\n" ++
+            "  /provider    switch provider, then model and effort\n" ++
             "  /model       switch model, then effort\n" ++
             "  /effort      set reasoning effort\n" ++
             "  /help        show this help\n" ++
@@ -687,6 +944,31 @@ test "selection notices escape terminal controls" {
     try owner.writeDiagnosticError("failure\x1b[2J\rhidden");
     try std.testing.expectEqualStrings(
         "provider\\x1b[31m\\nmodel\nfailure\\x1b[2J\\rhidden\n",
+        output.written(),
+    );
+}
+
+test "singleton provenance distinguishes reconciled discoveries" {
+    try std.testing.expectEqual(
+        RunSelection.ModelProvenance.concrete,
+        singletonModelProvenance(false),
+    );
+    try std.testing.expectEqual(
+        RunSelection.ModelProvenance.discovered,
+        singletonModelProvenance(true),
+    );
+}
+
+test "run-only persistence warning uses hax text once per process owner" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+
+    try writePersistenceWarning(&owner, .written);
+    try writePersistenceWarning(&owner, .run_only);
+    try writePersistenceWarning(&owner, .run_only);
+    try std.testing.expectEqualStrings(
+        "couldn't save to state.json — this choice applies to this run only\n",
         output.written(),
     );
 }

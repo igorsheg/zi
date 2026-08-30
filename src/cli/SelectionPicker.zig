@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
+const ProviderConfig = @import("../ProviderConfig.zig");
 const terminal = @import("../terminal/root.zig");
 const ModelOrder = @import("ModelOrder.zig");
 
@@ -9,6 +10,11 @@ pub const EffortOutcome = union(enum) {
 };
 
 pub const ModelOutcome = union(enum) {
+    canceled,
+    selected: usize,
+};
+
+pub const ProviderOutcome = union(enum) {
     canceled,
     selected: usize,
 };
@@ -81,6 +87,50 @@ pub const TerminalRunner = struct {
         );
     }
 };
+
+/// Sorts by display label while returning an index into registry-priority
+/// choices. Dimmed unavailable rows remain selectable.
+pub fn provider(
+    allocator: std.mem.Allocator,
+    runner: Runner,
+    choices: []const ProviderConfig.ProviderChoice,
+    current_provider: []const u8,
+) !ProviderOutcome {
+    if (choices.len == 0) return .canceled;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    const order = try temporary.alloc(usize, choices.len);
+    for (order, 0..) |*destination, index| destination.* = index;
+    std.mem.sort(usize, order, choices, lessProviderIndex);
+
+    const rows = try temporary.alloc(terminal.Picker.Item, choices.len);
+    var initial_index: usize = 0;
+    for (order, rows, 0..) |source_index, *row, row_index| {
+        const choice = choices[source_index];
+        const current = std.mem.eql(u8, choice.id, current_provider);
+        row.* = .{
+            .label = choice.label,
+            .description = if (!std.mem.eql(u8, choice.label, choice.id))
+                try std.fmt.allocPrint(temporary, "id: {s}", .{choice.id})
+            else
+                null,
+            .detail = choice.reason,
+            .dim = !choice.available,
+            .current = current,
+        };
+        if (current) initial_index = row_index;
+    }
+    const selected = try runner.run("select a provider", rows, initial_index) orelse return .canceled;
+    std.debug.assert(selected < order.len);
+    return .{ .selected = order[selected] };
+}
+
+fn lessProviderIndex(choices: []const ProviderConfig.ProviderChoice, left: usize, right: usize) bool {
+    const label_order = std.mem.order(u8, choices[left].label, choices[right].label);
+    if (label_order != .eq) return label_order == .lt;
+    return std.mem.lessThan(u8, choices[left].id, choices[right].id);
+}
 
 /// Builds bounded, picker-lifetime rows. `metadata` is aligned with `models` and
 /// already contains provider-over-catalog merges.
@@ -405,4 +455,41 @@ test "model row numbers round like hax" {
 
 test "model row ownership handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseModelRows, .{});
+}
+
+const ProviderRowRunner = struct {
+    valid: bool = false,
+
+    pub fn run(
+        self: *ProviderRowRunner,
+        title: []const u8,
+        items: []const terminal.Picker.Item,
+        initial_index: usize,
+    ) !?usize {
+        self.valid = std.mem.eql(u8, title, "select a provider") and items.len == 2 and
+            std.mem.eql(u8, items[0].label, "Alpha") and items[0].dim and
+            std.mem.eql(u8, items[0].detail.?, "offline\x1b[2J") and
+            std.mem.eql(u8, items[0].description.?, "id: z-provider") and
+            std.mem.eql(u8, items[1].label, "Zulu") and initial_index == 1;
+        return 0;
+    }
+};
+
+fn exerciseProviderRows(allocator: std.mem.Allocator) !void {
+    const choices = [_]ProviderConfig.ProviderChoice{
+        .{ .id = "a-provider", .label = "Zulu", .available = true, .reason = null },
+        .{ .id = "z-provider", .label = "Alpha", .available = false, .reason = "offline\x1b[2J" },
+    };
+    var runner: ProviderRowRunner = .{};
+    const selected = try provider(allocator, Runner.from(&runner), &choices, "a-provider");
+    try std.testing.expect(runner.valid);
+    try std.testing.expectEqual(@as(usize, 1), selected.selected);
+}
+
+test "provider picker sorts labels and keeps unavailable rows selectable" {
+    try exerciseProviderRows(std.testing.allocator);
+}
+
+test "provider picker releases every partial allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseProviderRows, .{});
 }

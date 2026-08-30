@@ -282,6 +282,17 @@ pub const Random = struct {
         return .{ .context = self, .fill_fn = fill };
     }
 
+    pub fn stateNonceSource(self: *Random) config.StateWriter.NonceSource {
+        return .{ .context = self, .fill_fn = fillState };
+    }
+
+    fn fillState(context: *anyopaque, bytes: []u8) config.StateWriter.NonceError!void {
+        const self: *Random = @ptrCast(@alignCast(context));
+        std.Io.randomSecure(self.io, bytes) catch |err| switch (err) {
+            error.Canceled, error.EntropyUnavailable => return error.Failed,
+        };
+    }
+
     fn fill(context: *anyopaque, bytes: []u8) persistence.PrivateFileStore.Error!void {
         const self: *Random = @ptrCast(@alignCast(context));
         std.Io.randomSecure(self.io, bytes) catch |err| switch (err) {

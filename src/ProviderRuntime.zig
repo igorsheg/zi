@@ -22,6 +22,59 @@ pub const InitError = ProviderConfig.ResolveError;
 /// are serialized with catalog replacement and input-token updates. Catalog or
 /// token mutation from a transport or sink callback is not allowed. Call
 /// `deinit` exactly once, after all copied provider handles have stopped being used.
+/// Listing-only provider composition. It deliberately exposes no streaming
+/// provider handle and cannot enter RunSelection.commit.
+pub const ListingOwned = struct {
+    config: *ProviderConfig.Owned,
+    json_transport: ?ai.JsonTransport.Transport,
+
+    pub fn deinit(self: *ListingOwned) void {
+        self.config.deinit();
+        self.* = undefined;
+    }
+
+    pub fn listModels(
+        self: *ListingOwned,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        tick: ?Provider.Tick,
+    ) ai.ModelListing.Error!ai.ModelListing.Outcome {
+        return listResolvedModels(allocator, io, self.config, self.json_transport, tick);
+    }
+
+    pub fn providerId(self: *const ListingOwned) []const u8 {
+        return self.config.resolved.metadata.provider_id;
+    }
+
+    pub fn displayName(self: *const ListingOwned) []const u8 {
+        return self.config.resolved.metadata.display_name;
+    }
+
+    pub fn defaultModel(self: *const ListingOwned) ?[]const u8 {
+        return self.config.listing_default_model;
+    }
+
+    pub fn modelDiscovered(self: *const ListingOwned) bool {
+        return self.config.model_discovered;
+    }
+
+    pub fn providerEfforts(self: *const ListingOwned) ai.Effort.Set {
+        return self.config.resolved.metadata.provider_efforts;
+    }
+
+    pub fn efforts(self: *const ListingOwned) ai.Effort.Set {
+        return self.config.resolved.metadata.efforts;
+    }
+
+    pub fn catalogId(self: *const ListingOwned) ?[]const u8 {
+        return self.config.resolved.metadata.catalog_id;
+    }
+
+    pub fn keepModelOrder(self: *const ListingOwned) bool {
+        return self.config.keep_model_order;
+    }
+};
+
 pub const Owned = struct {
     allocator: std.mem.Allocator,
     config: *ProviderConfig.Owned,
@@ -34,6 +87,7 @@ pub const Owned = struct {
     metadata: *const Registry.StableMetadata,
     keep_model_order: bool,
     provider_autoselected: bool,
+    model_discovered: bool,
 
     /// Returns a borrowed erased handle tied to this composition's factory.
     pub fn provider(self: *Owned) Provider.Provider {
@@ -59,54 +113,7 @@ pub const Owned = struct {
         self.factory.lockPlan(io);
         defer self.factory.unlockPlan(io);
 
-        const json_transport = self.json_transport orelse return .unsupported;
-        const stable_provider_id = self.config.resolved.metadata.provider_id;
-        switch (self.config.resolved.adapter) {
-            .codex => |config| {
-                var client = ai.CodexOperations.Client.init(json_transport, .{
-                    .source = config.source,
-                    .user_agent = config.user_agent,
-                    .extra_headers = config.extra_headers,
-                    .maximum_access_token_bytes = config.maximum_access_token_bytes,
-                    .maximum_account_id_bytes = config.maximum_account_id_bytes,
-                });
-                return client.listModels(allocator, io, tick);
-            },
-            .openai_chat => |config| {
-                var client = ai.OpenAiModels.Client.init(json_transport, .{
-                    .provider_id = stable_provider_id,
-                    .endpoint = config.endpoint,
-                    .api_key = config.api_key,
-                    .extra_headers = config.extra_headers,
-                    .privileged_header_policy = config.privileged_header_policy,
-                    .dialect = openAiDialect(stable_provider_id),
-                });
-                return client.listModels(allocator, io, tick);
-            },
-            .openai_responses => |config| {
-                var client = ai.OpenAiModels.Client.init(json_transport, .{
-                    .provider_id = stable_provider_id,
-                    .endpoint = config.endpoint,
-                    .api_key = config.api_key,
-                    .extra_headers = config.extra_headers,
-                    .privileged_header_policy = config.privileged_header_policy,
-                    .dialect = openAiDialect(stable_provider_id),
-                });
-                return client.listModels(allocator, io, tick);
-            },
-            .anthropic_messages => |config| {
-                var client = ai.AnthropicModels.Client.init(json_transport, .{
-                    .provider_id = stable_provider_id,
-                    .endpoint = config.endpoint,
-                    .api_key = config.api_key,
-                    .version = config.version,
-                    .extra_headers = config.extra_headers,
-                    .privileged_header_policy = config.privileged_header_policy,
-                });
-                return client.listModels(allocator, io, tick);
-            },
-            .mock => return .unsupported,
-        }
+        return listResolvedModels(allocator, io, self.config, self.json_transport, tick);
     }
 
     pub fn setInputTokens(self: *Owned, io: std.Io, input_tokens: u64) void {
@@ -152,6 +159,16 @@ pub const Owned = struct {
 /// streaming transport. This function performs no ambient configuration lookup
 /// and no network operation. On failure it releases every completed allocation
 /// and returns the original resolution or allocation error unchanged.
+pub fn initListing(
+    inputs_value: ProviderConfig.Inputs,
+    json_transport: ?ai.JsonTransport.Transport,
+) InitError!ListingOwned {
+    var inputs = inputs_value;
+    inputs.listing_only = true;
+    const provider_config = try ProviderConfig.resolve(inputs);
+    return .{ .config = provider_config, .json_transport = json_transport };
+}
+
 pub fn init(
     inputs: ProviderConfig.Inputs,
     transport: Transport.Transport,
@@ -164,11 +181,13 @@ pub fn init(
 /// transports without performing a network operation. The transport
 /// implementations and contexts must outlive the returned owner and calls.
 pub fn initWithJson(
-    inputs: ProviderConfig.Inputs,
+    inputs_value: ProviderConfig.Inputs,
     transport: Transport.Transport,
     json_transport: ?ai.JsonTransport.Transport,
     initial_input_tokens: u64,
 ) InitError!Owned {
+    var inputs = inputs_value;
+    inputs.listing_only = false;
     const config = try ProviderConfig.resolve(inputs);
     errdefer config.deinit();
 
@@ -185,7 +204,65 @@ pub fn initWithJson(
         .metadata = &config.resolved.metadata,
         .keep_model_order = config.keep_model_order,
         .provider_autoselected = config.provider_autoselected,
+        .model_discovered = config.model_discovered,
     };
+}
+
+fn listResolvedModels(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    provider_config: *ProviderConfig.Owned,
+    json_transport_value: ?ai.JsonTransport.Transport,
+    tick: ?Provider.Tick,
+) ai.ModelListing.Error!ai.ModelListing.Outcome {
+    const json_transport = json_transport_value orelse return .unsupported;
+    const stable_provider_id = provider_config.resolved.metadata.provider_id;
+    switch (provider_config.resolved.adapter) {
+        .codex => |config| {
+            var client = ai.CodexOperations.Client.init(json_transport, .{
+                .source = config.source,
+                .user_agent = config.user_agent,
+                .extra_headers = config.extra_headers,
+                .maximum_access_token_bytes = config.maximum_access_token_bytes,
+                .maximum_account_id_bytes = config.maximum_account_id_bytes,
+            });
+            return client.listModels(allocator, io, tick);
+        },
+        .openai_chat => |config| {
+            var client = ai.OpenAiModels.Client.init(json_transport, .{
+                .provider_id = stable_provider_id,
+                .endpoint = config.endpoint,
+                .api_key = config.api_key,
+                .extra_headers = config.extra_headers,
+                .privileged_header_policy = config.privileged_header_policy,
+                .dialect = openAiDialect(stable_provider_id),
+            });
+            return client.listModels(allocator, io, tick);
+        },
+        .openai_responses => |config| {
+            var client = ai.OpenAiModels.Client.init(json_transport, .{
+                .provider_id = stable_provider_id,
+                .endpoint = config.endpoint,
+                .api_key = config.api_key,
+                .extra_headers = config.extra_headers,
+                .privileged_header_policy = config.privileged_header_policy,
+                .dialect = openAiDialect(stable_provider_id),
+            });
+            return client.listModels(allocator, io, tick);
+        },
+        .anthropic_messages => |config| {
+            var client = ai.AnthropicModels.Client.init(json_transport, .{
+                .provider_id = stable_provider_id,
+                .endpoint = config.endpoint,
+                .api_key = config.api_key,
+                .version = config.version,
+                .extra_headers = config.extra_headers,
+                .privileged_header_policy = config.privileged_header_policy,
+            });
+            return client.listModels(allocator, io, tick);
+        },
+        .mock => return .unsupported,
+    }
 }
 
 fn openAiDialect(provider_id: []const u8) ai.OpenAiModels.Dialect {
@@ -885,6 +962,67 @@ test "initialization is transactional at every allocation index and preserves re
         .provider_override = "invalid-dynamic",
         .provider_definitions = &.{invalid},
     }, Transport.Transport.from(&fake), 0));
+}
+
+fn exerciseListingWithoutModel(allocator: std.mem.Allocator) !void {
+    const environment: TestEnvironment = .{};
+    const definition: config_module.ProviderDefinitions.Definition = .{
+        .id = @constCast("listing-dynamic"),
+        .api = .openai_completions,
+        .base_url = @constCast("https://listing.test/v1"),
+        .api_key = @constCast("runtime-secret"),
+    };
+    var listing_transport: FakeListingTransport = .{ .route = .openai_chat };
+    const reported: ai.ModelMeta.Metadata = .{ .efforts = try ai.Effort.Set.init(&.{"high"}) };
+    var runtime = try initListing(.{
+        .allocator = allocator,
+        .store = .init(.{
+            .registry = config_module.Settings.storeRegistry(),
+            .environment = .from(&environment),
+        }),
+        .api_key_environment = .from(&environment),
+        .provider_override = "listing-dynamic",
+        .provider_definitions = &.{definition},
+        .hints = .{ .reported = &reported },
+    }, ai.JsonTransport.Transport.from(&listing_transport));
+    defer runtime.deinit();
+    try std.testing.expect(runtime.defaultModel() == null);
+    try std.testing.expect(runtime.providerEfforts().count > runtime.efforts().count);
+    try std.testing.expectEqualStrings("high", runtime.efforts().valueAt(0));
+    var outcome = try runtime.listModels(allocator, std.testing.io, null);
+    defer outcome.deinit();
+    try std.testing.expectEqualStrings("chat-model", outcome.models.models[0].id);
+    try std.testing.expect(listing_transport.valid);
+}
+
+test "listing-only runtime enumerates without a configured model" {
+    try exerciseListingWithoutModel(std.testing.allocator);
+}
+
+test "listing-only runtime releases every partial allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseListingWithoutModel, .{});
+}
+
+test "streaming initialization rejects a missing model even when inputs request listing mode" {
+    const environment: TestEnvironment = .{};
+    const definition: config_module.ProviderDefinitions.Definition = .{
+        .id = @constCast("streaming-missing-model"),
+        .api = .openai_completions,
+        .base_url = @constCast("https://streaming.test/v1"),
+        .api_key = @constCast("runtime-secret"),
+    };
+    var fake: FakeTransport = .{};
+    try std.testing.expectError(error.MissingModel, initWithJson(.{
+        .allocator = std.testing.allocator,
+        .store = .init(.{
+            .registry = config_module.Settings.storeRegistry(),
+            .environment = .from(&environment),
+        }),
+        .api_key_environment = .from(&environment),
+        .provider_override = "streaming-missing-model",
+        .provider_definitions = &.{definition},
+        .listing_only = true,
+    }, ai.Transport.Transport.from(&fake), null, 0));
 }
 
 test "independent owners retain independent cache keys" {

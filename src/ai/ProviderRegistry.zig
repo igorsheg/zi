@@ -36,7 +36,8 @@ pub const Descriptor = struct {
     catalog_wires: bool = false,
 };
 
-// This order is both the picker order and the automatic-selection priority.
+// This order is automatic-selection priority. Provider pickers sort a copied
+// merged view by display label.
 pub const descriptors = [_]Descriptor{
     .{
         .id = "codex",

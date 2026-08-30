@@ -155,7 +155,126 @@ pub const Inputs = struct {
     hints: Registry.ModelHints = .{},
     rules: Registry.Rules = .{},
     http_policy: HttpPolicy = .{},
+    /// Listing-only runtimes may resolve an adapter before a model has been
+    /// chosen. The placeholder never becomes a streaming run selection.
+    listing_only: bool = false,
 };
+
+pub const maximum_provider_choices: usize = ProviderDefinitions.maximum_definitions + Registry.order().len;
+pub const maximum_provider_choice_bytes: usize = ProviderDefinitions.maximum_retained_bytes;
+
+pub const ProviderChoice = struct {
+    id: []const u8,
+    label: []const u8,
+    available: bool,
+    reason: ?[]const u8,
+};
+
+const ProviderChoiceOwner = struct {
+    parent_allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+};
+
+pub const ProviderChoices = struct {
+    values: []const ProviderChoice,
+    owner: *ProviderChoiceOwner,
+
+    pub fn deinit(self: *ProviderChoices) void {
+        const owner = self.owner;
+        const allocator = owner.parent_allocator;
+        owner.arena.deinit();
+        owner.* = undefined;
+        allocator.destroy(owner);
+        self.* = undefined;
+    }
+};
+
+/// Returns the selectable compiled registry followed by config-only providers.
+/// Registry order remains automatic-selection priority. Presentation may sort
+/// this owned result without changing that order.
+pub fn providerChoices(parent_allocator: std.mem.Allocator, inputs: Inputs) !ProviderChoices {
+    const owner = try parent_allocator.create(ProviderChoiceOwner);
+    errdefer parent_allocator.destroy(owner);
+    owner.* = .{ .parent_allocator = parent_allocator, .arena = .init(parent_allocator) };
+    errdefer owner.arena.deinit();
+    const allocator = owner.arena.allocator();
+    var values: std.ArrayList(ProviderChoice) = .empty;
+    defer values.deinit(allocator);
+    var retained_bytes: usize = 0;
+
+    for (Registry.order()) |descriptor| {
+        if (!descriptor.selectable) continue;
+        try appendProviderChoice(allocator, &values, &retained_bytes, inputs, descriptor.id, descriptor.display_name);
+    }
+    for (inputs.provider_definitions) |definition| {
+        if (!validDynamicId(definition.id) or Registry.find(definition.id) != null) continue;
+        const label = if (definition.display_name) |value|
+            if (value.len != 0) value else definition.id
+        else
+            definition.id;
+        try appendProviderChoice(allocator, &values, &retained_bytes, inputs, definition.id, label);
+    }
+    return .{ .values = try values.toOwnedSlice(allocator), .owner = owner };
+}
+
+fn appendProviderChoice(
+    allocator: std.mem.Allocator,
+    values: *std.ArrayList(ProviderChoice),
+    retained_bytes: *usize,
+    inputs: Inputs,
+    id: []const u8,
+    fallback_label: []const u8,
+) !void {
+    const definition = findDefinition(inputs.provider_definitions, id);
+    const label_source = if (definition) |value|
+        if (value.display_name) |label| if (label.len != 0) label else fallback_label else fallback_label
+    else
+        fallback_label;
+    const available = providerAvailable(allocator, inputs, id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => false,
+    };
+    const reason_source: ?[]const u8 = if (available) null else try unavailableReason(allocator, id, definition);
+    if (values.items.len == maximum_provider_choices) return error.TooManyProviderChoices;
+    var added_bytes = std.math.add(usize, id.len, label_source.len) catch return error.ProviderChoicesTooLarge;
+    if (reason_source) |reason| {
+        added_bytes = std.math.add(usize, added_bytes, reason.len) catch return error.ProviderChoicesTooLarge;
+    }
+    const next_retained = std.math.add(usize, retained_bytes.*, added_bytes) catch
+        return error.ProviderChoicesTooLarge;
+    if (next_retained > maximum_provider_choice_bytes) return error.ProviderChoicesTooLarge;
+    try values.append(allocator, .{
+        .id = try allocator.dupe(u8, id),
+        .label = try allocator.dupe(u8, label_source),
+        .available = available,
+        .reason = reason_source,
+    });
+    retained_bytes.* = next_retained;
+}
+
+fn unavailableReason(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    definition: ?Definition,
+) ![]const u8 {
+    if (definition) |value| if (definitionDeclaresKey(&value)) {
+        if (value.api_key_env) |name| if (name.len != 0) {
+            return std.fmt.allocPrint(allocator, "{s} not set", .{name});
+        };
+        return std.fmt.allocPrint(allocator, "providers.{s}.api_key not set", .{id});
+    };
+    if (std.mem.eql(u8, id, "codex")) return "not logged in (use /login)";
+    if (std.mem.eql(u8, id, "llamacpp") or std.mem.eql(u8, id, "ollama")) {
+        return "server not reachable";
+    }
+    if (std.mem.eql(u8, id, "openai")) return "OPENAI_API_KEY not set";
+    if (std.mem.eql(u8, id, "anthropic")) return "ANTHROPIC_API_KEY not set";
+    if (std.mem.eql(u8, id, "openrouter")) return "OPENROUTER_API_KEY not set";
+    if (std.mem.eql(u8, id, "openai-compatible")) return "HAX_OPENAI_BASE_URL not set";
+    if (std.mem.eql(u8, id, "anthropic-compatible")) return "HAX_ANTHROPIC_BASE_URL not set";
+    if (isOpenCode(id)) return "OPENCODE_API_KEY not set";
+    return "provider is not configured";
+}
 
 pub const ResolveError = error{
     OutOfMemory,
@@ -247,6 +366,10 @@ pub const Owned = struct {
     effort: ?[]const u8,
     keep_model_order: bool,
     provider_autoselected: bool,
+    model_discovered: bool,
+    /// Null for ordinary resolution. A listing-only placeholder is never a
+    /// safe provider default and must not be committed as a model choice.
+    listing_default_model: ?[]const u8,
     /// Pure resolver inputs retained so an authoritative catalog result can
     /// transactionally rebuild the complete adapter plan without borrowing the
     /// caller's configuration.
@@ -455,6 +578,14 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
     errdefer freeEffort(owned.wiping_allocator.allocator(), owned.effort);
     owned.keep_model_order = !(if (definition) |value| value.sort_models orelse true else true);
     owned.provider_autoselected = !selection.explicit;
+    owned.model_discovered = std.mem.eql(u8, descriptor.id, "llamacpp") and
+        ((if (inputs.llama_reconciliation) |value| switch (value) {
+            .replace => true,
+            .unchanged, .clear => false,
+        } else false) or
+            (if (inputs.llama_discovered_model) |value| std.mem.eql(u8, value, model) else false));
+    owned.listing_default_model = if (inputs.listing_only and
+        std.mem.eql(u8, model, listing_model_placeholder)) null else model;
     return owned;
 }
 
@@ -603,12 +734,16 @@ fn hasKey(
     fallback: []const u8,
 ) !bool {
     const inline_result = try inputs.store.readNonempty(allocator, setting);
-    return (try ApiKey.resolve(allocator, .{
+    var secret = try ApiKey.resolve(allocator, .{
         .inline_value = inline_result.value,
         .fallback_env_name = fallback,
         .environment = inputs.api_key_environment,
-    })) != null;
+    });
+    defer if (secret) |*value| value.deinit(allocator);
+    return secret != null;
 }
+
+const listing_model_placeholder = "zi-listing-candidate";
 
 fn selectModel(
     allocator: std.mem.Allocator,
@@ -636,7 +771,9 @@ fn selectModel(
         @as(?[]const u8, "mock-model")
     else
         null;
-    return allocator.dupe(u8, fallback orelse return error.MissingModel);
+    if (fallback) |value| return allocator.dupe(u8, value);
+    if (inputs.listing_only) return allocator.dupe(u8, listing_model_placeholder);
+    return error.MissingModel;
 }
 
 fn selectRequestedEffort(
@@ -907,11 +1044,13 @@ fn definitionHasKey(
         (if (name.len == 0) default_environment else name)
     else
         default_environment;
-    return (try ApiKey.resolve(allocator, .{
+    var secret = try ApiKey.resolve(allocator, .{
         .inline_value = definition.api_key,
         .fallback_env_name = fallback,
         .environment = inputs.api_key_environment,
-    })) != null;
+    });
+    defer if (secret) |*value| value.deinit(allocator);
+    return secret != null;
 }
 
 fn definitionAuth(
@@ -3481,6 +3620,98 @@ test "authoritative catalog rebuild is transactional on allocation failure" {
     try std.testing.expect(!observing.secret_seen_on_free);
 }
 
+const ChoiceEnvironment = struct {
+    pub fn get(_: *const ChoiceEnvironment, name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, name, "OPENAI_API_KEY")) return "openai-secret";
+        return null;
+    }
+};
+
+fn exerciseProviderChoices(allocator: std.mem.Allocator) !void {
+    const environment: ChoiceEnvironment = .{};
+    const definitions = [_]Definition{
+        .{ .id = @constCast("openai"), .display_name = @constCast("Zulu OpenAI") },
+        .{
+            .id = @constCast("custom-provider"),
+            .api = .openai_completions,
+            .base_url = @constCast("https://custom.test/v1"),
+            .display_name = @constCast("Alpha Custom"),
+        },
+    };
+    var choices = try providerChoices(allocator, .{
+        .allocator = allocator,
+        .store = .init(.{
+            .registry = Settings.storeRegistry(),
+            .environment = .from(&environment),
+        }),
+        .api_key_environment = .from(&environment),
+        .provider_definitions = &definitions,
+    });
+    defer choices.deinit();
+    try std.testing.expect(choices.values.len > Registry.order().len);
+    try std.testing.expectEqualStrings("codex", choices.values[0].id);
+    var openai_count: usize = 0;
+    var saw_custom = false;
+    for (choices.values) |choice| {
+        if (std.mem.eql(u8, choice.id, "openai")) {
+            openai_count += 1;
+            try std.testing.expect(choice.available);
+            try std.testing.expectEqualStrings("Zulu OpenAI", choice.label);
+        }
+        if (std.mem.eql(u8, choice.id, "custom-provider")) {
+            saw_custom = true;
+            try std.testing.expect(choice.available);
+            try std.testing.expectEqualStrings("Alpha Custom", choice.label);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), openai_count);
+    try std.testing.expect(saw_custom);
+}
+
+test "provider choices merge registry priority with config-only definitions" {
+    try exerciseProviderChoices(std.testing.allocator);
+}
+
+test "provider choice ownership handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseProviderChoices, .{});
+}
+
+test "provider choices reject counts beyond the public bound" {
+    const environment: ChoiceEnvironment = .{};
+    const definitions = try std.testing.allocator.alloc(Definition, maximum_provider_choices + 1);
+    defer std.testing.allocator.free(definitions);
+    for (definitions) |*definition| definition.* = .{ .id = @constCast("x") };
+    try std.testing.expectError(error.TooManyProviderChoices, providerChoices(std.testing.allocator, .{
+        .allocator = std.testing.allocator,
+        .store = .init(.{
+            .registry = Settings.storeRegistry(),
+            .environment = .from(&environment),
+        }),
+        .api_key_environment = .from(&environment),
+        .provider_definitions = definitions,
+    }));
+}
+
+test "provider choices reject retained data beyond the public bound" {
+    const environment: ChoiceEnvironment = .{};
+    const label = try std.testing.allocator.alloc(u8, maximum_provider_choice_bytes + 1);
+    defer std.testing.allocator.free(label);
+    @memset(label, 'x');
+    const definition: Definition = .{
+        .id = @constCast("bounded-provider"),
+        .display_name = label,
+    };
+    try std.testing.expectError(error.ProviderChoicesTooLarge, providerChoices(std.testing.allocator, .{
+        .allocator = std.testing.allocator,
+        .store = .init(.{
+            .registry = Settings.storeRegistry(),
+            .environment = .from(&environment),
+        }),
+        .api_key_environment = .from(&environment),
+        .provider_definitions = &.{definition},
+    }));
+}
+
 test "llama reconciliation overrides configured IDs and can clear them" {
     const environment: TestEnvironment = .{};
     var document = try Document.parse(
@@ -3509,6 +3740,7 @@ test "llama reconciliation overrides configured IDs and can clear them" {
     @memset(&header_name, 'x');
     @memset(&header_value, 'x');
     try std.testing.expectEqualStrings("served", replaced.model);
+    try std.testing.expect(replaced.model_discovered);
     try std.testing.expectEqual(@as(usize, 1), replaced.resolved.adapter.openai_chat.extra_headers.len);
     try std.testing.expectEqualStrings("X-Local", replaced.resolved.adapter.openai_chat.extra_headers[0].name);
     try std.testing.expectEqualStrings("local-secret", replaced.resolved.adapter.openai_chat.extra_headers[0].value);
