@@ -215,6 +215,9 @@ pub const StableMetadata = struct {
     model_id: []const u8,
     /// Null only for the internal mock provider, which has no wire dialect.
     wire: ?Wire,
+    /// Provider/wire vocabulary before model metadata narrows it.
+    provider_efforts: Effort.Set,
+    /// Effective vocabulary for the selected model.
     efforts: Effort.Set,
     model: ModelMeta.Metadata,
     send_cache_key: bool,
@@ -448,6 +451,7 @@ pub fn resolveDescriptor(
                 .catalog_id = null,
                 .model_id = model_id,
                 .wire = null,
+                .provider_efforts = .{},
                 .efforts = .{},
                 .model = .{},
                 .send_cache_key = false,
@@ -611,6 +615,7 @@ pub fn resolveDescriptor(
             .catalog_id = effective_catalog_id,
             .model_id = model_id,
             .wire = wire,
+            .provider_efforts = provider_ladder,
             .efforts = efforts,
             .model = merged,
             .send_cache_key = send_cache_key,

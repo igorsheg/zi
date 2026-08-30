@@ -1,7 +1,11 @@
 const std = @import("std");
+const ai = @import("../ai/root.zig");
 const render = @import("../render/root.zig");
 const text = @import("../text/root.zig");
+const DiagnosticText = @import("DiagnosticText.zig");
 const Interactive = @import("Interactive.zig");
+const RunSelection = @import("RunSelection.zig");
+const SelectionPicker = @import("SelectionPicker.zig");
 const Slash = @import("Slash.zig");
 
 const bold = "\x1b[1m";
@@ -49,11 +53,19 @@ const shortcuts = [_]Shortcut{
     .{ .key = "ctrl-l", .description = "clear screen and redraw prompt" },
 };
 
-const specs = [_]Slash.Spec{.{
-    .name = "help",
-    .summary = "show this help",
-    .handler_fn = runHelp,
-}};
+const specs = [_]Slash.Spec{
+    .{
+        .name = "effort",
+        .summary = "set reasoning effort",
+        .display = .managed,
+        .handler_fn = runEffort,
+    },
+    .{
+        .name = "help",
+        .summary = "show this help",
+        .handler_fn = runHelp,
+    },
+};
 
 comptime {
     Slash.assertValidSpecs(&specs);
@@ -68,6 +80,8 @@ pub const Owner = struct {
     columns: usize,
     width_source: ?WidthSource = null,
     frame: ?*render.Frame = null,
+    run_selection: ?*RunSelection.Owner = null,
+    effort_picker: ?SelectionPicker.Runner = null,
 
     pub fn init(
         writer: *std.Io.Writer,
@@ -89,6 +103,14 @@ pub const Owner = struct {
 
     pub fn setFrame(self: *Owner, frame: *render.Frame) void {
         self.frame = frame;
+    }
+
+    pub fn setRunSelection(self: *Owner, run_selection: *RunSelection.Owner) void {
+        self.run_selection = run_selection;
+    }
+
+    pub fn setEffortPicker(self: *Owner, picker: SelectionPicker.Runner) void {
+        self.effort_picker = picker;
     }
 
     pub fn gateway(self: *Owner) Interactive.CommandGateway {
@@ -202,6 +224,29 @@ pub const Owner = struct {
         }
     }
 
+    fn writeNote(self: *Owner, message: []const u8) !void {
+        try self.writeStyle(self.theme.chrome_dim.open);
+        try self.write(message);
+        try self.writeStyle(self.theme.chrome_dim.close);
+        try self.write("\n");
+    }
+
+    fn writeError(self: *Owner, message: []const u8) !void {
+        try self.writeStyle(self.theme.error_style.open);
+        try self.write(message);
+        try self.writeStyle(self.theme.error_style.close);
+        try self.write("\n");
+    }
+
+    fn writeDiagnosticNote(self: *Owner, message: []const u8) !void {
+        var storage: [4096]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&storage);
+        DiagnosticText.write(&writer, message) catch {
+            return self.writeNote("selection changed (details omitted)");
+        };
+        try self.writeNote(writer.buffered());
+    }
+
     fn writeHeading(self: *Owner, heading: []const u8) !void {
         if (self.styled) try self.write(bold);
         try self.write(heading);
@@ -280,6 +325,75 @@ pub const Owner = struct {
     }
 };
 
+fn runEffort(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
+    const self: *Owner = @ptrCast(@alignCast(context));
+    const live = self.run_selection orelse {
+        try self.writeNote("no provider selected — use /provider to choose one first");
+        return .handled;
+    };
+    const current = live.current();
+    const levels = current.efforts;
+    if (levels.count == 0) {
+        var buffer: [256]u8 = undefined;
+        try self.writeDiagnosticNote(effortUnavailableMessage(&buffer, current));
+        return .handled;
+    }
+
+    const picker = self.effort_picker orelse return .handled;
+    const choice = SelectionPicker.effort(picker, &levels, current.effort) catch return .handled;
+    const selected = switch (choice) {
+        .canceled => return .handled,
+        .selected => |value| value,
+    };
+    if (live.current().generation != current.generation) return .handled;
+    var candidate = live.prepare(.{
+        .model = if (current.preset != null) current.model else null,
+        .model_label = current.model_label orelse current.model,
+        .effort = selected,
+    }) catch {
+        try self.writeError("couldn't change reasoning effort — keeping the current selection");
+        return .handled;
+    };
+    defer candidate.deinit();
+    live.commit(&candidate);
+
+    const committed = live.current();
+    if (committed.effort) |effort_value| {
+        var buffer: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &buffer,
+            "switched to {s} · {s} · {s}",
+            .{ committed.provider_label, committed.model, effort_value },
+        ) catch "switched reasoning effort";
+        try self.writeDiagnosticNote(message);
+    } else {
+        var buffer: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &buffer,
+            "switched to {s} · {s}",
+            .{ committed.provider_label, committed.model },
+        ) catch "switched to provider-default reasoning effort";
+        try self.writeDiagnosticNote(message);
+    }
+    return .handled;
+}
+
+fn effortUnavailableMessage(
+    buffer: []u8,
+    current: RunSelection.CurrentSelection,
+) []const u8 {
+    if (current.provider_efforts.count != 0) return std.fmt.bufPrint(
+        buffer,
+        "{s} doesn't take reasoning-effort levels",
+        .{current.model},
+    ) catch "this model doesn't take reasoning-effort levels";
+    return std.fmt.bufPrint(
+        buffer,
+        "the {s} provider doesn't expose reasoning-effort levels",
+        .{current.provider_label},
+    ) catch "the current provider doesn't expose reasoning-effort levels";
+}
+
 fn runHelp(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
     const self: *Owner = @ptrCast(@alignCast(context));
     try self.renderHelp();
@@ -340,6 +454,7 @@ test "help lists only implemented commands and supported shortcuts" {
     try std.testing.expectEqual(Interactive.CommandOutcome.handled, try executeTestCommand(&owner, "/help"));
     try std.testing.expectEqualStrings(
         "commands\n" ++
+            "  /effort      set reasoning effort\n" ++
             "  /help        show this help\n" ++
             "\nshortcuts\n" ++
             "  enter        submit prompt\n" ++
@@ -366,6 +481,42 @@ test "help stacks descriptions on narrow displays and wraps by cells" {
         "  shift-enter\n    insert newline\n    (terminal must\n    be configured to\n",
     ) != null);
     try std.testing.expect(std.mem.find(u8, output.written(), "\x1b[?1049") == null);
+}
+
+test "effort unavailability distinguishes model restrictions from provider vocabulary" {
+    var buffer: [256]u8 = undefined;
+    var provider_efforts = try ai.Effort.Set.init(&.{"high"});
+    const base: RunSelection.CurrentSelection = .{
+        .provider = "p",
+        .provider_label = "Provider",
+        .model = "model-x",
+        .model_label = "Model X",
+        .effort = null,
+        .preset = null,
+        .provider_efforts = provider_efforts,
+        .efforts = .{},
+        .model_metadata = .{},
+    };
+    try std.testing.expectEqualStrings(
+        "model-x doesn't take reasoning-effort levels",
+        effortUnavailableMessage(&buffer, base),
+    );
+    provider_efforts = try ai.Effort.Set.init(&.{});
+    var no_provider_levels = base;
+    no_provider_levels.provider_efforts = provider_efforts;
+    try std.testing.expectEqualStrings(
+        "the Provider provider doesn't expose reasoning-effort levels",
+        effortUnavailableMessage(&buffer, no_provider_levels),
+    );
+}
+
+test "selection notices escape terminal controls" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+
+    try owner.writeDiagnosticNote("provider\x1b[31m\nmodel");
+    try std.testing.expectEqualStrings("provider\\x1b[31m\\nmodel\n", output.written());
 }
 
 test "unknown and bad usage diagnostics are exact and safe" {

@@ -83,6 +83,30 @@ pub const SelectionError = error{
     Indeterminate,
 };
 
+pub const PrepareSelectionError = error{
+    OutOfMemory,
+    Failed,
+    Indeterminate,
+    Diverged,
+};
+
+/// Move-only coordinated session and log replacement. Preparation changes
+/// neither owner; publication consumes both replacements without allocating.
+pub const PreparedSelection = struct {
+    session: agent.Session.PreparedSelection,
+    log: persistence.SessionFile.PreparedSelection,
+    changed: bool,
+    active: bool = true,
+
+    pub fn deinit(self: *PreparedSelection) void {
+        if (self.active) {
+            self.log.deinit();
+            self.session.deinit();
+        }
+        self.* = undefined;
+    }
+};
+
 /// Heap-stable owner of the erased seam hook. `log` is borrowed and must
 /// outlive this owner. Calls must remain synchronous and serialized with all
 /// other mutations of the log.
@@ -134,34 +158,63 @@ pub const Owner = struct {
         }
     }
 
-    /// Stages the log selection, then changes the live session. If the second
-    /// step fails, this restores the old log selection before returning the
-    /// definite error. A failed rollback is returned as an explicit split.
-    /// Selection records become durable with the next non-empty seam append.
+    /// Verifies the current session and log agree, then owns both prospective
+    /// replacements without changing either side.
+    pub fn prepareSelection(
+        self: *Owner,
+        session: *agent.Session.Session,
+        requested: persistence.SessionFile.Selection,
+    ) PrepareSelectionError!PreparedSelection {
+        const old_session = session.currentSelection();
+        if (!crossSelectionEqual(self.log.currentSelection(), old_session)) return error.Diverged;
+
+        const normalized = normalizeSelection(requested);
+        const changed = !crossSelectionEqual(normalized.log, old_session);
+        var session_prepared = session.prepareSelection(normalized.session) catch |err|
+            return mapSessionError(err);
+        errdefer session_prepared.deinit();
+        var log_prepared = self.log.prepareSelection(normalized.log) catch |err|
+            return mapSelectionLogError(err);
+        errdefer log_prepared.deinit();
+        return .{
+            .session = session_prepared,
+            .log = log_prepared,
+            .changed = changed,
+        };
+    }
+
+    /// Publishes a coordinated replacement without allocating. Consumes `prepared`.
+    pub fn publishSelection(
+        self: *Owner,
+        session: *agent.Session.Session,
+        prepared: *PreparedSelection,
+    ) void {
+        std.debug.assert(prepared.active);
+        session.publishSelection(&prepared.session);
+        self.log.publishSelection(&prepared.log);
+        prepared.active = false;
+    }
+
+    /// Preserves the original unchanged, updated, and divergence outcomes while
+    /// delegating all fallible work to preparation.
     pub fn updateSelection(
         self: *Owner,
         session: *agent.Session.Session,
         requested: persistence.SessionFile.Selection,
     ) SelectionError!SelectionUpdate {
-        const old_session = session.currentSelection();
-        const old_log = self.log.currentSelection();
-        if (!crossSelectionEqual(old_log, old_session)) return .{ .partial = .{
-            .state = .preexisting_divergence,
-            .failure = .indeterminate,
-        } };
-
-        const normalized = normalizeSelection(requested);
-        if (crossSelectionEqual(normalized.log, old_session)) return .unchanged;
-
-        self.log.setSelection(normalized.log) catch |err| return mapSelectionLogError(err);
-        session.reconfigureSelection(normalized.session) catch |session_err| {
-            self.log.setSelection(sessionToLog(old_session)) catch |rollback_err| return .{ .partial = .{
-                .state = .log_only,
-                .failure = classifyLogError(rollback_err),
-            } };
-            return mapSessionError(session_err);
+        var prepared = self.prepareSelection(session, requested) catch |err| switch (err) {
+            error.Diverged => return .{ .partial = .{
+                .state = .preexisting_divergence,
+                .failure = .indeterminate,
+            } },
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Failed => return error.Failed,
+            error.Indeterminate => return error.Indeterminate,
         };
-        return .updated;
+        defer prepared.deinit();
+        const changed = prepared.changed;
+        self.publishSelection(session, &prepared);
+        return if (changed) .updated else .unchanged;
     }
 };
 
@@ -190,16 +243,6 @@ fn normalizeSelection(value: persistence.SessionFile.Selection) NormalizedSelect
             .effort = value.effort,
             .preset = preset,
         },
-    };
-}
-
-fn sessionToLog(value: agent.Session.Selection) persistence.SessionFile.Selection {
-    return .{
-        .provider = value.provider_id,
-        .model = value.model,
-        .model_label = value.model_label,
-        .effort = value.effort,
-        .preset = value.preset,
     };
 }
 
@@ -240,14 +283,6 @@ fn mapSelectionLogError(err: persistence.SessionFile.Error) SelectionError {
         error.OutOfMemory => error.OutOfMemory,
         error.Failed => error.Failed,
         error.Indeterminate => error.Indeterminate,
-    };
-}
-
-fn classifyLogError(err: persistence.SessionFile.Error) FailureClass {
-    return switch (mapLogError(err)) {
-        error.OutOfMemory => .out_of_memory,
-        error.Failed => .failed,
-        error.Indeterminate => .indeterminate,
     };
 }
 
@@ -369,7 +404,7 @@ test "hook maps mismatch and callback failures without advancing observations" {
     try std.testing.expectEqual(error.Failed, mapLogError(error.FileTooLarge));
 }
 
-test "selection update handles same change rollback and preexisting divergence" {
+test "prepared selection can be dropped, published, and rejects divergence" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -389,13 +424,23 @@ test "selection update handles same change rollback and preexisting divergence" 
     const owner = try Owner.create(allocator, &log, .{});
     defer owner.deinit();
 
+    var no_op = try owner.prepareSelection(&session, original);
+    try std.testing.expect(!no_op.changed);
+    owner.publishSelection(&session, &no_op);
+    no_op.deinit();
+
+    var dropped = try owner.prepareSelection(&session, .{ .provider = "b", .model = "m2" });
+    dropped.deinit();
+    try std.testing.expectEqualStrings("a", session.currentSelection().provider_id.?);
+    try std.testing.expectEqualStrings("a", log.currentSelection().provider.?);
+
     try std.testing.expectEqual(SelectionUpdate.unchanged, try owner.updateSelection(&session, original));
     const changed = try owner.updateSelection(&session, .{ .provider = "b", .model = "m2" });
     try std.testing.expectEqual(SelectionUpdate.updated, changed);
     try std.testing.expectEqualStrings("b", session.currentSelection().provider_id.?);
     try std.testing.expectEqualStrings("b", log.currentSelection().provider.?);
 
-    // The log stages first. A deterministic session cap failure is rolled back.
+    // Preparation validates both replacements before either side changes.
     try std.testing.expectError(
         error.Failed,
         owner.updateSelection(&session, .{ .provider = "too-long", .model = "m2" }),
@@ -404,9 +449,63 @@ test "selection update handles same change rollback and preexisting divergence" 
     try std.testing.expectEqualStrings("b", log.currentSelection().provider.?);
 
     try log.setSelection(.{ .provider = "other", .model = "m2" });
+    try std.testing.expectError(
+        error.Diverged,
+        owner.prepareSelection(&session, .{ .provider = "c", .model = "m2" }),
+    );
     const partial = try owner.updateSelection(&session, .{ .provider = "c", .model = "m2" });
     try std.testing.expectEqual(PartialState.preexisting_divergence, partial.partial.state);
     try std.testing.expectEqual(FailureClass.indeterminate, partial.partial.failure);
+}
+
+fn exerciseSelectionPreparationAllocations(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+) !void {
+    const original: persistence.SessionFile.Selection = .{
+        .provider = "old-provider",
+        .model = "old-model",
+        .model_label = "Old Model",
+        .effort = "low",
+        .preset = "old-preset",
+    };
+    var log = try testLog(allocator, std.testing.io, root, original);
+    defer log.deinit();
+    var session = try agent.Session.Session.init(allocator, .{
+        .provider_id = original.provider,
+        .model = original.model,
+        .model_label = original.model_label,
+        .effort = original.effort,
+        .preset = original.preset,
+    });
+    defer session.deinit();
+    const owner = try Owner.create(allocator, &log, .{});
+    defer owner.deinit();
+
+    var prepared = try owner.prepareSelection(&session, .{
+        .provider = "new-provider",
+        .model = "new-model",
+        .model_label = "New Model",
+        .effort = "high",
+        .preset = "new-preset",
+    });
+    defer prepared.deinit();
+    try std.testing.expectEqualStrings("old-provider", session.currentSelection().provider_id.?);
+    try std.testing.expectEqualStrings("old-provider", log.currentSelection().provider.?);
+}
+
+test "coordinated selection preparation frees every allocation failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        exerciseSelectionPreparationAllocations,
+        .{root},
+    );
 }
 
 test "resumed log continues from loaded session high water" {

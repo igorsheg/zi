@@ -176,6 +176,17 @@ pub const Owner = struct {
         return self.state.selection.store();
     }
 
+    pub fn prepareRun(
+        self: *const Owner,
+        change: config.Selection.RunChange,
+    ) config.Selection.Error!config.Selection.PreparedRun {
+        return self.state.selection.prepareRun(change);
+    }
+
+    pub fn publishRun(self: *Owner, prepared: *config.Selection.PreparedRun) void {
+        self.state.selection.publishRun(prepared);
+    }
+
     pub fn presetPlans(self: *const Owner) []const config.Preset.Plan {
         return self.state.presets.plans;
     }
@@ -905,6 +916,32 @@ test "explicit preset is atomic and CLI selection overrides it last" {
     try expectSetting(&owner, "model", "cli-m", .run);
     try std.testing.expectEqualStrings("rose", owner.tint().?);
     try std.testing.expectEqual(@as(usize, 1), owner.presetPlans().len);
+}
+
+test "owner forwards prospective run preparation and publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTiers(&tmp,
+        \\{"presets":{"work":{"provider":"old-p","model":"old-m","effort":"low"}}}
+    , "{}");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    var environment = ProcessAdapters.Environment.init(testEnviron(&.{}));
+    var inputs = testInputs(std.testing.allocator, base, config.SecureOpen.Capability.from(&access), &environment);
+    inputs.selection.preset = "work";
+    var owner = try initOwner(inputs);
+    defer owner.deinit();
+
+    var prepared = try owner.prepareRun(.{ .model = "new-m", .effort = "high" });
+    try expectSetting(&owner, "model", "old-m", .run);
+    var candidate = try prepared.store().read(std.testing.allocator, "model");
+    defer candidate.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("new-m", candidate.value.?);
+    owner.publishRun(&prepared);
+    try expectSetting(&owner, "model", "new-m", .run);
+    try expectSetting(&owner, "effort", "high", .run);
+    try expectSetting(&owner, "preset", "", .run);
 }
 
 test "empty environment preset suppresses a lower preset without replacing a resumed stance" {

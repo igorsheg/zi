@@ -243,6 +243,21 @@ pub const OwnedSelection = struct {
     }
 };
 
+/// Move-only log selection replacement prepared without changing the log.
+pub const PreparedSelection = struct {
+    owner: *Log,
+    generation: u64,
+    allocator: std.mem.Allocator,
+    replacement: ?OwnedSelection,
+    core_changed: bool,
+    active: bool = true,
+
+    pub fn deinit(self: *PreparedSelection) void {
+        if (self.active) if (self.replacement) |*replacement| replacement.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
 /// Owns a lazy or resumed append writer. A materialized Log holds an exclusive
 /// lifetime lock. This deliberately narrows hax's shared writer lock because
 /// std.Io has no O_APPEND open option; exclusive ownership makes positional
@@ -279,6 +294,7 @@ pub const Log = struct {
     append_offset: u64 = 0,
     header_written: bool = false,
     selection_pending: bool = false,
+    selection_generation: u64 = 0,
     written_items: usize = 0,
     poisoned: bool = false,
 
@@ -812,11 +828,38 @@ pub const Log = struct {
         self.fork_sync_directory_fn(self.io, directory) catch return error.IndeterminateCleanup;
     }
 
-    pub fn setSelection(self: *Log, selection: Selection) Error!void {
+    /// Owns a prospective selection without changing the log. Core selection
+    /// changes and display-label-only changes remain distinct at publication.
+    pub fn prepareSelection(self: *Log, selection: Selection) Error!PreparedSelection {
         if (self.poisoned) return error.Poisoned;
+        validateSelection(selection) catch return error.InvalidSelection;
+        if (selectionEqual(self.selection.borrow(), selection)) return .{
+            .owner = self,
+            .generation = self.selection_generation,
+            .allocator = self.allocator,
+            .replacement = null,
+            .core_changed = false,
+        };
         var replacement = OwnedSelection.init(self.allocator, selection) catch |err| return mapAlloc(err);
-        const changed = !selectionCoreEqual(self.selection.borrow(), replacement.borrow());
-        if (!changed) {
+        errdefer replacement.deinit(self.allocator);
+        return .{
+            .owner = self,
+            .generation = self.selection_generation,
+            .allocator = self.allocator,
+            .core_changed = !selectionCoreEqual(self.selection.borrow(), replacement.borrow()),
+            .replacement = replacement,
+        };
+    }
+
+    /// Publishes a prepared replacement without allocating. Consumes `prepared`.
+    pub fn publishSelection(self: *Log, prepared: *PreparedSelection) void {
+        std.debug.assert(prepared.active);
+        std.debug.assert(prepared.owner == self);
+        std.debug.assert(prepared.generation == self.selection_generation);
+        prepared.active = false;
+        self.selection_generation +%= 1;
+        var replacement = prepared.replacement orelse return;
+        if (!prepared.core_changed) {
             if (self.selection.model_label) |value| self.allocator.free(value);
             self.selection.model_label = replacement.model_label;
             replacement.model_label = null;
@@ -826,6 +869,12 @@ pub const Log = struct {
         self.selection.deinit(self.allocator);
         self.selection = replacement;
         if (self.header_written) self.selection_pending = true;
+    }
+
+    pub fn setSelection(self: *Log, selection: Selection) Error!void {
+        var prepared = try self.prepareSelection(selection);
+        defer prepared.deinit();
+        self.publishSelection(&prepared);
     }
 
     pub fn discardSelection(self: *Log) void {
@@ -2013,6 +2062,63 @@ test "resumed log hint prefers header id and falls back to canonical path" {
         "550e8400-e29b-41d4-a716-446655440000",
         log.resumeHint().?,
     );
+}
+
+test "prepared selection drop and publication preserve pending semantics" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const root_length = try tmp.dir.realPath(io, &path_buffer);
+    const root = path_buffer[0..root_length];
+    const uuid = [_]u8{
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+        0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+    };
+    var log = try Log.prepare(allocator, io, .{
+        .state_root = root,
+        .cwd = "/work",
+        .selection = .{ .provider = "alpha", .model = "m1", .model_label = "One" },
+        .timestamp = .{ .epoch_seconds = 0 },
+        .uuid = uuid,
+        .writer_version = "test",
+    });
+    defer log.deinit();
+
+    var dropped = try log.prepareSelection(.{ .provider = "beta", .model = "m2" });
+    dropped.deinit();
+    try std.testing.expectEqualStrings("alpha", log.currentSelection().provider.?);
+    try std.testing.expect(!log.materialized());
+    try std.testing.expect(!log.selection_pending);
+
+    var label = try log.prepareSelection(.{
+        .provider = "alpha",
+        .model = "m1",
+        .model_label = "First",
+    });
+    try std.testing.expect(!label.core_changed);
+    log.publishSelection(&label);
+    label.deinit();
+    try std.testing.expectEqualStrings("First", log.currentSelection().model_label.?);
+    try std.testing.expect(!log.selection_pending);
+
+    const items = [_]ai.Item.Item{.{ .user_message = .{ .text = @constCast("hello") } }};
+    try log.appendSnapshot(0, &items);
+    var materialized_label = try log.prepareSelection(.{
+        .provider = "alpha",
+        .model = "m1",
+        .model_label = "Uno",
+    });
+    log.publishSelection(&materialized_label);
+    materialized_label.deinit();
+    try std.testing.expect(!log.selection_pending);
+
+    var core = try log.prepareSelection(.{ .provider = "beta", .model = "m2" });
+    try std.testing.expect(core.core_changed);
+    log.publishSelection(&core);
+    core.deinit();
+    try std.testing.expect(log.selection_pending);
 }
 
 test "lazy materialization and load round trip" {

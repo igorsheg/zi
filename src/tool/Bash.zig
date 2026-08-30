@@ -99,6 +99,12 @@ const RunSelectionState = struct {
         self.preset[preset_assignment.len] = 0;
     }
 
+    fn update(self: *RunSelectionState, selection: RunSelection) void {
+        writeAssignment(&self.provider, provider_prefix, selection.provider);
+        writeAssignment(&self.model, model_prefix, selection.model orelse "");
+        writeAssignment(&self.effort, effort_prefix, selection.effort orelse "");
+    }
+
     fn updateEffort(self: *RunSelectionState, effort: ?[]const u8) void {
         writeAssignment(&self.effort, effort_prefix, effort orelse "");
     }
@@ -261,6 +267,16 @@ pub const Bash = struct {
     /// Returns the resolved command shell borrowed until `deinit`.
     pub fn commandShell(self: *const Bash) []const u8 {
         return self.shell;
+    }
+
+    /// Rewrites the effective child selection without allocating. Validation
+    /// completes before any assignment changes.
+    /// The caller must have exclusive non-callback ownership. In particular,
+    /// this must not overlap a synchronous run or a background process launch.
+    pub fn updateRunSelection(self: *Bash, selection: RunSelection) error{InvalidConfig}!void {
+        try validateRunSelection(selection);
+        const state = self.run_selection_state orelse return error.InvalidConfig;
+        state.update(selection);
     }
 
     /// Rewrites the effective child HAX_EFFORT assignment without allocating.
@@ -875,11 +891,15 @@ fn validEffortValue(value: []const u8) bool {
         std.mem.findScalar(u8, value, 0) == null;
 }
 
+pub fn validateRunSelection(selection: RunSelection) error{InvalidConfig}!void {
+    if (!validSelectionValue(selection.provider, true)) return error.InvalidConfig;
+    if (selection.model) |model| if (!validSelectionValue(model, false)) return error.InvalidConfig;
+    if (selection.effort) |effort| if (!validEffortValue(effort)) return error.InvalidConfig;
+}
+
 fn validRunSelection(selection: ?RunSelection) bool {
     const value = selection orelse return true;
-    if (!validSelectionValue(value.provider, true)) return false;
-    if (value.model) |model| if (!validSelectionValue(model, false)) return false;
-    if (value.effort) |effort| if (!validEffortValue(effort)) return false;
+    validateRunSelection(value) catch return false;
     return true;
 }
 
@@ -1577,6 +1597,46 @@ test "bash effort updates keep environment pointers stable and child values exac
         "HAX_EFFORT=medium",
         std.mem.span(bash.environment.slice[effort_index].?),
     );
+}
+
+test "bash full selection updates are atomic and keep environment pointers stable" {
+    var bash = try Bash.init(std.testing.allocator, std.testing.io, .{
+        .environment = std.testing.environ,
+        .run_selection = .{ .provider = "old-provider", .model = "old-model", .effort = "low" },
+        .timeout_ms = 1000,
+    });
+    defer bash.deinit();
+
+    const start = bash.environment_borrowed_start;
+    const state_address = @intFromPtr(bash.run_selection_state.?);
+    const assignment_addresses = [_]usize{
+        @intFromPtr(bash.environment.slice[start].?),
+        @intFromPtr(bash.environment.slice[start + 1].?),
+        @intFromPtr(bash.environment.slice[start + 2].?),
+    };
+    const invalid_utf8 = [_]u8{0xff};
+    const nul_model = [_]u8{ 'm', 0, 'x' };
+    const invalid = [_]RunSelection{
+        .{ .provider = "", .model = "new-model", .effort = "high" },
+        .{ .provider = "new-provider", .model = &nul_model, .effort = "high" },
+        .{ .provider = "new-provider", .model = "new-model", .effort = &invalid_utf8 },
+        .{ .provider = "new-provider", .model = "new-model", .effort = "0123456789abcdef" },
+    };
+    for (invalid) |selection| {
+        try std.testing.expectError(error.InvalidConfig, bash.updateRunSelection(selection));
+        try std.testing.expectEqualStrings("HAX_PROVIDER=old-provider", std.mem.span(bash.environment.slice[start].?));
+        try std.testing.expectEqualStrings("HAX_MODEL=old-model", std.mem.span(bash.environment.slice[start + 1].?));
+        try std.testing.expectEqualStrings("HAX_EFFORT=low", std.mem.span(bash.environment.slice[start + 2].?));
+    }
+
+    try bash.updateRunSelection(.{ .provider = "new-provider", .model = null, .effort = "high" });
+    try std.testing.expectEqual(state_address, @intFromPtr(bash.run_selection_state.?));
+    for (assignment_addresses, 0..) |address, index| {
+        try std.testing.expectEqual(address, @intFromPtr(bash.environment.slice[start + index].?));
+    }
+    try std.testing.expectEqualStrings("HAX_PROVIDER=new-provider", std.mem.span(bash.environment.slice[start].?));
+    try std.testing.expectEqualStrings("HAX_MODEL=", std.mem.span(bash.environment.slice[start + 1].?));
+    try std.testing.expectEqualStrings("HAX_EFFORT=high", std.mem.span(bash.environment.slice[start + 2].?));
 }
 
 test "bash child environment retains selection variables when no selection is supplied" {

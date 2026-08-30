@@ -13,14 +13,17 @@ pub const SessionStartup = @import("SessionStartup.zig");
 pub const StartupConfig = @import("StartupConfig.zig");
 pub const LocalStartup = @import("LocalStartup.zig");
 pub const ModelOrder = @import("ModelOrder.zig");
+pub const RunSelection = @import("RunSelection.zig");
 pub const Stats = @import("Stats.zig");
 pub const SubagentDepth = @import("SubagentDepth.zig");
 
 const InteractiveCommands = @import("InteractiveCommands.zig");
+const SelectionPicker = @import("SelectionPicker.zig");
 const Slash = @import("Slash.zig");
 
 test {
     _ = InteractiveCommands;
+    _ = SelectionPicker;
     _ = Slash;
 }
 
@@ -218,6 +221,7 @@ test {
     _ = StartupConfig;
     _ = LocalStartup;
     _ = ModelOrder;
+    _ = RunSelection;
     _ = Stats;
     _ = SubagentDepth;
 }

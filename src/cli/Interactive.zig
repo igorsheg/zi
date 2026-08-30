@@ -69,6 +69,45 @@ pub const EffortSource = struct {
     }
 };
 
+/// Borrowed inputs used for one complete agent-loop invocation.
+pub const TurnSnapshot = struct {
+    provider: ai.Provider.Provider,
+    model: []const u8,
+    model_metadata: ai.ModelMeta.Metadata,
+    model_metadata_source: ?agent.ModelMetadataSource.ModelMetadataSource,
+    system_prompt: []const u8,
+    tools: []const tool.Tool.Tool,
+    effort: ?[]const u8,
+    image_input: ai.Provider.ImageInput,
+    image_input_source: ?agent.ImageInputSource.ImageInputSource,
+};
+
+/// Supplies one coherent borrowed snapshot per interactive turn.
+pub const TurnSource = struct {
+    context: *anyopaque,
+    snapshot_fn: *const fn (*anyopaque) TurnSnapshot,
+
+    pub fn snapshot(self: TurnSource) TurnSnapshot {
+        return self.snapshot_fn(self.context);
+    }
+
+    pub fn from(implementation: anytype) TurnSource {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("TurnSource.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn snapshot(context: *anyopaque) TurnSnapshot {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.snapshot();
+            }
+        };
+        return .{ .context = implementation, .snapshot_fn = Adapter.snapshot };
+    }
+};
+
 pub const PromptInput = struct {
     context: *anyopaque,
     read_fn: *const fn (*anyopaque) anyerror!terminal.Result,
@@ -426,6 +465,7 @@ pub const Inputs = struct {
     tools: []const tool.Tool.Tool = &.{},
     effort: ?[]const u8 = null,
     effort_source: ?EffortSource = null,
+    turn_source: ?TurnSource = null,
     image_input: ai.Provider.ImageInput = .unknown,
     image_input_source: ?agent.ImageInputSource.ImageInputSource = null,
     reader: *std.Io.Reader,
@@ -446,6 +486,20 @@ pub const Inputs = struct {
     max_turns: usize = agent.Loop.maximum_max_turns,
     before_first_send: ?BeforeFirstSend = null,
 };
+
+fn fixedTurnSnapshot(inputs: Inputs) TurnSnapshot {
+    return .{
+        .provider = inputs.provider,
+        .model = inputs.model,
+        .model_metadata = inputs.model_metadata,
+        .model_metadata_source = inputs.model_metadata_source,
+        .system_prompt = inputs.system_prompt,
+        .tools = inputs.tools,
+        .effort = if (inputs.effort_source) |source| source.resolve() else inputs.effort,
+        .image_input = inputs.image_input,
+        .image_input_source = inputs.image_input_source,
+    };
+}
 
 fn finishTurn(generation: ?Generation, renderer_instance: TurnRenderer, result: render.Terminal) ?anyerror {
     var first_error: ?anyerror = null;
@@ -549,7 +603,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
             first_send = false;
         }
 
-        const effort = if (inputs.effort_source) |source| source.resolve() else inputs.effort;
+        const turn = if (inputs.turn_source) |source| source.snapshot() else fixedTurnSnapshot(inputs);
         if (inputs.presentation) |presentation| try presentation.beforeGeneration();
         const started_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
         if (inputs.generation) |generation| try generation.arm();
@@ -566,15 +620,15 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
 
         var loop_result = agent.Loop.run(allocator, io, .{
             .session = inputs.session,
-            .provider = inputs.provider,
-            .model = inputs.model,
-            .model_metadata = inputs.model_metadata,
-            .model_metadata_source = inputs.model_metadata_source,
-            .system_prompt = inputs.system_prompt,
-            .tools = inputs.tools,
-            .effort = effort,
-            .image_input = inputs.image_input,
-            .image_input_source = inputs.image_input_source,
+            .provider = turn.provider,
+            .model = turn.model,
+            .model_metadata = turn.model_metadata,
+            .model_metadata_source = turn.model_metadata_source,
+            .system_prompt = turn.system_prompt,
+            .tools = turn.tools,
+            .effort = turn.effort,
+            .image_input = turn.image_input,
+            .image_input_source = turn.image_input_source,
             .max_turns = inputs.max_turns,
             .continued = continuing,
             .checkpoint = inputs.checkpoint,
@@ -1459,6 +1513,89 @@ test "effort source resolves after the lazy first-send hook" {
         .show_prompt = false,
         .before_first_send = BeforeFirstSend.from(&state),
     });
+}
+
+test "turn source supplies one coherent snapshot for each loop run" {
+    const Provider = struct {
+        const Self = @This();
+        calls: usize = 0,
+        snapshot_calls: ?*usize = null,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            request: ai.Provider.Request,
+            sink: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            const models = [_][]const u8{ "model-one", "model-two" };
+            const efforts = [_][]const u8{ "low", "high" };
+            const prompts = [_][]const u8{ "system-one", "system-two" };
+            const snapshot_calls = self.snapshot_calls orelse return error.InvalidRequest;
+            if (snapshot_calls.* != self.calls + 1) return error.InvalidRequest;
+            if (!std.mem.eql(u8, request.model, models[self.calls])) return error.InvalidRequest;
+            if (!std.mem.eql(u8, request.context.effort orelse "", efforts[self.calls])) {
+                return error.InvalidRequest;
+            }
+            if (!std.mem.eql(u8, request.context.system_prompt, prompts[self.calls])) {
+                return error.InvalidRequest;
+            }
+            self.calls += 1;
+            try sink.emit(.{ .done = .{} });
+        }
+    };
+    const Source = struct {
+        const Self = @This();
+        calls: usize = 0,
+        provider: *Provider,
+
+        pub fn snapshot(self: *Self) TurnSnapshot {
+            const models = [_][]const u8{ "model-one", "model-two" };
+            const efforts = [_][]const u8{ "low", "high" };
+            const prompts = [_][]const u8{ "system-one", "system-two" };
+            const index = self.calls;
+            self.calls += 1;
+            return .{
+                .provider = ai.Provider.Provider.from(self.provider, "snapshot"),
+                .model = models[index],
+                .model_metadata = .{},
+                .model_metadata_source = null,
+                .system_prompt = prompts[index],
+                .tools = &.{},
+                .effort = efforts[index],
+                .image_input = .unknown,
+                .image_input_source = null,
+            };
+        }
+    };
+
+    var provider: Provider = .{};
+    var source: Source = .{ .provider = &provider };
+    provider.snapshot_calls = &source.calls;
+    var fallback_provider: Provider = .{};
+    var session = try agent.Session.Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var reader = std.Io.Reader.fixed("one\ntwo\n");
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+
+    _ = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&fallback_provider, "fallback"),
+        .model = "fallback-model",
+        .system_prompt = "fallback-system",
+        .effort = "fallback-effort",
+        .turn_source = TurnSource.from(&source),
+        .reader = &reader,
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .show_prompt = false,
+    });
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
+    try std.testing.expectEqual(@as(usize, 0), fallback_provider.calls);
 }
 
 test "presentation callbacks report ordered turns and precise resume reasons" {

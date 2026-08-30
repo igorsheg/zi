@@ -22,6 +22,8 @@ const PromptAssembly = @import("../PromptAssembly.zig");
 const GitProbe = @import("../GitProbe.zig");
 const Args = @import("Args.zig");
 const InteractiveCommands = @import("InteractiveCommands.zig");
+const RunSelection = @import("RunSelection.zig");
+const SelectionPicker = @import("SelectionPicker.zig");
 const ProcessAdapters = @import("ProcessAdapters.zig");
 const ProcessFacts = @import("ProcessFacts.zig");
 const CodexFiles = @import("CodexFiles.zig");
@@ -418,7 +420,7 @@ pub fn run(
         "http.idle_timeout",
     )).value;
 
-    var provider_runtime = try ProviderRuntime.initWithJson(.{
+    const provider_inputs: ProviderConfig.Inputs = .{
         .allocator = allocator,
         .store = startup.store(),
         .api_key_environment = environment.apiKey(),
@@ -444,8 +446,15 @@ pub fn run(
             .retry_base_ms = http_retry_base,
             .idle_timeout_ms = http_idle_timeout,
         },
-    }, http_transport.streaming(), http_transport.json(), 0);
-    defer provider_runtime.deinit();
+    };
+    var provider_runtime = try ProviderRuntime.initWithJson(
+        provider_inputs,
+        http_transport.streaming(),
+        http_transport.json(),
+        0,
+    );
+    var provider_runtime_owned = true;
+    defer if (provider_runtime_owned) provider_runtime.deinit();
     try renderProviderHeaderWarnings(
         stderr,
         provider_runtime.metadata.provider_id,
@@ -617,7 +626,7 @@ pub fn run(
         .name = plan.name,
         .description = plan.description.value orelse "",
     };
-    var system_prompt = try PromptAssembly.build(allocator, io, .{
+    const prompt_template: PromptAssembly.Inputs = .{
         .raw = options.raw,
         .base = base_kind,
         .append = if (resolved_append) |value| value.text else null,
@@ -649,7 +658,8 @@ pub fn run(
             .config_root = paths.config_root,
         },
         .presets = prompt_presets,
-    });
+    };
+    var system_prompt = try PromptAssembly.build(allocator, io, prompt_template);
     defer if (system_prompt) |*value| value.deinit(allocator);
 
     var usage = try agent.UsageStats.UsageStats.init(allocator, agent.UsageStats.maximum_retained_attempts);
@@ -667,13 +677,47 @@ pub fn run(
     defer image_input_setting.deinit(allocator);
     const image_policy = try parseImageInputPolicy(image_input_setting.value);
     const image_input = image_policy.resolveFixed(provider_runtime.metadata.model.image_input);
+    var live_builder: LiveBuilder = .{
+        .allocator = allocator,
+        .io = io,
+        .provider_inputs = provider_inputs,
+        .streaming_transport = http_transport.streaming(),
+        .json_transport = http_transport.json(),
+        .prompt_template = prompt_template,
+        .prompt_access = secure_open.configCapability(),
+        .config_root = config_root,
+        .home = path_inputs.home,
+        .cwd = cwd,
+        .image_policy = image_policy,
+        .manual_context_limit = manual_context_limit,
+    };
+    var live_tool_selection: LiveToolSelection = .{ .tools = &tools };
+    var live: RunSelection.Owner = .{
+        .allocator = allocator,
+        .config_source = RunSelection.ConfigSource.from(&startup),
+        .builder = RunSelection.Builder.from(&live_builder),
+        .tools = RunSelection.ToolSelection.from(&live_tool_selection),
+        .session = session_run.session(),
+        .durability = durability,
+        .runtime = provider_runtime,
+        .prompt = system_prompt,
+        .tool_list = tools.tools(),
+        .image_input = image_input,
+        .context_limit = context_limit,
+        .model_metadata_source = null,
+        .image_input_source = null,
+    };
+    provider_runtime_owned = false;
+    provider_runtime = undefined;
+    system_prompt = null;
+    defer live.deinit();
     var catalog_runtime: CatalogRuntime = .{
         .allocator = allocator,
         .io = io,
         .owner = catalog,
-        .runtime = &provider_runtime,
-        .provider_id = provider_runtime.metadata.catalog_id,
-        .model_id = provider_runtime.model,
+        .runtime = &live.runtime,
+        .provider_id = live.runtime.metadata.catalog_id,
+        .model_id = live.runtime.model,
     };
     var image_source: DynamicImageInput = .{
         .policy = image_policy,
@@ -682,7 +726,6 @@ pub fn run(
     var model_metadata_source: DynamicModelMetadata = .{
         .catalog_runtime = &catalog_runtime,
     };
-    var effort_source: DynamicEffort = .{ .runtime = &provider_runtime };
     const compact_enabled = (try config.Settings.getBool(store, allocator, "compact.auto")).value;
     const configured_max_turns = (try config.Settings.getInt(store, allocator, "max_turns")).value;
     const interactive_max_turns: usize = if (configured_max_turns <= 0)
@@ -693,15 +736,15 @@ pub fn run(
     var compaction: AutoCompact = .{
         .allocator = allocator,
         .io = io,
-        .provider = provider_runtime.provider(),
-        .model = provider_runtime.model,
-        .metadata = provider_runtime.metadata.model,
+        .provider = live.runtime.provider(),
+        .model = live.runtime.model,
+        .metadata = live.runtime.metadata.model,
         .model_metadata_source = agent.ModelMetadataSource.ModelMetadataSource.from(&model_metadata_source),
-        .system_prompt = if (system_prompt) |value| value.bytes else "",
+        .system_prompt = live.snapshot().system_prompt,
         .tools = tools.tools(),
         .tool_runtime = &tools,
         .durability = durability,
-        .effort = provider_runtime.effort,
+        .effort = live.runtime.effort,
         .usage = &usage,
         .catalog_runtime = &catalog_runtime,
         .manual_context_limit = manual_context_limit,
@@ -714,7 +757,7 @@ pub fn run(
     var terminal: Terminal = .{ .tools = &tools };
     var session_info: SessionInfo = .{
         .run = session_run,
-        .runtime = &provider_runtime,
+        .runtime = &live.runtime,
         .preset = nonEmpty(selected_preset.value),
         .resumed = restored != null,
     };
@@ -727,6 +770,14 @@ pub fn run(
     image_source.effects = &catalog_hook;
     model_metadata_source.effects = &catalog_hook;
     compaction.effects = &catalog_hook;
+    live.model_metadata_source = agent.ModelMetadataSource.ModelMetadataSource.from(&model_metadata_source);
+    live.image_input_source = agent.ImageInputSource.ImageInputSource.from(&image_source);
+    var live_views: LiveViews = .{
+        .catalog_runtime = &catalog_runtime,
+        .stats = &stats,
+        .compaction = &compaction,
+    };
+    live.setViews(RunSelection.Views.from(&live_views));
 
     var configured_theme = try config.Settings.getString(store, allocator, "theme");
     defer configured_theme.deinit(allocator);
@@ -749,15 +800,15 @@ pub fn run(
     const run_result = switch (mode) {
         .print => |prompt| OneShot.run(allocator, io, .{
             .session = session_run.session(),
-            .provider = provider_runtime.provider(),
-            .model = provider_runtime.model,
-            .model_metadata = provider_runtime.metadata.model,
-            .model_metadata_source = agent.ModelMetadataSource.ModelMetadataSource.from(&model_metadata_source),
-            .system_prompt = if (system_prompt) |value| value.bytes else "",
-            .tools = tools.tools(),
-            .effort = provider_runtime.effort,
-            .image_input = image_input,
-            .image_input_source = agent.ImageInputSource.ImageInputSource.from(&image_source),
+            .provider = live.runtime.provider(),
+            .model = live.runtime.model,
+            .model_metadata = live.runtime.metadata.model,
+            .model_metadata_source = live.model_metadata_source,
+            .system_prompt = live.snapshot().system_prompt,
+            .tools = live.tool_list,
+            .effort = live.runtime.effort,
+            .image_input = live.image_input,
+            .image_input_source = live.image_input_source,
             .prompt = prompt,
             .stdout = stdout,
             .stderr = stderr,
@@ -766,7 +817,7 @@ pub fn run(
             .continuation_hook = agent.Loop.ContinuationHook.from(&compaction),
             .usage_stats = &usage,
             .session_info_hook = OneShot.SessionInfoHook.from(&session_info),
-            .catalog_hook = if (catalog != null and provider_runtime.metadata.catalog_id != null)
+            .catalog_hook = if (catalog != null and live.runtime.metadata.catalog_id != null)
                 OneShot.CatalogHook.from(&catalog_hook)
             else
                 null,
@@ -788,16 +839,16 @@ pub fn run(
                 ProcessAdapters.isTty(io, .stdout());
             const interactive_inputs: Interactive.Inputs = .{
                 .session = session_run.session(),
-                .provider = provider_runtime.provider(),
-                .model = provider_runtime.model,
-                .model_metadata = provider_runtime.metadata.model,
-                .model_metadata_source = agent.ModelMetadataSource.ModelMetadataSource.from(&model_metadata_source),
-                .system_prompt = if (system_prompt) |value| value.bytes else "",
-                .tools = tools.tools(),
-                .effort = provider_runtime.effort,
-                .effort_source = Interactive.EffortSource.from(&effort_source),
-                .image_input = image_input,
-                .image_input_source = agent.ImageInputSource.ImageInputSource.from(&image_source),
+                .provider = live.runtime.provider(),
+                .model = live.runtime.model,
+                .model_metadata = live.runtime.metadata.model,
+                .model_metadata_source = live.model_metadata_source,
+                .system_prompt = live.snapshot().system_prompt,
+                .tools = live.tool_list,
+                .effort = live.runtime.effort,
+                .turn_source = Interactive.TurnSource.from(&live),
+                .image_input = live.image_input,
+                .image_input_source = live.image_input_source,
                 .reader = &stdin_file.interface,
                 .stdout = stdout,
                 .stderr = stderr,
@@ -807,7 +858,7 @@ pub fn run(
                 .continuation_hook = agent.Loop.ContinuationHook.from(&compaction),
                 .usage_observer = agent.Loop.UsageObserver.from(&usage),
                 .max_turns = interactive_max_turns,
-                .before_first_send = if (catalog != null and provider_runtime.metadata.catalog_id != null)
+                .before_first_send = if (catalog != null and live.runtime.metadata.catalog_id != null)
                     Interactive.BeforeFirstSend.from(&interactive_catalog)
                 else
                     null,
@@ -824,6 +875,7 @@ pub fn run(
                     false,
                     display_columns.resolve(terminal_module.Size.presentationColumns(stdout_terminal_file.handle)),
                 );
+                commands.setRunSelection(&live);
                 var cooked_inputs = interactive_inputs;
                 cooked_inputs.command_gateway = commands.gateway();
                 break :interactive runInteractiveWithFinish(allocator, io, cooked_inputs, &terminal);
@@ -845,20 +897,21 @@ pub fn run(
                 http,
                 &compaction,
                 &terminal,
+                &live,
                 theme,
                 display_columns,
                 markdown_enabled,
                 show_reasoning,
                 restored != null,
                 .{
-                    .provider = provider_runtime.metadata.display_name,
-                    .model = provider_runtime.model,
-                    .effort = provider_runtime.effort,
+                    .provider = live.runtime.metadata.display_name,
+                    .model = live.runtime.model,
+                    .effort = live.runtime.effort,
                     .preset = nonEmpty(selected_preset.value),
                 },
                 &stats,
                 &usage,
-                if (catalog != null and provider_runtime.metadata.catalog_id != null) &catalog_hook else null,
+                if (catalog != null and live.runtime.metadata.catalog_id != null) &catalog_hook else null,
             );
         },
     };
@@ -1146,6 +1199,7 @@ fn runRawInteractive(
     http: *ai.HttpTransport.Runtime,
     compaction: *AutoCompact,
     terminal_owner: *Terminal,
+    live: *RunSelection.Owner,
     theme: render.Theme,
     display_columns: terminal_module.DisplayColumns.Policy,
     markdown_enabled: bool,
@@ -1264,6 +1318,22 @@ fn runRawInteractive(
     );
     commands.setWidthSource(.from(&markdown_width));
     commands.setFrame(&frame);
+    commands.setRunSelection(live);
+    var effort_picker: SelectionPicker.TerminalRunner = .{
+        .allocator = allocator,
+        .io = io,
+        .stdin = stdin_file,
+        .stdout = stdout_file,
+        .writer = inputs_value.stdout,
+        .display_columns = display_columns,
+        .style = .{
+            .accent_open = theme.accent.open,
+            .accent_close = theme.accent.close,
+            .ok_open = theme.ok.open,
+            .ok_close = theme.ok.close,
+        },
+    };
+    commands.setEffortPicker(SelectionPicker.Runner.from(&effort_picker));
     var markdown_renderer = render.MarkdownStreamRenderer.init(
         allocator,
         inputs_value.stdout,
@@ -1465,6 +1535,112 @@ const CatalogHints = struct {
     }
 };
 
+const LiveBuilder = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    provider_inputs: ProviderConfig.Inputs,
+    streaming_transport: ai.Transport.Transport,
+    json_transport: ai.JsonTransport.Transport,
+    prompt_template: PromptAssembly.Inputs,
+    prompt_access: config.SecureOpen.Capability,
+    config_root: ?[]const u8,
+    home: ?[]const u8,
+    cwd: []const u8,
+    image_policy: ImageInputPolicy,
+    manual_context_limit: ?u64,
+
+    pub fn build(self: *LiveBuilder, store: config.Store) !RunSelection.Built {
+        var provider_inputs = self.provider_inputs;
+        provider_inputs.store = store;
+        var runtime = try ProviderRuntime.initWithJson(
+            provider_inputs,
+            self.streaming_transport,
+            self.json_transport,
+            0,
+        );
+        errdefer runtime.deinit();
+
+        var base_setting = try config.Settings.getString(store, self.allocator, "system_prompt");
+        defer base_setting.deinit(self.allocator);
+        var append_setting = try config.Settings.getString(store, self.allocator, "system_prompt_append");
+        defer append_setting.deinit(self.allocator);
+        var resolved_base: ?config.PromptValue.Value = null;
+        defer if (resolved_base) |*value| value.deinit(self.allocator);
+        var resolved_append: ?config.PromptValue.Value = null;
+        defer if (resolved_append) |*value| value.deinit(self.allocator);
+        if (base_setting.value) |value| resolved_base = try config.PromptValue.resolve(
+            self.allocator,
+            self.io,
+            self.prompt_access,
+            value,
+            self.config_root,
+            self.home,
+            self.cwd,
+        );
+        if (append_setting.value) |value| resolved_append = try config.PromptValue.resolve(
+            self.allocator,
+            self.io,
+            self.prompt_access,
+            value,
+            self.config_root,
+            self.home,
+            self.cwd,
+        );
+
+        const base_value = if (resolved_base) |value| value.text else null;
+        var prompt_inputs = self.prompt_template;
+        prompt_inputs.base = if (base_value) |value|
+            if (std.mem.eql(u8, value, "(none)")) .none else .{ .custom = value }
+        else
+            .default;
+        prompt_inputs.append = if (resolved_append) |value| value.text else null;
+        prompt_inputs.environment.model = runtime.model;
+        const prompt = try PromptAssembly.build(self.allocator, self.io, prompt_inputs);
+        return .{
+            .runtime = runtime,
+            .prompt = prompt,
+            .image_input = self.image_policy.resolveFixed(runtime.metadata.model.image_input),
+            .context_limit = effectiveContextLimit(
+                self.manual_context_limit,
+                runtime.metadata.model.context_window,
+            ),
+        };
+    }
+};
+
+const LiveToolSelection = struct {
+    tools: *ToolRuntime.Owner,
+
+    pub fn validateRunSelection(self: *LiveToolSelection, selection: tool.Bash.RunSelection) !void {
+        try self.tools.prepareRunSelection(selection);
+    }
+
+    pub fn publishRunSelection(self: *LiveToolSelection, selection: tool.Bash.RunSelection) void {
+        self.tools.updateRunSelection(selection) catch unreachable;
+    }
+};
+
+const LiveViews = struct {
+    catalog_runtime: *CatalogRuntime,
+    stats: *Stats.Renderer,
+    compaction: *AutoCompact,
+
+    pub fn publishSelectionViews(self: *LiveViews, derived: RunSelection.Derived) void {
+        const runtime = derived.runtime;
+        self.catalog_runtime.runtime = runtime;
+        self.catalog_runtime.provider_id = runtime.metadata.catalog_id;
+        self.catalog_runtime.model_id = runtime.model;
+        self.catalog_runtime.applied_replacement = false;
+        self.stats.context_limit = derived.context_limit;
+        self.compaction.provider = runtime.provider();
+        self.compaction.model = runtime.model;
+        self.compaction.metadata = runtime.metadata.model;
+        self.compaction.system_prompt = derived.system_prompt;
+        self.compaction.effort = runtime.effort;
+        self.compaction.context_limit = derived.context_limit;
+    }
+};
+
 const CatalogRuntime = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1610,14 +1786,6 @@ const Terminal = struct {
             error.HookIndeterminate => error.Indeterminate,
             else => error.Failed,
         };
-    }
-};
-
-const DynamicEffort = struct {
-    runtime: *ProviderRuntime.Owned,
-
-    pub fn resolve(self: *DynamicEffort) ?[]const u8 {
-        return self.runtime.effort;
     }
 };
 

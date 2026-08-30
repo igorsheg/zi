@@ -254,6 +254,7 @@ fn testResolved(
                 .anthropic_messages => .anthropic_messages,
                 .mock => null,
             },
+            .provider_efforts = .{},
             .efforts = .{},
             .model = .{},
             .send_cache_key = false,

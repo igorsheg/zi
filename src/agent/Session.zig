@@ -83,6 +83,20 @@ pub const UsageInput = struct {
     source_model: ?[]const u8 = null,
 };
 
+/// Move-only selection replacement prepared without changing the session.
+pub const PreparedSelection = struct {
+    owner: *Session,
+    generation: u64,
+    allocator: std.mem.Allocator,
+    replacement: ?OwnedSelection,
+    active: bool = true,
+
+    pub fn deinit(self: *PreparedSelection) void {
+        if (self.active) if (self.replacement) |*replacement| replacement.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
 /// Move-only usage footer prepared for an allocation-free session commit.
 pub const PreparedUsage = struct {
     item: ai.Item.Item,
@@ -103,6 +117,7 @@ pub const Session = struct {
 
     allocator: std.mem.Allocator,
     run_state: RunState = .idle,
+    selection_generation: u64 = 0,
     limits: Limits,
     provider_id: ?[]u8,
     model: ?[]u8,
@@ -148,12 +163,35 @@ pub const Session = struct {
         self.* = undefined;
     }
 
-    /// Atomically owns and replaces the live selection. Conversation items and
-    /// their accounting remain unchanged. Allocation failure preserves the old selection.
-    pub fn reconfigureSelection(self: *Session, selection: Selection) Error!void {
+    /// Owns a prospective selection without changing the live session.
+    /// The returned value is move-only and must be published or deinitialized.
+    pub fn prepareSelection(self: *Session, selection: Selection) Error!PreparedSelection {
         try self.ensureMutable();
         try validateSelection(selection, self.limits);
-        var replacement = try OwnedSelection.init(self.allocator, selection);
+        if (selectionEqual(self.currentSelection(), selection)) return .{
+            .owner = self,
+            .generation = self.selection_generation,
+            .allocator = self.allocator,
+            .replacement = null,
+        };
+        return .{
+            .owner = self,
+            .generation = self.selection_generation,
+            .allocator = self.allocator,
+            .replacement = try OwnedSelection.init(self.allocator, selection),
+        };
+    }
+
+    /// Publishes a prepared replacement without allocating. Consumes `prepared`.
+    pub fn publishSelection(self: *Session, prepared: *PreparedSelection) void {
+        std.debug.assert(prepared.active);
+        std.debug.assert(prepared.owner == self);
+        std.debug.assert(prepared.generation == self.selection_generation);
+        std.debug.assert(self.run_state != .running);
+        std.debug.assert(self.run_state != .compacting);
+        prepared.active = false;
+        self.selection_generation +%= 1;
+        var replacement = prepared.replacement orelse return;
         const previous: OwnedSelection = .{
             .provider_id = self.provider_id,
             .model = self.model,
@@ -168,6 +206,14 @@ pub const Session = struct {
         self.preset = replacement.preset;
         replacement = previous;
         replacement.deinit(self.allocator);
+    }
+
+    /// Atomically owns and replaces the live selection. Conversation items and
+    /// their accounting remain unchanged. Allocation failure preserves the old selection.
+    pub fn reconfigureSelection(self: *Session, selection: Selection) Error!void {
+        var prepared = try self.prepareSelection(selection);
+        defer if (prepared.active) prepared.deinit();
+        self.publishSelection(&prepared);
     }
 
     /// Replaces admission limits without cloning history. The existing selection
@@ -761,6 +807,19 @@ const OwnedSelection = struct {
     }
 };
 
+fn selectionEqual(a: Selection, b: Selection) bool {
+    return optionalEqual(a.provider_id, b.provider_id) and
+        optionalEqual(a.model, b.model) and
+        optionalEqual(a.model_label, b.model_label) and
+        optionalEqual(a.effort, b.effort) and
+        optionalEqual(a.preset, b.preset);
+}
+
+fn optionalEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
 fn validateSelection(selection: Selection, limits: Limits) Error!void {
     if (selection.provider_id) |value| {
         if (value.len > limits.provider_id_bytes) return error.ProviderIdTooLarge;
@@ -900,6 +959,26 @@ test "reconfigure selection owns replacement without changing items" {
     try std.testing.expectEqual(@as(usize, 2), session.items().len);
     try std.testing.expectEqualStrings("kept", session.items()[1].user_message.text);
     try std.testing.expectEqual(retained_before, session.retained_bytes);
+}
+
+test "prepared selection can be dropped or publish a no-op without mutation" {
+    var session = try Session.init(std.testing.allocator, .{
+        .provider_id = "old-provider",
+        .model = "old-model",
+    });
+    defer session.deinit();
+
+    var dropped = try session.prepareSelection(.{
+        .provider_id = "new-provider",
+        .model = "new-model",
+    });
+    dropped.deinit();
+    try std.testing.expectEqualStrings("old-provider", session.currentSelection().provider_id.?);
+
+    var no_op = try session.prepareSelection(session.currentSelection());
+    try std.testing.expect(no_op.replacement == null);
+    session.publishSelection(&no_op);
+    try std.testing.expectEqualStrings("old-provider", session.currentSelection().provider_id.?);
 }
 
 test "reconfigure selection allocation failure preserves selection and items" {

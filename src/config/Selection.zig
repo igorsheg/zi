@@ -87,6 +87,45 @@ pub const RunInputs = struct {
     no_session: ?bool = null,
 };
 
+pub const RunChange = struct {
+    provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    effort: ?[]const u8 = null,
+    exit_preset: bool = false,
+};
+
+/// Move-only prospective run overlay. Derive Store on demand because retaining
+/// one here would point into this value and become invalid when it moves.
+pub const PreparedRun = struct {
+    document: Document,
+    conversation: ?Document,
+    tint: ?[]u8,
+    options: Store.Options,
+    exits_preset: bool,
+
+    pub fn deinit(self: *PreparedRun, allocator: std.mem.Allocator) void {
+        wipeDocument(&self.document);
+        self.document.deinit();
+        if (self.conversation) |*document| {
+            wipeDocument(document);
+            document.deinit();
+        }
+        if (self.tint) |value| {
+            @memset(value, 0);
+            allocator.free(value);
+        }
+        self.* = undefined;
+    }
+
+    /// Borrows this prepared value and its Selection collaborators.
+    pub fn store(self: *const PreparedRun) Store {
+        var options = self.options;
+        options.run = &self.document;
+        if (self.conversation) |*document| options.conversation = document;
+        return .init(options);
+    }
+};
+
 allocator: std.mem.Allocator,
 base: Store.Options,
 run: ?Document = null,
@@ -269,6 +308,71 @@ pub fn setRun(self: *Selection, inputs: RunInputs) Error!void {
     if (count != 0) try self.replaceTier(.run, changes[0..count]);
 }
 
+/// Builds a complete prospective run stance without changing Selection.
+/// Provider replacement clears stale model and effort before applying any
+/// explicit final values carried by the same change.
+pub fn prepareRun(self: *const Selection, change: RunChange) Error!PreparedRun {
+    var changes: [7]Change = undefined;
+    var count: usize = 0;
+    if (change.provider) |provider| {
+        appendChange(&changes, &count, "provider", provider);
+        appendChange(&changes, &count, "model", change.model orelse default_sentinel);
+        appendChange(&changes, &count, "effort", change.effort orelse default_sentinel);
+    } else {
+        appendOptional(&changes, &count, "model", change.model);
+        appendOptional(&changes, &count, "effort", change.effort);
+    }
+
+    const exits_preset = change.exit_preset or change.provider != null or
+        change.model != null or change.effort != null;
+    if (exits_preset) {
+        appendChange(&changes, &count, "preset", "");
+        appendChange(&changes, &count, "system_prompt", null);
+        appendChange(&changes, &count, "system_prompt_append", null);
+    }
+
+    var document = try self.changedDocument(.run, changes[0..count]);
+    errdefer {
+        wipeDocument(&document);
+        document.deinit();
+    }
+    var conversation: ?Document = null;
+    errdefer if (conversation) |*value| {
+        wipeDocument(value);
+        value.deinit();
+    };
+    if (exits_preset) conversation = try self.changedDocument(.conversation, &.{
+        .{ .key = "preset", .value = null },
+        .{ .key = "system_prompt", .value = null },
+        .{ .key = "system_prompt_append", .value = null },
+    });
+    const tint = if (!exits_preset) try self.copyOptional(self.run_preset_tint) else null;
+
+    var options = self.base;
+    options.conversation = if (self.conversation) |*value| value else self.base.conversation;
+    return .{
+        .document = document,
+        .conversation = conversation,
+        .tint = tint,
+        .options = options,
+        .exits_preset = exits_preset,
+    };
+}
+
+/// Consumes prepared and publishes without allocation.
+pub fn publishRun(self: *Selection, prepared: *PreparedRun) void {
+    self.publishDocument(.run, prepared.document);
+    prepared.document = undefined;
+    if (prepared.conversation) |document| {
+        self.publishDocument(.conversation, document);
+        prepared.conversation = null;
+    }
+    self.publishTint(.run, prepared.tint);
+    prepared.tint = null;
+    if (prepared.exits_preset) self.freeSecret(&self.conversation_preset_tint);
+    prepared.* = undefined;
+}
+
 const Change = struct { key: []const u8, value: ?[]const u8 };
 
 fn appendChange(changes: []Change, count: *usize, key: []const u8, value: ?[]const u8) void {
@@ -315,7 +419,7 @@ fn validateChanges(changes: []const Change) Error!void {
     }
 }
 
-fn changedDocument(self: *Selection, tier: Tier, changes: []const Change) Error!Document {
+fn changedDocument(self: *const Selection, tier: Tier, changes: []const Change) Error!Document {
     try validateChanges(changes);
     const source = self.tierDocument(tier);
     var scratch: Document.WipingAllocator = .{ .backing = self.allocator };
@@ -427,7 +531,7 @@ fn wipeValue(value: *std.json.Value) void {
     }
 }
 
-fn copyOptional(self: *Selection, value: ?[]const u8) Error!?[]u8 {
+fn copyOptional(self: *const Selection, value: ?[]const u8) Error!?[]u8 {
     return if (value) |text| self.allocator.dupe(u8, text) catch error.OutOfMemory else null;
 }
 
@@ -673,6 +777,111 @@ test "oversized run values and plans reject before either tier changes" {
     try std.testing.expectEqualStrings("rose", selection.presetTint().?);
 }
 
+test "prospective provider change is complete and cancellation leaves selection unchanged" {
+    var selection = Selection.init(std.testing.allocator, testBase(null, null));
+    defer selection.deinit();
+    const resumed = testPlan();
+    const lookup: Preset.Lookup = .{ .plan = resumed };
+    _ = try selection.restoreConversation(.{ .preset = "work" }, &lookup);
+    try selection.setRun(.{ .provider = "old-p", .model = "old-m", .effort = "old-e" });
+
+    var prepared = try selection.prepareRun(.{ .provider = "new-p" });
+    var moved = prepared;
+    prepared = undefined;
+    defer moved.deinit(std.testing.allocator);
+
+    var candidate_provider = try moved.store().read(std.testing.allocator, "provider");
+    defer candidate_provider.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("new-p", candidate_provider.value.?);
+    try std.testing.expectEqualStrings(default_sentinel, moved.document.getRaw("model").?.string);
+    try std.testing.expectEqualStrings(default_sentinel, moved.document.getRaw("effort").?.string);
+    var candidate_preset = try moved.store().read(std.testing.allocator, "preset");
+    defer candidate_preset.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", candidate_preset.value.?);
+    var below_preset = try moved.store().readBelowRun(std.testing.allocator, "preset");
+    defer below_preset.deinit(std.testing.allocator);
+    try std.testing.expect(below_preset.value == null);
+
+    try expectSelectionRead(&selection, "provider", "old-p", .run);
+    try expectSelectionRead(&selection, "model", "old-m", .run);
+    try expectSelectionRead(&selection, "effort", "old-e", .run);
+    var live_below = try selection.store().readBelowRun(std.testing.allocator, "preset");
+    defer live_below.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("work", live_below.value.?);
+}
+
+test "effort preparation preserves a provider-default model stance" {
+    var selection = Selection.init(std.testing.allocator, testBase(null, null));
+    defer selection.deinit();
+    try selection.setRun(.{
+        .provider = "p",
+        .model = default_sentinel,
+        .effort = "low",
+    });
+
+    var effort = try selection.prepareRun(.{ .effort = "high" });
+    defer effort.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(default_sentinel, effort.document.getRaw("model").?.string);
+    try expectStoreRead(effort.store(), "effort", "high", .run);
+}
+
+test "model and effort preparation preserves the other run fields" {
+    var selection = Selection.init(std.testing.allocator, testBase(null, null));
+    defer selection.deinit();
+    try selection.setRun(.{
+        .provider = "p",
+        .model = "old-model",
+        .effort = "old-effort",
+        .preset = "work",
+    });
+
+    var model = try selection.prepareRun(.{ .model = "new-model" });
+    try expectStoreRead(model.store(), "provider", "p", .run);
+    try expectStoreRead(model.store(), "model", "new-model", .run);
+    try expectStoreRead(model.store(), "effort", "old-effort", .run);
+    selection.publishRun(&model);
+    try expectSelectionRead(&selection, "preset", "", .run);
+
+    var effort = try selection.prepareRun(.{ .effort = "high" });
+    defer effort.deinit(std.testing.allocator);
+    try expectStoreRead(effort.store(), "provider", "p", .run);
+    try expectStoreRead(effort.store(), "model", "new-model", .run);
+    try expectStoreRead(effort.store(), "effort", "high", .run);
+}
+
+fn expectStoreRead(store_value: Store, key: []const u8, expected: []const u8, source: Store.Source) !void {
+    var result = try store_value.read(std.testing.allocator, key);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(source, result.source);
+    try std.testing.expectEqualStrings(expected, result.value.?);
+}
+
+fn exercisePreparedRunAllocationFailures(allocator: std.mem.Allocator) !void {
+    var selection = Selection.init(allocator, testBase(null, null));
+    defer selection.deinit();
+    const plan = testPlan();
+    try selection.applyPreset(.run, &plan);
+    var prepared = selection.prepareRun(.{
+        .provider = "new-provider",
+        .model = "new-model",
+        .effort = "high",
+    }) catch |err| {
+        try expectSelectionRead(&selection, "provider", "p", .run);
+        try expectSelectionRead(&selection, "model", "preset-model", .run);
+        try std.testing.expectEqualStrings("rose", selection.presetTint().?);
+        return err;
+    };
+    defer prepared.deinit(allocator);
+}
+
+test "prospective run preparation releases every allocation and rolls back on OOM" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exercisePreparedRunAllocationFailures,
+        .{},
+    );
+}
+
 const SecretFreeObserver = struct {
     backing: std.mem.Allocator,
     fail_index: ?usize = null,
@@ -731,6 +940,25 @@ const SecretFreeObserver = struct {
         self.backing.rawFree(memory, alignment, ret_addr);
     }
 };
+
+test "prepared run publication performs no allocation" {
+    var observer: SecretFreeObserver = .{ .backing = std.testing.allocator };
+    const allocator = observer.allocator();
+    var selection = Selection.init(allocator, testBase(null, null));
+    defer selection.deinit();
+    try selection.setRun(.{ .provider = "old-p", .model = "old-m", .effort = "low" });
+    var prepared = try selection.prepareRun(.{
+        .provider = "new-p",
+        .model = "new-m",
+        .effort = "high",
+    });
+
+    observer.fail_index = observer.allocations;
+    selection.publishRun(&prepared);
+    try expectSelectionRead(&selection, "provider", "new-p", .run);
+    try expectSelectionRead(&selection, "model", "new-m", .run);
+    try expectSelectionRead(&selection, "effort", "high", .run);
+}
 
 test "owned config secrets are wiped before allocator free" {
     var observer: SecretFreeObserver = .{ .backing = std.testing.allocator };

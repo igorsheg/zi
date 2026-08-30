@@ -14,6 +14,11 @@ const Session = agent.Session.Session;
 
 pub const InitError = error{ OutOfMemory, InvalidConfig };
 pub const BindingError = error{ Reentrant, PendingDurability };
+pub const RunSelection = tool.Bash.RunSelection;
+
+pub fn validateRunSelection(selection: RunSelection) error{InvalidConfig}!void {
+    return tool.Bash.validateRunSelection(selection);
+}
 pub const FinishError = agent.Session.Error || tool.TaskRegistry.Error || error{
     PendingDurability,
     HookFailed,
@@ -129,9 +134,29 @@ pub const Owner = struct {
         return self.bash.commandShell();
     }
 
+    /// Validates a future publication without changing child-process state.
+    pub fn prepareRunSelection(
+        self: *Owner,
+        selection: RunSelection,
+    ) (BindingError || error{InvalidConfig})!void {
+        if (self.task_notes) |state| if (state.active) return error.Reentrant;
+        try validateRunSelection(selection);
+    }
+
+    /// Updates the selection inherited by later Bash child processes. This is
+    /// allocation-free and validates the complete replacement before mutation.
+    /// The caller must hold exclusive Owner access and must not overlap this
+    /// call with a Bash run or background process launch.
+    pub fn updateRunSelection(
+        self: *Owner,
+        selection: RunSelection,
+    ) (BindingError || error{InvalidConfig})!void {
+        if (self.task_notes) |state| if (state.active) return error.Reentrant;
+        try self.bash.updateRunSelection(selection);
+    }
+
     /// Updates the effective effort inherited by later Bash child processes.
-    /// This is allocation-free. The caller must hold exclusive Owner access and
-    /// must not overlap this call with a Bash run or background process launch.
+    /// This compatibility method remains allocation-free.
     pub fn updateRunEffort(
         self: *Owner,
         effort: ?[]const u8,
@@ -451,6 +476,42 @@ test "task mode appends task wait and owner moves without invalidating erased ad
     try std.testing.expectEqual(@intFromPtr(shell_address), @intFromPtr(moved.commandShell().ptr));
     try std.testing.expectEqual(@intFromPtr(registry_address), @intFromPtr(moved.taskRegistry().?));
     try std.testing.expectEqual(@as(usize, 4), moved.tools()[3].definition.parameters.len);
+}
+
+test "owner validates and atomically forwards full Bash selection updates" {
+    var inputs = testInputs(std.testing.allocator);
+    inputs.run_selection = .{ .provider = "old-provider", .model = "old-model", .effort = "low" };
+    var owner = try init(inputs);
+    defer owner.deinit();
+
+    try validateRunSelection(.{ .provider = "new-provider", .model = "new-model", .effort = "high" });
+    try std.testing.expectError(
+        error.InvalidConfig,
+        validateRunSelection(.{ .provider = "new-provider", .model = "new-model", .effort = "0123456789abcdef" }),
+    );
+    try std.testing.expectError(
+        error.InvalidConfig,
+        owner.updateRunSelection(.{ .provider = "new-provider", .model = "new-model", .effort = "0123456789abcdef" }),
+    );
+
+    var result = try owner.tools()[3].run(
+        std.testing.allocator,
+        std.testing.io,
+        "{\"command\":\"printf '%s|%s|%s' $HAX_PROVIDER $HAX_MODEL $HAX_EFFORT\"}",
+        .{},
+    );
+    try std.testing.expectEqualStrings("old-provider|old-model|low", result.output);
+    result.deinit(std.testing.allocator);
+
+    try owner.updateRunSelection(.{ .provider = "new-provider", .model = null, .effort = "high" });
+    result = try owner.tools()[3].run(
+        std.testing.allocator,
+        std.testing.io,
+        "{\"command\":\"printf '<%s>|<%s>|<%s>' \\\"$HAX_PROVIDER\\\" \\\"$HAX_MODEL\\\" \\\"$HAX_EFFORT\\\"\"}",
+        .{},
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("<new-provider>|<>|<high>", result.output);
 }
 
 test "owner forwards allocation-free Bash effort updates and rejects callback reentry" {
