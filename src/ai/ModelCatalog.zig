@@ -63,6 +63,25 @@ pub fn lookup(
     return lookupProviderSlice(allocator, slice, model_id, limits);
 }
 
+/// Fills contributions aligned with `model_ids`. The catalog is validated once
+/// and the selected provider object is parsed once.
+pub fn lookupBatch(
+    allocator: std.mem.Allocator,
+    json: []const u8,
+    provider_id: []const u8,
+    model_ids: []const []const u8,
+    output: []Contribution,
+    limits: Limits,
+) Error!void {
+    std.debug.assert(model_ids.len == output.len);
+    for (output) |*value| value.* = .{};
+    try validateLimits(limits);
+    if (json.len > limits.max_input_bytes) return error.InputTooLarge;
+    if (provider_id.len == 0 or model_ids.len == 0) return;
+    const slice = try providerSlice(allocator, json, provider_id, limits) orelse return;
+    try lookupProviderSliceBatch(allocator, slice, model_ids, output, limits);
+}
+
 /// Returns the borrowed JSON value slice for one exact top-level provider.
 /// It scans structure without allocating the complete artifact.
 pub fn providerSlice(
@@ -99,9 +118,39 @@ pub fn lookupProviderSlice(
     defer parsed.deinit();
     const provider = valueObject(parsed.value) orelse return null;
     const models = objectField(provider, "models") orelse return null;
-    const model_value = models.get(model_id) orelse return null;
-    const model = valueObject(model_value) orelse return null;
+    const model = valueObject(models.get(model_id) orelse return null) orelse return null;
     return parseContribution(provider, model, true);
+}
+
+/// Parses one borrowed provider object once and fills aligned inline results.
+pub fn lookupProviderSliceBatch(
+    allocator: std.mem.Allocator,
+    provider_json: []const u8,
+    model_ids: []const []const u8,
+    output: []Contribution,
+    limits: Limits,
+) Error!void {
+    std.debug.assert(model_ids.len == output.len);
+    for (output) |*value| value.* = .{};
+    try validateLimits(limits);
+    if (provider_json.len > limits.max_input_bytes) return error.InputTooLarge;
+    try validateBounds(allocator, provider_json, limits);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, provider_json, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .use_last,
+        .max_value_len = limits.max_string_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
+    defer parsed.deinit();
+    const provider = valueObject(parsed.value) orelse return;
+    const models = objectField(provider, "models") orelse return;
+    for (model_ids, output) |model_id, *destination| {
+        if (model_id.len == 0) continue;
+        const model = valueObject(models.get(model_id) orelse continue) orelse continue;
+        destination.* = parseContribution(provider, model, true);
+    }
 }
 
 /// Parses a configuration override artifact. Provider members may contain a
@@ -130,6 +179,39 @@ pub fn lookupOverride(
     const models = objectField(provider, "models") orelse provider;
     const model = valueObject(models.get(model_id) orelse return null) orelse return null;
     return parseContribution(provider, model, false);
+}
+
+pub fn lookupOverrideBatch(
+    allocator: std.mem.Allocator,
+    json: []const u8,
+    provider_id: []const u8,
+    model_ids: []const []const u8,
+    output: []Contribution,
+    limits: Limits,
+) Error!void {
+    std.debug.assert(model_ids.len == output.len);
+    for (output) |*value| value.* = .{};
+    try validateLimits(limits);
+    if (json.len > limits.max_input_bytes) return error.InputTooLarge;
+    if (provider_id.len == 0 or model_ids.len == 0) return;
+    const slice = try providerSlice(allocator, json, provider_id, limits) orelse return;
+    try validateBounds(allocator, slice, limits);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, slice, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .use_last,
+        .max_value_len = limits.max_string_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
+    defer parsed.deinit();
+    const provider = valueObject(parsed.value) orelse return;
+    const models = objectField(provider, "models") orelse provider;
+    for (model_ids, output) |model_id, *destination| {
+        if (model_id.len == 0) continue;
+        const model = valueObject(models.get(model_id) orelse continue) orelse continue;
+        destination.* = parseContribution(provider, model, false);
+    }
 }
 
 /// Configuration wins field by field. Declared empty tier and effort lists win.
@@ -546,6 +628,35 @@ test "models.dev mapping fields tiers and malformed values" {
     const bad = (try lookup(std.testing.allocator, fixture, "openai", "bad", .{})).?;
     try std.testing.expect(bad.metadata.rates.input == null);
     try std.testing.expectEqual(@as(u64, 0), bad.metadata.max_output);
+}
+
+fn batchAllocationExercise(allocator: std.mem.Allocator) !void {
+    const fixture =
+        "{\"p\":{\"models\":{" ++
+        "\"a\":{\"limit\":{\"context\":100}}," ++
+        "\"b\":{\"tool_call\":false}}}}";
+    const ids = [_][]const u8{ "b", "missing", "a", "b" };
+    var batch: [ids.len]Contribution = undefined;
+    try lookupBatch(allocator, fixture, "p", &ids, &batch, .{});
+    for (ids, batch) |model_id, contribution| {
+        const scalar = try lookup(allocator, fixture, "p", model_id, .{});
+        if (scalar) |value| {
+            try std.testing.expectEqualDeep(value, contribution);
+        } else {
+            const empty: Contribution = .{};
+            try std.testing.expectEqualDeep(empty, contribution);
+        }
+    }
+    try std.testing.expectEqual(ModelMeta.Support.no, batch[0].metadata.tools);
+    try std.testing.expectEqual(@as(u64, 100), batch[2].metadata.context_window);
+}
+
+test "batch lookup is aligned and equivalent to scalar lookup" {
+    try batchAllocationExercise(std.testing.allocator);
+}
+
+test "batch lookup reports every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, batchAllocationExercise, .{});
 }
 
 test "wire selectors image and reasoning tri-states" {

@@ -288,36 +288,65 @@ pub fn lookup(
     provider_id: []const u8,
     model_id: []const u8,
 ) Error!ai.ModelCatalog.Contribution {
-    var cache_contribution: ?ai.ModelCatalog.Contribution = null;
+    var output: [1]ai.ModelCatalog.Contribution = undefined;
+    try lookupBatch(allocator, cache, override_json, provider_id, &.{model_id}, &output);
+    return output[0];
+}
+
+/// Reads one cache snapshot and parses each selected provider at most once.
+/// Results own all variable data inline and align with `model_ids`.
+pub fn lookupBatch(
+    allocator: std.mem.Allocator,
+    cache: *persistence.CatalogCache.CatalogCache,
+    override_json: []const u8,
+    provider_id: []const u8,
+    model_ids: []const []const u8,
+    output: []ai.ModelCatalog.Contribution,
+) Error!void {
+    std.debug.assert(model_ids.len == output.len);
+    std.debug.assert(model_ids.len <= ai.ModelListing.maximum_models);
+    for (output) |*value| value.* = .{};
+    if (model_ids.len == 0) return;
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
     var read_result = cache.read(allocator) catch return error.OutOfMemory;
     defer read_result.deinit(allocator);
     if (read_result == .cached) {
-        cache_contribution = ai.ModelCatalog.lookup(
-            allocator,
+        ai.ModelCatalog.lookupBatch(
+            scratch,
             read_result.cached.bytes,
             provider_id,
-            model_id,
+            model_ids,
+            output,
             .{},
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => null,
+            else => {
+                for (output) |*value| value.* = .{};
+            },
         };
     }
 
-    const config_contribution = ai.ModelCatalog.lookupOverride(
-        allocator,
+    _ = arena.reset(.retain_capacity);
+    const configured = try scratch.alloc(ai.ModelCatalog.Contribution, model_ids.len);
+    ai.ModelCatalog.lookupOverrideBatch(
+        scratch,
         override_json,
         provider_id,
-        model_id,
+        model_ids,
+        configured,
         .{},
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => null,
+        else => {
+            for (configured) |*value| value.* = .{};
+        },
     };
-    return ai.ModelCatalog.merge(
-        if (config_contribution) |*value| value else null,
-        if (cache_contribution) |*value| value else null,
-    );
+    for (configured, output) |*config_contribution, *cache_contribution| {
+        cache_contribution.* = ai.ModelCatalog.merge(config_contribution, cache_contribution);
+    }
 }
 
 fn validCandidate(allocator: std.mem.Allocator, bytes: []const u8) Error!bool {
@@ -788,10 +817,33 @@ fn lookupAllocationExercise(
     allocator: std.mem.Allocator,
     cache: *persistence.CatalogCache.CatalogCache,
 ) !void {
-    const result = try lookup(allocator, cache,
-        \\{"p":{"m":{"limit":{"output":7}}}}
-    , "p", "m");
-    try std.testing.expectEqual(@as(u64, 7), result.metadata.max_output);
+    const ids = [_][]const u8{ "m", "other", "missing", "m" };
+    var output: [ids.len]ai.ModelCatalog.Contribution = undefined;
+    try lookupBatch(allocator, cache,
+        \\{"p":{"m":{"limit":{"output":7}},"other":{"tool_call":false}}}
+    , "p", &ids, &output);
+    for (ids, output) |model_id, contribution| {
+        const scalar = try lookup(allocator, cache,
+            \\{"p":{"m":{"limit":{"output":7}},"other":{"tool_call":false}}}
+        , "p", model_id);
+        try std.testing.expectEqualDeep(scalar, contribution);
+    }
+    try std.testing.expectEqual(@as(u64, 7), output[0].metadata.max_output);
+    try std.testing.expectEqual(ai.ModelMeta.Support.no, output[1].metadata.tools);
+}
+
+test "batch lookup is scalar-equivalent and aligned" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var cache = try testCache(std.testing.allocator, io, root);
+    defer cache.deinit();
+    try std.testing.expect(cache.replace(
+        \\{"p":{"models":{"m":{"limit":{"context":100}},"other":{"tool_call":true}}}}
+    , testNonce()) == .published);
+    try lookupAllocationExercise(std.testing.allocator, &cache);
 }
 
 test "refresh and lookup release all partial allocations" {

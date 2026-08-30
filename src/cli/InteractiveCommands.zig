@@ -55,6 +55,12 @@ const shortcuts = [_]Shortcut{
 
 const specs = [_]Slash.Spec{
     .{
+        .name = "model",
+        .summary = "switch model, then effort",
+        .display = .managed,
+        .handler_fn = runModel,
+    },
+    .{
         .name = "effort",
         .summary = "set reasoning effort",
         .display = .managed,
@@ -81,7 +87,10 @@ pub const Owner = struct {
     width_source: ?WidthSource = null,
     frame: ?*render.Frame = null,
     run_selection: ?*RunSelection.Owner = null,
-    effort_picker: ?SelectionPicker.Runner = null,
+    io: ?std.Io = null,
+    listing_generation: ?Interactive.Generation = null,
+    listing_tick: ?ai.Provider.Tick = null,
+    selection_picker: ?SelectionPicker.Runner = null,
 
     pub fn init(
         writer: *std.Io.Writer,
@@ -109,8 +118,22 @@ pub const Owner = struct {
         self.run_selection = run_selection;
     }
 
-    pub fn setEffortPicker(self: *Owner, picker: SelectionPicker.Runner) void {
-        self.effort_picker = picker;
+    pub fn setIo(self: *Owner, io: std.Io) void {
+        self.io = io;
+    }
+
+    pub fn setListingCancellation(
+        self: *Owner,
+        generation: Interactive.Generation,
+        tick: ai.Provider.Tick,
+    ) void {
+        self.listing_generation = generation;
+        self.listing_tick = tick;
+    }
+
+    pub fn setSelectionPicker(self: *Owner, io: std.Io, picker: SelectionPicker.Runner) void {
+        self.io = io;
+        self.selection_picker = picker;
     }
 
     pub fn gateway(self: *Owner) Interactive.CommandGateway {
@@ -238,6 +261,13 @@ pub const Owner = struct {
         try self.write("\n");
     }
 
+    fn writeDiagnosticError(self: *Owner, message: []const u8) !void {
+        var storage: [4096]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&storage);
+        DiagnosticText.write(&writer, message) catch return self.writeError("failed to list models");
+        try self.writeError(writer.buffered());
+    }
+
     fn writeDiagnosticNote(self: *Owner, message: []const u8) !void {
         var storage: [4096]u8 = undefined;
         var writer = std.Io.Writer.fixed(&storage);
@@ -325,6 +355,141 @@ pub const Owner = struct {
     }
 };
 
+fn runModel(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
+    const self: *Owner = @ptrCast(@alignCast(context));
+    const live = self.run_selection orelse {
+        try self.writeNote("no provider selected — use /provider to choose one first");
+        return .handled;
+    };
+    const io = self.io orelse return .handled;
+    const before = live.current();
+    try self.writeNote("fetching models...");
+    var listing_armed = false;
+    if (self.listing_generation) |generation| {
+        generation.arm() catch return .handled;
+        listing_armed = true;
+    }
+    var listing = live.listModels(live.allocator, io, self.listing_tick) catch |err| {
+        if (listing_armed) {
+            try self.listing_generation.?.disarm();
+            listing_armed = false;
+        }
+        if (err == error.Cancelled) return .handled;
+        var buffer: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &buffer,
+            "failed to list models for {s}",
+            .{before.provider_label},
+        ) catch "failed to list models for the current provider";
+        try self.writeDiagnosticError(message);
+        return .handled;
+    };
+    if (listing_armed) {
+        try self.listing_generation.?.disarm();
+        listing_armed = false;
+    }
+    defer listing.deinit();
+    switch (listing) {
+        .unsupported => {
+            var buffer: [512]u8 = undefined;
+            const message = std.fmt.bufPrint(
+                &buffer,
+                "{s} can't list models — set one with HAX_MODEL or in config",
+                .{before.provider_label},
+            ) catch "the current provider can't list models — set one in config";
+            try self.writeDiagnosticNote(message);
+            return .handled;
+        },
+        .failure => |failure| {
+            try self.writeDiagnosticError(failure.message);
+            return .handled;
+        },
+        .models => {},
+    }
+    const models = listing.models.models;
+    if (models.len == 0) {
+        var buffer: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &buffer,
+            "{s} has no models available",
+            .{before.provider_label},
+        ) catch "the current provider has no models available";
+        try self.writeDiagnosticNote(message);
+        return .handled;
+    }
+
+    const merged = live.allocator.alloc(ai.ModelMeta.Metadata, models.len) catch {
+        try self.writeError("couldn't prepare the model list — keeping the current selection");
+        return .handled;
+    };
+    defer live.allocator.free(merged);
+    const catalog = live.allocator.alloc(ai.ModelMeta.Metadata, models.len) catch {
+        try self.writeError("couldn't prepare the model list — keeping the current selection");
+        return .handled;
+    };
+    defer live.allocator.free(catalog);
+    live.catalogMetadataBatch(live.allocator, models, catalog) catch {
+        try self.writeError("couldn't prepare the model list — keeping the current selection");
+        return .handled;
+    };
+    for (models, merged, catalog) |model_value, *merged_value, *catalog_value| {
+        merged_value.* = ai.ModelMeta.merge(&model_value.metadata, catalog_value);
+    }
+    if (live.current().generation != before.generation) return .handled;
+
+    var selected_index: usize = 0;
+    var provenance: RunSelection.ModelProvenance = .inherited;
+    if (models.len > 1) {
+        const picker = self.selection_picker orelse return .handled;
+        const choice = SelectionPicker.model(
+            live.allocator,
+            picker,
+            models,
+            merged,
+            before.model,
+            before.sort_models,
+        ) catch return .handled;
+        selected_index = switch (choice) {
+            .canceled => return .handled,
+            .selected => |index| index,
+        };
+        provenance = .explicit;
+    }
+    if (live.current().generation != before.generation) return .handled;
+
+    const selected_model = models[selected_index];
+    const levels = ai.ModelMeta.resolveEfforts(
+        &before.provider_efforts,
+        &selected_model.metadata.efforts,
+        &catalog[selected_index].efforts,
+    );
+    var selected_effort: ?[]const u8 = null;
+    if (levels.count != 0) {
+        const picker = self.selection_picker orelse return .handled;
+        const effort_choice = SelectionPicker.effort(picker, &levels, before.effort) catch return .handled;
+        selected_effort = switch (effort_choice) {
+            .canceled => return .handled,
+            .selected => |value| value,
+        };
+    }
+    if (live.current().generation != before.generation) return .handled;
+
+    var candidate = live.prepare(.{
+        .model = selected_model.id,
+        .model_label = selected_model.id,
+        .effort = selected_effort,
+        .reported_metadata = .{ .replace = selected_model.metadata },
+        .model_provenance = provenance,
+    }) catch {
+        try self.writeError("couldn't change model — keeping the current selection");
+        return .handled;
+    };
+    defer candidate.deinit();
+    live.commit(&candidate);
+    try writeSelectionNotice(self, live.current());
+    return .handled;
+}
+
 fn runEffort(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
     const self: *Owner = @ptrCast(@alignCast(context));
     const live = self.run_selection orelse {
@@ -339,7 +504,7 @@ fn runEffort(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
         return .handled;
     }
 
-    const picker = self.effort_picker orelse return .handled;
+    const picker = self.selection_picker orelse return .handled;
     const choice = SelectionPicker.effort(picker, &levels, current.effort) catch return .handled;
     const selected = switch (choice) {
         .canceled => return .handled,
@@ -357,25 +522,27 @@ fn runEffort(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
     defer candidate.deinit();
     live.commit(&candidate);
 
-    const committed = live.current();
+    try writeSelectionNotice(self, live.current());
+    return .handled;
+}
+
+fn writeSelectionNotice(self: *Owner, committed: RunSelection.CurrentSelection) !void {
     if (committed.effort) |effort_value| {
         var buffer: [512]u8 = undefined;
         const message = std.fmt.bufPrint(
             &buffer,
             "switched to {s} · {s} · {s}",
             .{ committed.provider_label, committed.model, effort_value },
-        ) catch "switched reasoning effort";
-        try self.writeDiagnosticNote(message);
-    } else {
-        var buffer: [512]u8 = undefined;
-        const message = std.fmt.bufPrint(
-            &buffer,
-            "switched to {s} · {s}",
-            .{ committed.provider_label, committed.model },
-        ) catch "switched to provider-default reasoning effort";
-        try self.writeDiagnosticNote(message);
+        ) catch "switched selection";
+        return self.writeDiagnosticNote(message);
     }
-    return .handled;
+    var buffer: [512]u8 = undefined;
+    const message = std.fmt.bufPrint(
+        &buffer,
+        "switched to {s} · {s}",
+        .{ committed.provider_label, committed.model },
+    ) catch "switched selection";
+    return self.writeDiagnosticNote(message);
 }
 
 fn effortUnavailableMessage(
@@ -454,6 +621,7 @@ test "help lists only implemented commands and supported shortcuts" {
     try std.testing.expectEqual(Interactive.CommandOutcome.handled, try executeTestCommand(&owner, "/help"));
     try std.testing.expectEqualStrings(
         "commands\n" ++
+            "  /model       switch model, then effort\n" ++
             "  /effort      set reasoning effort\n" ++
             "  /help        show this help\n" ++
             "\nshortcuts\n" ++
@@ -516,7 +684,11 @@ test "selection notices escape terminal controls" {
     var owner = Owner.init(&output.writer, try testTheme(), false, 80);
 
     try owner.writeDiagnosticNote("provider\x1b[31m\nmodel");
-    try std.testing.expectEqualStrings("provider\\x1b[31m\\nmodel\n", output.written());
+    try owner.writeDiagnosticError("failure\x1b[2J\rhidden");
+    try std.testing.expectEqualStrings(
+        "provider\\x1b[31m\\nmodel\nfailure\\x1b[2J\\rhidden\n",
+        output.written(),
+    );
 }
 
 test "unknown and bad usage diagnostics are exact and safe" {

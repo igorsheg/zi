@@ -677,6 +677,7 @@ pub fn run(
     defer image_input_setting.deinit(allocator);
     const image_policy = try parseImageInputPolicy(image_input_setting.value);
     const image_input = image_policy.resolveFixed(provider_runtime.metadata.model.image_input);
+    const sort_models = try resolveSortModels(allocator, store, provider_runtime.keep_model_order);
     var live_builder: LiveBuilder = .{
         .allocator = allocator,
         .io = io,
@@ -706,6 +707,9 @@ pub fn run(
         .context_limit = context_limit,
         .model_metadata_source = null,
         .image_input_source = null,
+        .model_hints_source = provider_inputs.hints_source,
+        .reported_metadata = if (provider_inputs.hints.reported) |value| value.* else null,
+        .sort_models = sort_models,
     };
     provider_runtime_owned = false;
     provider_runtime = undefined;
@@ -876,6 +880,7 @@ pub fn run(
                     display_columns.resolve(terminal_module.Size.presentationColumns(stdout_terminal_file.handle)),
                 );
                 commands.setRunSelection(&live);
+                commands.setIo(io);
                 var cooked_inputs = interactive_inputs;
                 cooked_inputs.command_gateway = commands.gateway();
                 break :interactive runInteractiveWithFinish(allocator, io, cooked_inputs, &terminal);
@@ -952,6 +957,14 @@ const TerminalCheckpoint = struct {
 
     pub fn resolve(self: *TerminalCheckpoint) agent.Loop.Signal {
         return mapTerminalSignal(self.interrupt.resolve());
+    }
+};
+
+const ModelListingTick = struct {
+    interrupt: *terminal_module.GenerationInterrupt,
+
+    pub fn poll(self: *ModelListingTick) ai.Provider.DeliveryError!void {
+        if (self.interrupt.sample() != .none) return error.Cancelled;
     }
 };
 
@@ -1319,7 +1332,7 @@ fn runRawInteractive(
     commands.setWidthSource(.from(&markdown_width));
     commands.setFrame(&frame);
     commands.setRunSelection(live);
-    var effort_picker: SelectionPicker.TerminalRunner = .{
+    var selection_picker: SelectionPicker.TerminalRunner = .{
         .allocator = allocator,
         .io = io,
         .stdin = stdin_file,
@@ -1333,7 +1346,7 @@ fn runRawInteractive(
             .ok_close = theme.ok.close,
         },
     };
-    commands.setEffortPicker(SelectionPicker.Runner.from(&effort_picker));
+    commands.setSelectionPicker(io, SelectionPicker.Runner.from(&selection_picker));
     var markdown_renderer = render.MarkdownStreamRenderer.init(
         allocator,
         inputs_value.stdout,
@@ -1388,6 +1401,11 @@ fn runRawInteractive(
         spinner.destroy();
     }
     var checkpoint: TerminalCheckpoint = .{ .interrupt = &interrupt };
+    var model_listing_tick: ModelListingTick = .{ .interrupt = &interrupt };
+    commands.setListingCancellation(
+        Interactive.Generation.from(&interrupt),
+        ai.Provider.Tick.from(&model_listing_tick),
+    );
     var compact_cancellation: CompactCancellation = .{ .interrupt = &interrupt };
     compaction.cancellation = agent.CompactRunner.Cancellation.from(&compact_cancellation);
     defer compaction.cancellation = null;
@@ -1513,6 +1531,22 @@ fn parseImageInputPolicy(value: ?[]const u8) !ImageInputPolicy {
     return error.InvalidSetting;
 }
 
+fn parseAutomaticBool(setting: ?[]const u8) ?bool {
+    const value = setting orelse return null;
+    if (std.ascii.eqlIgnoreCase(value, "auto")) return null;
+    if (std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on")) return true;
+    if (std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "no") or
+        std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "off")) return false;
+    return null;
+}
+
+fn resolveSortModels(allocator: std.mem.Allocator, store: config.Store, keep_provider_order: bool) !bool {
+    var setting = try config.Settings.getString(store, allocator, "sort_models");
+    defer setting.deinit(allocator);
+    return parseAutomaticBool(setting.value) orelse !keep_provider_order;
+}
+
 fn imageInputFromSupport(support: ai.ModelMeta.Support) ai.Provider.ImageInput {
     return switch (support) {
         .yes => .supported,
@@ -1533,6 +1567,20 @@ const CatalogHints = struct {
         const owner = self.owner orelse return .{};
         return owner.lookup(allocator, "", provider_id, model_id);
     }
+
+    pub fn lookupBatch(
+        self: *CatalogHints,
+        allocator: std.mem.Allocator,
+        provider_id: []const u8,
+        model_ids: []const []const u8,
+        output: []ai.ModelCatalog.Contribution,
+    ) error{OutOfMemory}!void {
+        const owner = self.owner orelse {
+            for (output) |*value| value.* = .{};
+            return;
+        };
+        return owner.lookupBatch(allocator, "", provider_id, model_ids, output);
+    }
 };
 
 const LiveBuilder = struct {
@@ -1549,9 +1597,14 @@ const LiveBuilder = struct {
     image_policy: ImageInputPolicy,
     manual_context_limit: ?u64,
 
-    pub fn build(self: *LiveBuilder, store: config.Store) !RunSelection.Built {
+    pub fn build(
+        self: *LiveBuilder,
+        store: config.Store,
+        reported_metadata: ?ai.ModelMeta.Metadata,
+    ) !RunSelection.Built {
         var provider_inputs = self.provider_inputs;
         provider_inputs.store = store;
+        provider_inputs.hints.reported = if (reported_metadata) |*value| value else null;
         var runtime = try ProviderRuntime.initWithJson(
             provider_inputs,
             self.streaming_transport,
@@ -1595,7 +1648,9 @@ const LiveBuilder = struct {
             .default;
         prompt_inputs.append = if (resolved_append) |value| value.text else null;
         prompt_inputs.environment.model = runtime.model;
-        const prompt = try PromptAssembly.build(self.allocator, self.io, prompt_inputs);
+        var prompt = try PromptAssembly.build(self.allocator, self.io, prompt_inputs);
+        errdefer if (prompt) |*value| value.deinit(self.allocator);
+        const sort_models = try resolveSortModels(self.allocator, store, runtime.keep_model_order);
         return .{
             .runtime = runtime,
             .prompt = prompt,
@@ -1604,6 +1659,7 @@ const LiveBuilder = struct {
                 self.manual_context_limit,
                 runtime.metadata.model.context_window,
             ),
+            .sort_models = sort_models,
         };
     }
 };
@@ -2263,6 +2319,44 @@ test "provider aliases are canonical before resumed selection comparison" {
     const canonicalizer: ProviderCanonicalizer = .{};
     try std.testing.expectEqualStrings("llamacpp", canonicalizer.canonical("llama.cpp"));
     try std.testing.expectEqualStrings("openai", canonicalizer.canonical("openai"));
+}
+
+test "sort model policy resolves from each store and provider default" {
+    const EmptyEnvironment = struct {
+        const Self = @This();
+
+        pub fn get(_: *const Self, _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    const environment: EmptyEnvironment = .{};
+    var automatic_document = try config.Document.parse(std.testing.allocator, "{}", .{});
+    defer automatic_document.deinit();
+    const automatic = config.Store.init(.{
+        .file = &automatic_document,
+        .registry = config.Settings.storeRegistry(),
+        .environment = .from(&environment),
+    });
+    try std.testing.expect(!try resolveSortModels(std.testing.allocator, automatic, true));
+    try std.testing.expect(try resolveSortModels(std.testing.allocator, automatic, false));
+
+    var enabled_document = try config.Document.parse(std.testing.allocator, "{\"sort_models\":true}", .{});
+    defer enabled_document.deinit();
+    const enabled = config.Store.init(.{
+        .run = &enabled_document,
+        .registry = config.Settings.storeRegistry(),
+        .environment = .from(&environment),
+    });
+    try std.testing.expect(try resolveSortModels(std.testing.allocator, enabled, true));
+
+    var disabled_document = try config.Document.parse(std.testing.allocator, "{\"sort_models\":false}", .{});
+    defer disabled_document.deinit();
+    const disabled = config.Store.init(.{
+        .run = &disabled_document,
+        .registry = config.Settings.storeRegistry(),
+        .environment = .from(&environment),
+    });
+    try std.testing.expect(!try resolveSortModels(std.testing.allocator, disabled, false));
 }
 
 test "image input setting resolves explicit and automatic policy" {

@@ -312,6 +312,24 @@ pub const Owner = struct {
         return CatalogManager.lookup(allocator, &self.cache, override_json, provider_id, model_id);
     }
 
+    pub fn lookupBatch(
+        self: *Owner,
+        allocator: std.mem.Allocator,
+        override_json: []const u8,
+        provider_id: []const u8,
+        model_ids: []const []const u8,
+        output: []ai.ModelCatalog.Contribution,
+    ) CatalogManager.Error!void {
+        return CatalogManager.lookupBatch(
+            allocator,
+            &self.cache,
+            override_json,
+            provider_id,
+            model_ids,
+            output,
+        );
+    }
+
     /// Requires exclusive ownership: no other method call may overlap deinit.
     /// Borrowed callback contexts must remain valid through this call.
     pub fn deinit(self: *Owner) void { // ziglint-ignore: Z030

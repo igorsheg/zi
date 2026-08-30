@@ -6,14 +6,27 @@ const persistence = @import("../persistence/root.zig");
 const tool = @import("../tool/root.zig");
 const Interactive = @import("Interactive.zig");
 const PromptAssembly = @import("../PromptAssembly.zig");
+const ProviderConfig = @import("../ProviderConfig.zig");
 const ProviderRuntime = @import("../ProviderRuntime.zig");
 const SessionDurability = @import("../SessionDurability.zig");
+
+pub const ModelProvenance = enum {
+    inherited,
+    explicit,
+};
+
+pub const ReportedMetadataChange = union(enum) {
+    preserve,
+    replace: ?ai.ModelMeta.Metadata,
+};
 
 pub const RequestedSelection = struct {
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
     model_label: ?[]const u8 = null,
     effort: ?[]const u8,
+    reported_metadata: ReportedMetadataChange = .preserve,
+    model_provenance: ModelProvenance = .inherited,
 };
 
 pub const Built = struct {
@@ -21,6 +34,7 @@ pub const Built = struct {
     prompt: ?PromptAssembly.OwnedPrompt,
     image_input: ai.Provider.ImageInput,
     context_limit: ?u64,
+    sort_models: bool,
     active: bool = true,
 
     pub fn deinit(self: *Built, allocator: std.mem.Allocator) void {
@@ -36,10 +50,10 @@ pub const Built = struct {
 /// prospective store. The returned value owns everything that survives build.
 pub const Builder = struct {
     context: *anyopaque,
-    build_fn: *const fn (*anyopaque, config.Store) anyerror!Built,
+    build_fn: *const fn (*anyopaque, config.Store, ?ai.ModelMeta.Metadata) anyerror!Built,
 
-    pub fn build(self: Builder, store: config.Store) !Built {
-        return self.build_fn(self.context, store);
+    pub fn build(self: Builder, store: config.Store, reported_metadata: ?ai.ModelMeta.Metadata) !Built {
+        return self.build_fn(self.context, store, reported_metadata);
     }
 
     pub fn from(implementation: anytype) Builder {
@@ -50,9 +64,13 @@ pub const Builder = struct {
         }
         const Implementation = pointer_info.pointer.child;
         const Adapter = struct {
-            fn build(context: *anyopaque, store: config.Store) anyerror!Built {
+            fn build(
+                context: *anyopaque,
+                store: config.Store,
+                reported_metadata: ?ai.ModelMeta.Metadata,
+            ) anyerror!Built {
                 const self: *Implementation = @ptrCast(@alignCast(context));
-                return self.build(store);
+                return self.build(store, reported_metadata);
             }
         };
         return .{ .context = implementation, .build_fn = Adapter.build };
@@ -185,6 +203,8 @@ pub const Candidate = struct {
     built: Built,
     session: PreparedSession,
     tool_selection: tool.Bash.RunSelection,
+    reported_metadata: ?ai.ModelMeta.Metadata,
+    model_provenance: ModelProvenance,
     active: bool = true,
 
     pub fn deinit(self: *Candidate) void {
@@ -208,6 +228,8 @@ pub const CurrentSelection = struct {
     provider_efforts: ai.Effort.Set,
     efforts: ai.Effort.Set,
     model_metadata: ai.ModelMeta.Metadata,
+    sort_models: bool = true,
+    model_provenance: ModelProvenance = .inherited,
 };
 
 /// Heap-stable live interactive selection. The owner is the only writer of
@@ -226,9 +248,14 @@ pub const Owner = struct {
     context_limit: ?u64,
     model_metadata_source: ?agent.ModelMetadataSource.ModelMetadataSource,
     image_input_source: ?agent.ImageInputSource.ImageInputSource,
+    model_hints_source: ?ProviderConfig.ModelHintsSource = null,
+    reported_metadata: ?ai.ModelMeta.Metadata = null,
+    sort_models: bool = true,
+    model_provenance: ModelProvenance = .inherited,
     views: ?Views = null,
     generation: u64 = 0,
     committing: bool = false,
+    catalog_lookup_active: bool = false,
     bound_address: ?usize = null,
 
     pub fn deinit(self: *Owner) void {
@@ -259,7 +286,51 @@ pub const Owner = struct {
             .provider_efforts = self.runtime.metadata.provider_efforts,
             .efforts = self.runtime.metadata.efforts,
             .model_metadata = self.runtime.metadata.model,
+            .sort_models = self.sort_models,
+            .model_provenance = self.model_provenance,
         };
+    }
+
+    /// Enumerates through the live runtime. Returned ownership belongs to the caller.
+    pub fn listModels(
+        self: *Owner,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        tick: ?ai.Provider.Tick,
+    ) ai.ModelListing.Error!ai.ModelListing.Outcome {
+        self.assertStable();
+        std.debug.assert(!self.committing);
+        return self.runtime.listModels(allocator, io, tick);
+    }
+
+    /// Reads one current catalog snapshot without starting or waiting for refresh work.
+    /// Output metadata aligns with `models` and owns all variable data inline.
+    pub fn catalogMetadataBatch(
+        self: *Owner,
+        allocator: std.mem.Allocator,
+        models: []const ai.ModelListing.Model,
+        output: []ai.ModelMeta.Metadata,
+    ) error{ OutOfMemory, Reentrant, SelectionChanged }!void {
+        self.assertStable();
+        std.debug.assert(models.len == output.len);
+        std.debug.assert(models.len <= ai.ModelListing.maximum_models);
+        if (self.committing or self.catalog_lookup_active) return error.Reentrant;
+        for (output) |*value| value.* = .{};
+        const source = self.model_hints_source orelse return;
+        const catalog_id = self.runtime.metadata.catalog_id orelse return;
+        const generation = self.generation;
+
+        self.catalog_lookup_active = true;
+        defer self.catalog_lookup_active = false;
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const model_ids = try scratch.alloc([]const u8, models.len);
+        const contributions = try scratch.alloc(ai.ModelCatalog.Contribution, models.len);
+        for (models, model_ids) |model_value, *model_id| model_id.* = model_value.id;
+        try source.lookupBatch(scratch, catalog_id, model_ids, contributions);
+        if (self.generation != generation) return error.SelectionChanged;
+        for (contributions, output) |contribution, *metadata| metadata.* = contribution.metadata;
     }
 
     pub fn snapshot(self: *Owner) Interactive.TurnSnapshot {
@@ -280,7 +351,7 @@ pub const Owner = struct {
 
     pub fn prepare(self: *Owner, requested: RequestedSelection) !Candidate {
         self.assertStable();
-        if (self.committing) return error.Reentrant;
+        if (self.committing or self.catalog_lookup_active) return error.Reentrant;
         var config_run = try self.config_source.prepare(.{
             .provider = requested.provider,
             .model = requested.model,
@@ -289,7 +360,11 @@ pub const Owner = struct {
         });
         errdefer config_run.deinit(self.allocator);
 
-        var built = try self.builder.build(config_run.store());
+        const reported_metadata = switch (requested.reported_metadata) {
+            .preserve => self.reported_metadata,
+            .replace => |value| value,
+        };
+        var built = try self.builder.build(config_run.store(), reported_metadata);
         errdefer built.deinit(self.allocator);
         const selection: agent.Session.Selection = .{
             .provider_id = built.runtime.metadata.provider_id,
@@ -324,6 +399,11 @@ pub const Owner = struct {
             .built = built,
             .session = prepared_session,
             .tool_selection = tool_selection,
+            .reported_metadata = reported_metadata,
+            .model_provenance = if (requested.model_provenance == .inherited)
+                self.model_provenance
+            else
+                requested.model_provenance,
         };
     }
 
@@ -333,6 +413,7 @@ pub const Owner = struct {
         self.assertStable();
         std.debug.assert(candidate.active);
         std.debug.assert(!self.committing);
+        std.debug.assert(!self.catalog_lookup_active);
         self.committing = true;
         defer self.committing = false;
         self.config_source.publish(&candidate.config_run);
@@ -343,6 +424,7 @@ pub const Owner = struct {
         self.prompt = candidate.built.prompt;
         self.image_input = candidate.built.image_input;
         self.context_limit = candidate.built.context_limit;
+        self.sort_models = candidate.built.sort_models;
         candidate.built.active = false;
 
         switch (candidate.session) {
@@ -350,6 +432,8 @@ pub const Owner = struct {
             .durability => |*prepared| self.durability.?.publishSelection(self.session, prepared),
         }
         self.tools.publish(candidate.tool_selection);
+        self.reported_metadata = candidate.reported_metadata;
+        self.model_provenance = candidate.model_provenance;
         self.generation +%= 1;
         if (self.views) |views| views.publish(self.derived());
         candidate.active = false;
@@ -401,13 +485,17 @@ const TestBuilder = struct {
     transport: *TestTransport,
     metadata: *const ai.ModelMeta.Metadata,
 
-    pub fn build(self: *TestBuilder, store: config.Store) !Built {
+    pub fn build(
+        self: *TestBuilder,
+        store: config.Store,
+        reported_metadata: ?ai.ModelMeta.Metadata,
+    ) !Built {
         var runtime = try ProviderRuntime.init(.{
             .allocator = self.allocator,
             .store = store,
             .api_key_environment = .from(self.environment),
             .provider_definitions = self.definition[0..1],
-            .hints = .{ .reported = self.metadata },
+            .hints = .{ .reported = if (reported_metadata) |*value| value else null },
         }, ai.Transport.Transport.from(self.transport), 0);
         errdefer runtime.deinit();
         const prompt = try std.fmt.allocPrint(
@@ -421,6 +509,7 @@ const TestBuilder = struct {
             .prompt = .{ .bytes = prompt },
             .image_input = if (high) .supported else .unsupported,
             .context_limit = if (high) 222 else 111,
+            .sort_models = !high,
         };
     }
 };
@@ -490,6 +579,7 @@ const TestRig = struct {
             .id = @constCast("selection-test"),
             .api = .openai_responses,
             .base_url = @constCast("https://selection.test/v1"),
+            .catalog_id = @constCast("selection-test"),
         };
         const transport = try allocator.create(TestTransport);
         errdefer allocator.destroy(transport);
@@ -655,6 +745,8 @@ test "successful publication changes every next-turn and derived selection view"
         .model = "old-model",
         .model_label = "Old model",
         .effort = "high",
+        .reported_metadata = .{ .replace = .{ .context_window = 999, .tools = .no } },
+        .model_provenance = .explicit,
     });
     defer candidate.deinit();
     try std.testing.expectEqualStrings("low", rig.live.snapshot().effort.?);
@@ -663,6 +755,9 @@ test "successful publication changes every next-turn and derived selection view"
     const turn = rig.live.snapshot();
     try std.testing.expectEqual(runtime_address, @intFromPtr(&rig.live.runtime));
     try std.testing.expectEqualStrings("high", turn.effort.?);
+    try std.testing.expectEqual(@as(u64, 999), turn.model_metadata.context_window);
+    try std.testing.expectEqual(ai.ModelMeta.Support.no, turn.model_metadata.tools);
+    try std.testing.expectEqual(ModelProvenance.explicit, rig.live.current().model_provenance);
     try std.testing.expectEqualStrings("model=old-model;effort=high", turn.system_prompt);
     try std.testing.expectEqual(ai.Provider.ImageInput.supported, turn.image_input);
     try std.testing.expectEqualStrings("high", rig.session.currentSelection().effort.?);
@@ -681,6 +776,7 @@ test "successful publication changes every next-turn and derived selection view"
     try std.testing.expectEqualStrings(turn.system_prompt, rig.views.prompt.?);
     try std.testing.expectEqual(ai.Provider.ImageInput.supported, rig.views.image_input);
     try std.testing.expectEqual(@as(?u64, 222), rig.views.context_limit);
+    try std.testing.expect(!rig.live.current().sort_models);
 
     var effort_setting = try rig.selection.store().read(std.testing.allocator, "effort");
     defer effort_setting.deinit(std.testing.allocator);
@@ -688,4 +784,81 @@ test "successful publication changes every next-turn and derived selection view"
     var preset_setting = try rig.selection.store().read(std.testing.allocator, "preset");
     defer preset_setting.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("", preset_setting.value.?);
+}
+
+const MutatingHints = struct {
+    live: *Owner,
+    batch_calls: usize = 0,
+
+    pub fn lookup(
+        _: *MutatingHints,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: []const u8,
+    ) error{OutOfMemory}!ai.ModelCatalog.Contribution {
+        return .{};
+    }
+
+    pub fn lookupBatch(
+        self: *MutatingHints,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: []const []const u8,
+        output: []ai.ModelCatalog.Contribution,
+    ) error{OutOfMemory}!void {
+        self.batch_calls += 1;
+        for (output) |*value| value.* = .{};
+        self.live.generation +%= 1;
+    }
+};
+
+test "catalog batch detects generation changes and invokes the source once" {
+    var rig = try TestRig.init(std.testing.allocator);
+    defer rig.deinit();
+    rig.stabilize();
+    var source: MutatingHints = .{ .live = &rig.live };
+    rig.live.model_hints_source = ProviderConfig.ModelHintsSource.from(&source);
+    const models = [_]ai.ModelListing.Model{ .{ .id = "a" }, .{ .id = "b" } };
+    var metadata: [models.len]ai.ModelMeta.Metadata = undefined;
+    try std.testing.expectError(
+        error.SelectionChanged,
+        rig.live.catalogMetadataBatch(std.testing.allocator, &models, &metadata),
+    );
+    try std.testing.expectEqual(@as(usize, 1), source.batch_calls);
+}
+
+test "effort changes preserve reported metadata and model changes can reset it" {
+    var rig = try TestRig.init(std.testing.allocator);
+    defer rig.deinit();
+    rig.stabilize();
+
+    var selected = try rig.live.prepare(.{
+        .model = "old-model",
+        .model_label = "old-model",
+        .effort = "high",
+        .reported_metadata = .{ .replace = .{ .context_window = 999, .tools = .no } },
+    });
+    defer selected.deinit();
+    rig.live.commit(&selected);
+
+    var effort_only = try rig.live.prepare(.{
+        .model_label = "old-model",
+        .effort = "low",
+    });
+    defer effort_only.deinit();
+    try std.testing.expectEqual(@as(u64, 999), effort_only.built.runtime.metadata.model.context_window);
+    try std.testing.expectEqual(ai.ModelMeta.Support.no, effort_only.built.runtime.metadata.model.tools);
+    rig.live.commit(&effort_only);
+    try std.testing.expectEqual(@as(u64, 999), rig.live.current().model_metadata.context_window);
+
+    var reset = try rig.live.prepare(.{
+        .model = "old-model",
+        .model_label = "old-model",
+        .effort = "low",
+        .reported_metadata = .{ .replace = null },
+    });
+    defer reset.deinit();
+    try std.testing.expectEqual(@as(u64, 0), reset.built.runtime.metadata.model.context_window);
+    rig.live.commit(&reset);
+    try std.testing.expectEqual(@as(u64, 0), rig.live.current().model_metadata.context_window);
 }

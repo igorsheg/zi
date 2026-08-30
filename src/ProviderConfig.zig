@@ -22,6 +22,13 @@ pub const ModelHintsSource = struct {
         []const u8,
         []const u8,
     ) error{OutOfMemory}!ai.ModelCatalog.Contribution,
+    lookup_batch_fn: ?*const fn (
+        std.mem.Allocator,
+        *anyopaque,
+        []const u8,
+        []const []const u8,
+        []ai.ModelCatalog.Contribution,
+    ) error{OutOfMemory}!void = null,
 
     pub fn from(implementation: anytype) ModelHintsSource {
         const Pointer = @TypeOf(implementation);
@@ -42,8 +49,23 @@ pub const ModelHintsSource = struct {
                 const self: *Implementation = @ptrCast(@alignCast(context));
                 return self.lookup(allocator, provider_id, model_id);
             }
+
+            fn lookupBatchFn(
+                allocator: std.mem.Allocator,
+                context: *anyopaque,
+                provider_id: []const u8,
+                model_ids: []const []const u8,
+                output: []ai.ModelCatalog.Contribution,
+            ) error{OutOfMemory}!void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.lookupBatch(allocator, provider_id, model_ids, output);
+            }
         };
-        return .{ .context = implementation, .lookup_fn = Adapter.lookupFn };
+        return .{
+            .context = implementation,
+            .lookup_fn = Adapter.lookupFn,
+            .lookup_batch_fn = if (@hasDecl(Implementation, "lookupBatch")) Adapter.lookupBatchFn else null,
+        };
     }
 
     pub fn lookup(
@@ -53,6 +75,25 @@ pub const ModelHintsSource = struct {
         model_id: []const u8,
     ) error{OutOfMemory}!ai.ModelCatalog.Contribution {
         return self.lookup_fn(allocator, self.context, provider_id, model_id);
+    }
+
+    /// Uses one source snapshot when supported. Older implementations retain
+    /// scalar behavior through the bounded fallback.
+    pub fn lookupBatch(
+        self: ModelHintsSource,
+        allocator: std.mem.Allocator,
+        provider_id: []const u8,
+        model_ids: []const []const u8,
+        output: []ai.ModelCatalog.Contribution,
+    ) error{OutOfMemory}!void {
+        std.debug.assert(model_ids.len == output.len);
+        std.debug.assert(model_ids.len <= ai.ModelListing.maximum_models);
+        if (self.lookup_batch_fn) |lookup_batch| {
+            return lookup_batch(allocator, self.context, provider_id, model_ids, output);
+        }
+        for (model_ids, output) |model_id, *destination| {
+            destination.* = try self.lookup(allocator, provider_id, model_id);
+        }
     }
 };
 
@@ -3014,6 +3055,55 @@ const TestModelHintsSource = struct {
         return self.contribution;
     }
 };
+
+const BatchModelHintsSource = struct {
+    scalar_calls: usize = 0,
+    batch_calls: usize = 0,
+
+    pub fn lookup(
+        self: *BatchModelHintsSource,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: []const u8,
+    ) error{OutOfMemory}!ai.ModelCatalog.Contribution {
+        self.scalar_calls += 1;
+        return .{};
+    }
+
+    pub fn lookupBatch(
+        self: *BatchModelHintsSource,
+        _: std.mem.Allocator,
+        provider_id: []const u8,
+        model_ids: []const []const u8,
+        output: []ai.ModelCatalog.Contribution,
+    ) error{OutOfMemory}!void {
+        self.batch_calls += 1;
+        std.debug.assert(std.mem.eql(u8, provider_id, "p"));
+        for (model_ids, output, 1..) |_, *destination, context_window| {
+            destination.* = .{ .metadata = .{ .context_window = context_window } };
+        }
+    }
+};
+
+test "model hints batch uses one callback and scalar sources retain bounded fallback" {
+    const ids = [_][]const u8{ "a", "b", "c" };
+    var output: [ids.len]ai.ModelCatalog.Contribution = undefined;
+    var batch: BatchModelHintsSource = .{};
+    try ModelHintsSource.from(&batch).lookupBatch(std.testing.allocator, "p", &ids, &output);
+    try std.testing.expectEqual(@as(usize, 1), batch.batch_calls);
+    try std.testing.expectEqual(@as(usize, 0), batch.scalar_calls);
+    try std.testing.expectEqual(@as(u64, 3), output[2].metadata.context_window);
+
+    var scalar: TestModelHintsSource = .{
+        .expected_provider = "p",
+        .expected_model = "same",
+        .contribution = .{ .metadata = .{ .context_window = 9 } },
+    };
+    const same = [_][]const u8{ "same", "same", "same" };
+    try ModelHintsSource.from(&scalar).lookupBatch(std.testing.allocator, "p", &same, &output);
+    try std.testing.expectEqual(ids.len, scalar.calls);
+    try std.testing.expectEqual(@as(u64, 9), output[1].metadata.context_window);
+}
 
 test "cached model hints lookup uses catalog identity once for compiled and dynamic providers" {
     const environment: TestEnvironment = .{

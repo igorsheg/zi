@@ -1,18 +1,29 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const terminal = @import("../terminal/root.zig");
+const ModelOrder = @import("ModelOrder.zig");
 
 pub const EffortOutcome = union(enum) {
     canceled,
     selected: ?[]const u8,
 };
 
+pub const ModelOutcome = union(enum) {
+    canceled,
+    selected: usize,
+};
+
 pub const Runner = struct {
     context: *anyopaque,
-    run_fn: *const fn (*anyopaque, []const terminal.Picker.Item, usize) anyerror!?usize,
+    run_fn: *const fn (*anyopaque, []const u8, []const terminal.Picker.Item, usize) anyerror!?usize,
 
-    pub fn run(self: Runner, items: []const terminal.Picker.Item, initial_index: usize) !?usize {
-        return self.run_fn(self.context, items, initial_index);
+    pub fn run(
+        self: Runner,
+        title: []const u8,
+        items: []const terminal.Picker.Item,
+        initial_index: usize,
+    ) !?usize {
+        return self.run_fn(self.context, title, items, initial_index);
     }
 
     pub fn from(implementation: anytype) Runner {
@@ -25,11 +36,12 @@ pub const Runner = struct {
         const Adapter = struct {
             fn run(
                 context: *anyopaque,
+                title: []const u8,
                 items: []const terminal.Picker.Item,
                 initial_index: usize,
             ) anyerror!?usize {
                 const self: *Implementation = @ptrCast(@alignCast(context));
-                return self.run(items, initial_index);
+                return self.run(title, items, initial_index);
             }
         };
         return .{ .context = implementation, .run_fn = Adapter.run };
@@ -48,6 +60,7 @@ pub const TerminalRunner = struct {
 
     pub fn run(
         self: *TerminalRunner,
+        title: []const u8,
         items: []const terminal.Picker.Item,
         initial_index: usize,
     ) !?usize {
@@ -58,7 +71,7 @@ pub const TerminalRunner = struct {
             self.stdout.handle,
             self.writer,
             .{
-                .title = "select reasoning effort",
+                .title = title,
                 .items = items,
                 .initial_index = initial_index,
                 .display_columns = self.display_columns,
@@ -68,6 +81,147 @@ pub const TerminalRunner = struct {
         );
     }
 };
+
+/// Builds bounded, picker-lifetime rows. `metadata` is aligned with `models` and
+/// already contains provider-over-catalog merges.
+pub fn model(
+    allocator: std.mem.Allocator,
+    runner: Runner,
+    models: []const ai.ModelListing.Model,
+    metadata: []const ai.ModelMeta.Metadata,
+    current_model: []const u8,
+    sort_models: bool,
+) !ModelOutcome {
+    std.debug.assert(models.len > 1);
+    std.debug.assert(models.len == metadata.len);
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    const order = try temporary.alloc(usize, models.len);
+    for (order, 0..) |*destination, index| destination.* = index;
+    if (sort_models) std.mem.sort(usize, order, models, lessModelIndex);
+
+    const rows = try temporary.alloc(terminal.Picker.Item, models.len);
+    var initial_index: usize = 0;
+    for (order, rows, 0..) |source_index, *row, row_index| {
+        const facts = metadata[source_index];
+        const current = std.mem.eql(u8, models[source_index].id, current_model);
+        row.* = .{
+            .label = models[source_index].id,
+            .description = try modelDescription(temporary, models[source_index], facts),
+            .detail = if (models[source_index].metadata.tools == .no) "no tool calling" else null,
+            .dim = models[source_index].metadata.tools == .no,
+            .current = current,
+        };
+        if (current) initial_index = row_index;
+    }
+
+    const selected = try runner.run("select a model", rows, initial_index) orelse return .canceled;
+    std.debug.assert(selected < order.len);
+    return .{ .selected = order[selected] };
+}
+
+fn lessModelIndex(models: []const ai.ModelListing.Model, left: usize, right: usize) bool {
+    return ModelOrder.lessThan({}, models[left].id, models[right].id);
+}
+
+fn modelDescription(
+    allocator: std.mem.Allocator,
+    model_value: ai.ModelListing.Model,
+    metadata: ai.ModelMeta.Metadata,
+) !?[]const u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    var has_segment = false;
+    if (metadata.context_window != 0) {
+        try appendSeparator(&output.writer, &has_segment);
+        try writeTokenCount(&output.writer, metadata.context_window);
+        try output.writer.writeAll(" context");
+    }
+    if (metadata.image_input == .no) {
+        try appendSeparator(&output.writer, &has_segment);
+        try output.writer.writeAll("no images");
+    }
+    if (metadata.rates.input) |input_rate| if (metadata.rates.output) |output_rate| {
+        try appendSeparator(&output.writer, &has_segment);
+        if (input_rate == 0 and output_rate == 0) {
+            try output.writer.writeAll("free");
+        } else if (metadata.rates.cache_read) |cache_rate| {
+            try output.writer.writeByte('$');
+            try writeRate(&output.writer, input_rate);
+            try output.writer.writeAll(" in / $");
+            try writeRate(&output.writer, cache_rate);
+            try output.writer.writeAll(" cached / $");
+            try writeRate(&output.writer, output_rate);
+            try output.writer.writeAll(" out per Mtok");
+        } else {
+            try output.writer.writeByte('$');
+            try writeRate(&output.writer, input_rate);
+            try output.writer.writeAll(" in / $");
+            try writeRate(&output.writer, output_rate);
+            try output.writer.writeAll(" out per Mtok");
+        }
+    };
+    if (model_value.description) |prose| {
+        if (has_segment) try output.writer.writeByte('\n');
+        try output.writer.writeAll(prose);
+        has_segment = true;
+    }
+    if (!has_segment) {
+        output.deinit();
+        return null;
+    }
+    const owned: []const u8 = try output.toOwnedSlice();
+    return owned;
+}
+
+fn appendSeparator(writer: *std.Io.Writer, has_segment: *bool) !void {
+    if (has_segment.*) try writer.writeAll(" · ");
+    has_segment.* = true;
+}
+
+fn writeTokenCount(writer: *std.Io.Writer, tokens: u64) !void {
+    if (tokens >= 1_000_000) {
+        const rounded_tenths = (tokens +| 50_000) / 100_000;
+        const whole = rounded_tenths / 10;
+        const decimal = rounded_tenths % 10;
+        if (decimal == 0) return writer.print("{d}M", .{whole});
+        return writer.print("{d}.{d}M", .{ whole, decimal });
+    }
+    if (tokens >= 1_000) return writer.print("{d}k", .{tokens / 1_000});
+    return writer.print("{d}", .{tokens});
+}
+
+fn writeRate(writer: *std.Io.Writer, rate: f64) !void {
+    if (rate == 0) return writer.writeByte('0');
+    var buffer: [64]u8 = undefined;
+    const magnitude = @abs(rate);
+    const rendered = if (magnitude >= 1_000 or magnitude < 0.0001)
+        try std.fmt.bufPrint(&buffer, "{e:.2}", .{rate})
+    else if (magnitude >= 100)
+        try std.fmt.bufPrint(&buffer, "{d:.0}", .{rate})
+    else if (magnitude >= 10)
+        try std.fmt.bufPrint(&buffer, "{d:.1}", .{rate})
+    else if (magnitude >= 1)
+        try std.fmt.bufPrint(&buffer, "{d:.2}", .{rate})
+    else if (magnitude >= 0.1)
+        try std.fmt.bufPrint(&buffer, "{d:.3}", .{rate})
+    else if (magnitude >= 0.01)
+        try std.fmt.bufPrint(&buffer, "{d:.4}", .{rate})
+    else if (magnitude >= 0.001)
+        try std.fmt.bufPrint(&buffer, "{d:.5}", .{rate})
+    else
+        try std.fmt.bufPrint(&buffer, "{d:.6}", .{rate});
+    const exponent = std.mem.findScalar(u8, rendered, 'e');
+    var mantissa_end = exponent orelse rendered.len;
+    if (std.mem.indexOfScalar(u8, rendered[0..mantissa_end], '.') != null) {
+        while (mantissa_end != 0 and rendered[mantissa_end - 1] == '0') mantissa_end -= 1;
+        if (mantissa_end != 0 and rendered[mantissa_end - 1] == '.') mantissa_end -= 1;
+    }
+    try writer.writeAll(rendered[0..mantissa_end]);
+    if (exponent) |index| try writer.writeAll(rendered[index..]);
+}
 
 /// Offers hax's distinct provider-default row followed by the exact provider
 /// vocabulary in its declared order. Returned explicit values borrow `levels`.
@@ -93,49 +247,162 @@ pub fn effort(
         if (current) initial_index = index + 1;
     }
 
-    const selected = try runner.run(rows[0 .. @as(usize, levels.count) + 1], initial_index) orelse
-        return .canceled;
+    const selected = try runner.run(
+        "select reasoning effort",
+        rows[0 .. @as(usize, levels.count) + 1],
+        initial_index,
+    ) orelse return .canceled;
     std.debug.assert(selected <= levels.count);
     return .{ .selected = if (selected == 0) null else levels.valueAt(selected - 1) };
 }
 
 const FakeRunner = struct {
     selected: ?usize,
+    expected_title: []const u8,
     expected_initial: usize,
     valid: bool = false,
 
     pub fn run(
         self: *FakeRunner,
+        title: []const u8,
         items: []const terminal.Picker.Item,
         initial_index: usize,
     ) !?usize {
-        self.valid = items.len == 4 and
-            std.mem.eql(u8, items[0].label, "default") and
-            std.mem.eql(u8, items[0].description.?, "Let the provider choose the reasoning effort") and
-            std.mem.eql(u8, items[1].label, "none") and
-            std.mem.eql(u8, items[2].label, "low") and
-            std.mem.eql(u8, items[3].label, "high") and
-            items[2].current == (self.expected_initial == 2) and
-            initial_index == self.expected_initial;
+        self.valid = std.mem.eql(u8, title, self.expected_title) and initial_index == self.expected_initial;
+        if (std.mem.eql(u8, title, "select reasoning effort")) {
+            self.valid = self.valid and items.len == 4 and
+                std.mem.eql(u8, items[0].label, "default") and
+                std.mem.eql(u8, items[1].label, "none") and
+                std.mem.eql(u8, items[2].label, "low") and
+                std.mem.eql(u8, items[3].label, "high");
+        }
         return self.selected;
     }
 };
 
-test "effort picker keeps default distinct and preserves provider vocabulary" {
+test "effort picker keeps default distinct and passes its title" {
     const levels = try ai.Effort.Set.init(&.{ "none", "low", "high" });
-    var explicit_runner: FakeRunner = .{ .selected = 1, .expected_initial = 2 };
-    const explicit = try effort(Runner.from(&explicit_runner), &levels, "low");
-    try std.testing.expect(explicit_runner.valid);
-    try std.testing.expectEqualStrings("none", explicit.selected.?);
-
-    var default_runner: FakeRunner = .{ .selected = 0, .expected_initial = 2 };
-    const provider_default = try effort(Runner.from(&default_runner), &levels, "low");
-    try std.testing.expect(provider_default.selected == null);
+    var runner: FakeRunner = .{
+        .selected = 1,
+        .expected_title = "select reasoning effort",
+        .expected_initial = 2,
+    };
+    const selected = try effort(Runner.from(&runner), &levels, "low");
+    try std.testing.expect(runner.valid);
+    try std.testing.expectEqualStrings("none", selected.selected.?);
 }
 
 test "effort picker cancellation is a no-op result" {
     const levels = try ai.Effort.Set.init(&.{ "none", "low", "high" });
-    var runner: FakeRunner = .{ .selected = null, .expected_initial = 0 };
+    var runner: FakeRunner = .{
+        .selected = null,
+        .expected_title = "select reasoning effort",
+        .expected_initial = 0,
+    };
     try std.testing.expect((try effort(Runner.from(&runner), &levels, null)) == .canceled);
+}
+
+const RowRunner = struct {
+    selected: ?usize = 0,
+    sorted: bool = false,
+    rendered: bool = false,
+
+    pub fn run(
+        self: *RowRunner,
+        title: []const u8,
+        items: []const terminal.Picker.Item,
+        initial_index: usize,
+    ) !?usize {
+        self.sorted = std.mem.eql(u8, title, "select a model") and
+            std.mem.eql(u8, items[0].label, "gpt-5.4") and
+            std.mem.eql(u8, items[1].label, "gpt-5") and initial_index == 1;
+        self.rendered = std.mem.eql(
+            u8,
+            items[0].description.?,
+            "1.5M context · no images · $2 in / $0.5 cached / $8 out per Mtok\nnew model",
+        ) and items[0].dim and std.mem.eql(u8, items[0].detail.?, "no tool calling");
+        return self.selected;
+    }
+};
+
+fn exerciseModelRows(allocator: std.mem.Allocator) !void {
+    const models = [_]ai.ModelListing.Model{
+        .{ .id = "gpt-5", .description = "base" },
+        .{ .id = "gpt-5.4", .description = "new model", .metadata = .{ .tools = .no } },
+    };
+    const metadata = [_]ai.ModelMeta.Metadata{
+        .{},
+        .{
+            .context_window = 1_500_000,
+            .image_input = .no,
+            .rates = .{ .input = 2, .output = 8, .cache_read = 0.5 },
+        },
+    };
+    var runner: RowRunner = .{};
+    const selected = model(
+        allocator,
+        Runner.from(&runner),
+        &models,
+        &metadata,
+        "gpt-5",
+        true,
+    ) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    try std.testing.expectEqual(@as(usize, 1), selected.selected);
+    try std.testing.expect(runner.sorted);
+    try std.testing.expect(runner.rendered);
+}
+
+test "model rows sort indexes and render merged hax facts" {
+    try exerciseModelRows(std.testing.allocator);
+}
+
+const KeepOrderRunner = struct {
+    valid: bool = false,
+
+    pub fn run(
+        self: *KeepOrderRunner,
+        _: []const u8,
+        items: []const terminal.Picker.Item,
+        initial_index: usize,
+    ) !?usize {
+        self.valid = std.mem.eql(u8, items[0].label, "gpt-5") and
+            std.mem.eql(u8, items[1].label, "gpt-5.4") and initial_index == 0;
+        return 1;
+    }
+};
+
+test "model rows preserve provider order when sorting is disabled" {
+    const models = [_]ai.ModelListing.Model{ .{ .id = "gpt-5" }, .{ .id = "gpt-5.4" } };
+    const metadata = [_]ai.ModelMeta.Metadata{ .{}, .{} };
+    var runner: KeepOrderRunner = .{};
+    const selected = try model(
+        std.testing.allocator,
+        Runner.from(&runner),
+        &models,
+        &metadata,
+        "gpt-5",
+        false,
+    );
     try std.testing.expect(runner.valid);
+    try std.testing.expectEqual(@as(usize, 1), selected.selected);
+}
+
+test "model row numbers round like hax" {
+    var storage: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    try writeTokenCount(&writer, 1_950_000);
+    try writer.writeByte('|');
+    try writeRate(&writer, 1.2345);
+    try writer.writeByte('|');
+    try writeRate(&writer, 1234.5);
+    try writer.writeByte('|');
+    try writeRate(&writer, 0.00001234);
+    try std.testing.expectEqualStrings("2M|1.23|1.23e3|1.23e-5", writer.buffered());
+}
+
+test "model row ownership handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseModelRows, .{});
 }
