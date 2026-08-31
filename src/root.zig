@@ -7,6 +7,7 @@ pub const text = @import("text/root.zig");
 pub const terminal = @import("terminal/root.zig");
 pub const render = @import("render/root.zig");
 pub const persistence = @import("persistence/root.zig");
+pub const transcript = @import("transcript/root.zig");
 pub const ProviderConfig = @import("ProviderConfig.zig");
 pub const ProviderHeaders = @import("ProviderHeaders.zig");
 pub const ProviderRuntime = @import("ProviderRuntime.zig");
@@ -33,6 +34,7 @@ test {
     _ = terminal;
     _ = render;
     _ = persistence;
+    _ = transcript;
     _ = ProviderConfig;
     _ = ProviderHeaders;
     _ = ProviderRuntime;

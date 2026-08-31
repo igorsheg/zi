@@ -6,6 +6,7 @@ const DiagnosticText = @import("DiagnosticText.zig");
 const Interactive = @import("Interactive.zig");
 const ProviderConfig = @import("../ProviderConfig.zig");
 const RunSelection = @import("RunSelection.zig");
+const RunLogSeam = @import("RunLogSeam.zig");
 const SelectionPicker = @import("SelectionPicker.zig");
 const Slash = @import("Slash.zig");
 
@@ -94,6 +95,7 @@ pub const Owner = struct {
     width_source: ?WidthSource = null,
     frame: ?*render.Frame = null,
     run_selection: ?*RunSelection.Owner = null,
+    run_log_seam: ?*RunLogSeam.Owner = null,
     io: ?std.Io = null,
     listing_generation: ?Interactive.Generation = null,
     listing_tick: ?ai.Provider.Tick = null,
@@ -124,6 +126,10 @@ pub const Owner = struct {
 
     pub fn setRunSelection(self: *Owner, run_selection: *RunSelection.Owner) void {
         self.run_selection = run_selection;
+    }
+
+    pub fn setRunLogSeam(self: *Owner, run_log_seam: *RunLogSeam.Owner) void {
+        self.run_log_seam = run_log_seam;
     }
 
     pub fn setIo(self: *Owner, io: std.Io) void {
@@ -773,7 +779,9 @@ fn commitAndWarn(
     live: *RunSelection.Owner,
     candidate: *RunSelection.Candidate,
 ) !void {
-    try writePersistenceWarning(self, live.commit(candidate));
+    const result = live.commit(candidate);
+    if (self.run_log_seam) |seam| seam.rebuildTranscript(.selection, live.session);
+    try writePersistenceWarning(self, result);
 }
 
 fn writePersistenceWarning(self: *Owner, result: RunSelection.CommitResult) !void {

@@ -290,6 +290,13 @@ pub const Run = struct {
         return if (self.log_value) |*value| value else null;
     }
 
+    /// Moves the optional append log out of startup ownership.
+    pub fn takeLog(self: *Run) ?persistence.SessionFile.Log {
+        const value = self.log_value;
+        self.log_value = null;
+        return value;
+    }
+
     pub fn warning(self: *const Run) ?Warning {
         return self.warning_value;
     }
@@ -606,6 +613,30 @@ test "resolve is cwd isolated and accepts an exact or unique prefix" {
     });
     defer prefix.found.deinit();
     try std.testing.expectEqualStrings(full_id, prefix.found.id().?);
+}
+
+test "takeLog transfers ownership once" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const run = try start(null, .{ .provider = "p" }, .{
+        .allocator = allocator,
+        .io = io,
+        .state_root = root,
+        .cwd = "/work",
+        .new_identity = .{ .timestamp = .{ .epoch_seconds = 0 }, .uuid = test_uuid },
+        .writer_version = "test",
+    });
+    defer run.deinit();
+
+    var moved = run.takeLog();
+    defer if (moved) |*log_value| log_value.deinit();
+    try std.testing.expect(moved != null);
+    try std.testing.expect(run.takeLog() == null);
+    try std.testing.expect(!run.recordingAvailable());
 }
 
 test "new recording is lazy and caller materialization creates mode 0600" {

@@ -176,6 +176,40 @@ pub const TouchError = error{
     IoFailure,
 };
 
+pub const MutationDurability = enum { synced, sync_failed };
+
+pub const AppendFailure = enum {
+    path_collision,
+    lock_failed_after_create,
+    identity_changed,
+    partial_write,
+    verification_failed,
+    cleanup_indeterminate,
+};
+
+pub const AppendOutcome = union(enum) {
+    unchanged,
+    committed: MutationDurability,
+    indeterminate: AppendFailure,
+};
+
+/// Failures proven before append bytes may have changed.
+pub const AppendError = error{
+    OutOfMemory,
+    InvalidPath,
+    InvalidSelection,
+    InvalidHeader,
+    FileTooLarge,
+    LineTooLarge,
+    TooManyItems,
+    HighWaterMismatch,
+    Poisoned,
+    Cancelled,
+    IoFailure,
+    NotRegular,
+    Removed,
+};
+
 pub const Error = error{
     OutOfMemory,
     InvalidLimits,
@@ -275,6 +309,9 @@ pub const Log = struct {
     selection: OwnedSelection,
     git_probe: ?GitProbe,
     commit_fn: *const fn (std.Io, std.Io.File, []const u8, u64) error{IoFailure}!void = commitAll,
+    append_sync_file_fn: *const fn (std.Io, std.Io.File) error{IoFailure}!void = syncFile,
+    append_delete_fn: *const fn (std.Io, []const u8) error{IoFailure}!void = deleteForkTarget,
+    append_sync_directory_fn: *const fn (std.Io, []const u8) error{IoFailure}!void = syncParentDirectory,
     set_length_fn: *const fn (std.Io, std.Io.File, u64) error{IoFailure}!void = setLength,
     fork_verify_fn: *const fn (
         std.Io,
@@ -473,9 +510,24 @@ pub const Log = struct {
         start_index: usize,
         items: []const ai.Item.Item,
     ) Error!void {
+        const outcome = try self.appendSnapshotClassified(start_index, items);
+        switch (outcome) {
+            .unchanged => if (start_index != items.len) return error.IoFailure,
+            .committed => |durability| if (durability == .sync_failed) return error.IoFailure,
+            .indeterminate => return error.IoFailure,
+        }
+    }
+
+    /// Appends a prepared snapshot while separating pre-mutation errors from
+    /// verified unchanged, committed, and indeterminate write outcomes.
+    pub fn appendSnapshotClassified(
+        self: *Log,
+        start_index: usize,
+        items: []const ai.Item.Item,
+    ) AppendError!AppendOutcome {
         if (self.poisoned) return error.Poisoned;
         if (start_index != self.written_items or start_index > items.len) return error.HighWaterMismatch;
-        if (start_index == items.len) return;
+        if (start_index == items.len) return .unchanged;
         if (items.len > self.limits.max_items) return error.TooManyItems;
 
         var output: std.Io.Writer.Allocating = .init(self.allocator);
@@ -497,40 +549,61 @@ pub const Log = struct {
             defer self.allocator.free(line);
             if (line.len > self.limits.max_line_bytes) return error.LineTooLarge;
             const record_bytes = std.math.add(usize, line.len, 1) catch return error.FileTooLarge;
-            if (record_bytes > self.limits.max_file_bytes -| output.written().len) {
-                return error.FileTooLarge;
-            }
+            if (record_bytes > self.limits.max_file_bytes -| output.written().len) return error.FileTooLarge;
             output.writer.writeAll(line) catch return error.OutOfMemory;
             output.writer.writeByte('\n') catch return error.OutOfMemory;
         }
         if (output.written().len > self.limits.max_file_bytes) return error.FileTooLarge;
-        try self.ensureFile();
+
+        const was_materialized = self.file != null;
+        if (!was_materialized) {
+            if (try self.ensureFileClassified()) |outcome| return outcome;
+        }
         const file = self.file.?;
-        const stat = file.stat(self.io) catch {
-            self.poison();
+        const initial_stat = file.stat(self.io) catch {
+            if (!was_materialized) return self.cleanupCreatedOrIndeterminate(.verification_failed);
             return error.IoFailure;
         };
-        if (stat.kind != .file or stat.nlink == 0) {
+        if (initial_stat.kind != .file or initial_stat.nlink == 0 or
+            !self.namedFileMatches(initial_stat) or initial_stat.size != self.append_offset)
+        {
             self.poison();
-            return if (stat.nlink == 0) error.Removed else error.NotRegular;
+            if (!was_materialized) return .{ .indeterminate = .identity_changed };
+            return error.Poisoned;
         }
-        const current_size = stat.size;
-        if (current_size != self.append_offset) {
-            self.poison();
+        const old_size = std.math.cast(usize, initial_stat.size) orelse return error.FileTooLarge;
+        if (output.written().len > self.limits.max_file_bytes -| old_size) return error.FileTooLarge;
+        const old_bytes = self.allocator.alloc(u8, old_size) catch return error.OutOfMemory;
+        defer self.allocator.free(old_bytes);
+        if (old_size != 0) {
+            const read = file.readPositionalAll(self.io, old_bytes, 0) catch return error.IoFailure;
+            if (read != old_size) return error.IoFailure;
+        }
+        const stable_stat = file.stat(self.io) catch {
+            if (!was_materialized) return self.cleanupCreatedOrIndeterminate(.verification_failed);
             return error.IoFailure;
+        };
+        if (!sameSnapshotStat(initial_stat, stable_stat) or !self.namedFileMatches(stable_stat)) {
+            self.poison();
+            if (!was_materialized) return .{ .indeterminate = .identity_changed };
+            return error.Poisoned;
         }
-        const current_size_usize = std.math.cast(usize, current_size) orelse return error.FileTooLarge;
-        if (output.written().len > self.limits.max_file_bytes -| current_size_usize) {
-            return error.FileTooLarge;
-        }
+
         self.commit_fn(self.io, file, output.written(), self.append_offset) catch {
-            self.poison();
-            return error.IoFailure;
+            return self.classifyFailedAppend(
+                initial_stat,
+                old_bytes,
+                output.written(),
+                items.len,
+                !was_materialized,
+            );
         };
-        self.header_written = true;
-        self.selection_pending = false;
-        self.append_offset += @intCast(output.written().len);
-        self.written_items = items.len;
+        return self.classifyPopulatedAppend(
+            initial_stat,
+            old_bytes,
+            output.written(),
+            items.len,
+        );
     }
 
     /// Cuts the materialized JSONL log after `keep_turns` typed turns and
@@ -906,7 +979,7 @@ pub const Log = struct {
         self.* = replacement;
     }
 
-    fn encodeHeader(self: *Log, writer: *std.Io.Writer) Error!void {
+    fn encodeHeader(self: *Log, writer: *std.Io.Writer) AppendError!void {
         var git: ?GitState = null;
         if (self.git_probe) |probe_value| {
             git = probe_value.probe(self.allocator, self.io, self.cwd.?) catch |err| switch (err) {
@@ -937,8 +1010,8 @@ pub const Log = struct {
         if (writer.end - start > self.limits.max_line_bytes + 1) return error.LineTooLarge;
     }
 
-    fn ensureFile(self: *Log) Error!void {
-        if (self.file != null) return;
+    fn ensureFileClassified(self: *Log) AppendError!?AppendOutcome {
+        if (self.file != null) return null;
         const directory = std.fs.path.dirname(self.path_value) orelse return error.InvalidPath;
         _ = std.Io.Dir.createDirPathStatus(
             .cwd(),
@@ -954,15 +1027,190 @@ pub const Log = struct {
             .truncate = false,
             .exclusive = true,
             .permissions = .fromMode(0o600),
-        }) catch return error.IoFailure;
-        errdefer file.close(self.io);
-        const locked = file.tryLock(self.io, .exclusive) catch return error.IoFailure;
-        if (!locked) return error.SessionBusy;
-        const stat = file.stat(self.io) catch return error.IoFailure;
-        if (stat.kind != .file) return error.NotRegular;
-        if (stat.nlink == 0) return error.Removed;
-        file.setPermissions(self.io, .fromMode(0o600)) catch return error.IoFailure;
+        }) catch |err| {
+            if (err == error.PathAlreadyExists) {
+                self.poison();
+                return .{ .indeterminate = .path_collision };
+            }
+            return error.IoFailure;
+        };
         self.file = file;
+        const locked = file.tryLock(self.io, .exclusive) catch {
+            self.poison();
+            return .{ .indeterminate = .lock_failed_after_create };
+        };
+        if (!locked) {
+            self.poison();
+            return .{ .indeterminate = .lock_failed_after_create };
+        }
+        const stat = file.stat(self.io) catch {
+            return self.cleanupCreatedOrIndeterminate(.verification_failed);
+        };
+        if (stat.kind != .file or stat.nlink == 0 or !self.namedFileMatches(stat)) {
+            self.poison();
+            return .{ .indeterminate = .identity_changed };
+        }
+        file.setPermissions(self.io, .fromMode(0o600)) catch {
+            return self.cleanupCreatedOrIndeterminate(.verification_failed);
+        };
+        return null;
+    }
+
+    fn classifyFailedAppend(
+        self: *Log,
+        initial_stat: std.Io.File.Stat,
+        old_bytes: []const u8,
+        appended: []const u8,
+        item_count: usize,
+        created: bool,
+    ) AppendOutcome {
+        const content = self.classifyAppendContent(initial_stat, old_bytes, appended);
+        return switch (content) {
+            .old => if (created)
+                self.cleanupCreatedOrIndeterminate(.cleanup_indeterminate)
+            else
+                .unchanged,
+            .final => self.finishCommittedAppend(appended.len, item_count),
+            .partial => blk: {
+                self.poison();
+                break :blk .{ .indeterminate = .partial_write };
+            },
+            .identity_changed => blk: {
+                self.poison();
+                break :blk .{ .indeterminate = .identity_changed };
+            },
+            .verification_failed => blk: {
+                self.poison();
+                break :blk .{ .indeterminate = .verification_failed };
+            },
+        };
+    }
+
+    fn classifyPopulatedAppend(
+        self: *Log,
+        initial_stat: std.Io.File.Stat,
+        old_bytes: []const u8,
+        appended: []const u8,
+        item_count: usize,
+    ) AppendOutcome {
+        const content = self.classifyAppendContent(initial_stat, old_bytes, appended);
+        if (content == .final) return self.finishCommittedAppend(appended.len, item_count);
+        self.poison();
+        return .{ .indeterminate = switch (content) {
+            .identity_changed => .identity_changed,
+            .verification_failed => .verification_failed,
+            .old, .partial => .partial_write,
+            .final => unreachable,
+        } };
+    }
+
+    const AppendContent = enum { old, final, partial, identity_changed, verification_failed };
+
+    fn classifyAppendContent(
+        self: *Log,
+        initial_stat: std.Io.File.Stat,
+        old_bytes: []const u8,
+        appended: []const u8,
+    ) AppendContent {
+        const file = self.file.?;
+        const stat = file.stat(self.io) catch return .verification_failed;
+        if (stat.kind != .file or stat.nlink == 0 or stat.inode != initial_stat.inode) {
+            return .identity_changed;
+        }
+        if (!self.namedFileMatches(stat)) return .identity_changed;
+        if (stat.size == old_bytes.len) {
+            const matches = fileContentMatches(self.io, file, old_bytes, &.{}) orelse
+                return .verification_failed;
+            if (!matches or !self.snapshotStillMatches(stat)) return .partial;
+            return .old;
+        }
+        const final_size = std.math.add(usize, old_bytes.len, appended.len) catch return .partial;
+        if (stat.size == final_size) {
+            const matches = fileContentMatches(self.io, file, old_bytes, appended) orelse
+                return .verification_failed;
+            if (!matches or !self.snapshotStillMatches(stat)) return .partial;
+            return .final;
+        }
+        return .partial;
+    }
+
+    fn snapshotStillMatches(self: *Log, before: std.Io.File.Stat) bool {
+        const after = self.file.?.stat(self.io) catch return false;
+        return sameSnapshotStat(before, after) and self.namedFileMatches(after);
+    }
+
+    fn finishCommittedAppend(self: *Log, appended_bytes: usize, item_count: usize) AppendOutcome {
+        self.header_written = true;
+        self.selection_pending = false;
+        self.append_offset += @intCast(appended_bytes);
+        self.written_items = item_count;
+        self.append_sync_file_fn(self.io, self.file.?) catch {
+            self.poison();
+            return .{ .committed = .sync_failed };
+        };
+        if (self.append_offset == appended_bytes) {
+            const directory = std.fs.path.dirname(self.path_value) orelse {
+                self.poison();
+                return .{ .committed = .sync_failed };
+            };
+            self.append_sync_directory_fn(self.io, directory) catch {
+                self.poison();
+                return .{ .committed = .sync_failed };
+            };
+        }
+        return .{ .committed = .synced };
+    }
+
+    fn cleanupCreatedOrIndeterminate(self: *Log, failure: AppendFailure) AppendOutcome {
+        const file = self.file.?;
+        const opened = file.stat(self.io) catch {
+            self.poison();
+            return .{ .indeterminate = failure };
+        };
+        if (!self.namedFileMatches(opened)) {
+            self.poison();
+            return .{ .indeterminate = .identity_changed };
+        }
+        self.append_delete_fn(self.io, self.path_value) catch {
+            self.poison();
+            return .{ .indeterminate = .cleanup_indeterminate };
+        };
+        const unlinked = file.stat(self.io) catch {
+            self.poison();
+            return .{ .indeterminate = .cleanup_indeterminate };
+        };
+        if (unlinked.inode != opened.inode or unlinked.nlink != 0) {
+            self.poison();
+            return .{ .indeterminate = .cleanup_indeterminate };
+        }
+        if (std.Io.Dir.statFile(.cwd(), self.io, self.path_value, .{ .follow_symlinks = false })) |_| {
+            self.poison();
+            return .{ .indeterminate = .cleanup_indeterminate };
+        } else |err| if (err != error.FileNotFound) {
+            self.poison();
+            return .{ .indeterminate = .cleanup_indeterminate };
+        }
+        const directory = std.fs.path.dirname(self.path_value) orelse {
+            self.poison();
+            return .{ .indeterminate = .cleanup_indeterminate };
+        };
+        self.append_sync_directory_fn(self.io, directory) catch {
+            self.poison();
+            return .{ .indeterminate = .cleanup_indeterminate };
+        };
+        file.close(self.io);
+        self.file = null;
+        return .unchanged;
+    }
+
+    fn namedFileMatches(self: *Log, opened: std.Io.File.Stat) bool {
+        const named = std.Io.Dir.statFile(
+            .cwd(),
+            self.io,
+            self.path_value,
+            .{ .follow_symlinks = false },
+        ) catch return false;
+        return named.kind == .file and named.nlink != 0 and named.inode == opened.inode;
     }
 
     fn poison(self: *Log) void {
@@ -974,6 +1222,32 @@ pub const Log = struct {
 
 fn commitAll(io: std.Io, file: std.Io.File, bytes: []const u8, offset: u64) error{IoFailure}!void {
     file.writePositionalAll(io, bytes, offset) catch return error.IoFailure;
+}
+
+fn syncFile(io: std.Io, file: std.Io.File) error{IoFailure}!void {
+    file.sync(io) catch return error.IoFailure;
+}
+
+fn fileContentMatches(
+    io: std.Io,
+    file: std.Io.File,
+    prefix: []const u8,
+    suffix: []const u8,
+) ?bool {
+    var buffer: [4096]u8 = undefined;
+    var offset: usize = 0;
+    const total = prefix.len + suffix.len;
+    while (offset < total) {
+        const length = @min(buffer.len, total - offset);
+        const read = file.readPositionalAll(io, buffer[0..length], @intCast(offset)) catch return null;
+        if (read != length) return false;
+        for (buffer[0..length], offset..) |byte, index| {
+            const expected = if (index < prefix.len) prefix[index] else suffix[index - prefix.len];
+            if (byte != expected) return false;
+        }
+        offset += length;
+    }
+    return true;
 }
 
 fn setLength(io: std.Io, file: std.Io.File, length: u64) error{IoFailure}!void {
@@ -1669,7 +1943,11 @@ fn removeDangling(
     items.items.len = kept;
 }
 
-fn encodeSelection(writer: *std.Io.Writer, selection: Selection, max_line: usize) Error!void {
+fn encodeSelection(
+    writer: *std.Io.Writer,
+    selection: Selection,
+    max_line: usize,
+) error{ OutOfMemory, LineTooLarge }!void {
     const start = writer.end;
     var json: std.json.Stringify = .{ .writer = writer };
     json.beginObject() catch return error.OutOfMemory;
@@ -1680,7 +1958,7 @@ fn encodeSelection(writer: *std.Io.Writer, selection: Selection, max_line: usize
     if (writer.end - start > max_line + 1) return error.LineTooLarge;
 }
 
-fn jsonSelection(json: *std.json.Stringify, selection: Selection) Error!void {
+fn jsonSelection(json: *std.json.Stringify, selection: Selection) error{OutOfMemory}!void {
     jsonOptional(json, "provider", selection.provider) catch return error.OutOfMemory;
     jsonOptional(json, "model", selection.model) catch return error.OutOfMemory;
     jsonOptional(json, "model_label", persistedModelLabel(selection)) catch return error.OutOfMemory;
@@ -1763,7 +2041,7 @@ fn validateLimits(limits: Limits) Error!void {
     }
 }
 
-fn validateGitState(state: GitState) Error!void {
+fn validateGitState(state: GitState) error{InvalidHeader}!void {
     for ([_]?[]const u8{ state.branch, state.commit, state.subject }) |value| {
         const bytes = value orelse continue;
         if (bytes.len > maximum_selection_field_bytes or
@@ -2343,6 +2621,25 @@ test "load degrades image groups beyond hax request count" {
     try std.testing.expectEqualStrings("images", loaded.session.items()[0].user_message.text);
 }
 
+fn failBeforeWrite(
+    _: std.Io,
+    _: std.Io.File,
+    _: []const u8,
+    _: u64,
+) error{IoFailure}!void {
+    return error.IoFailure;
+}
+
+fn commitThenFail(
+    io: std.Io,
+    file: std.Io.File,
+    bytes: []const u8,
+    offset: u64,
+) error{IoFailure}!void {
+    file.writePositionalAll(io, bytes, offset) catch return error.IoFailure;
+    return error.IoFailure;
+}
+
 fn failAfterPrefix(
     io: std.Io,
     file: std.Io.File,
@@ -2351,6 +2648,10 @@ fn failAfterPrefix(
 ) error{IoFailure}!void {
     const prefix_len = @max(@as(usize, 1), bytes.len / 2);
     file.writePositionalAll(io, bytes[0..prefix_len], offset) catch return error.IoFailure;
+    return error.IoFailure;
+}
+
+fn failSyncFile(_: std.Io, _: std.Io.File) error{IoFailure}!void {
     return error.IoFailure;
 }
 
@@ -2383,6 +2684,165 @@ fn failDeleteForkTarget(_: std.Io, _: []const u8) error{IoFailure}!void {
 
 fn failSyncDirectory(_: std.Io, _: []const u8) error{IoFailure}!void {
     return error.IoFailure;
+}
+
+test "classified append distinguishes unchanged committed and indeterminate writes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [4096]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const uuid = [_]u8{ 9, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 9 };
+    var log = try Log.prepare(allocator, io, .{
+        .state_root = root_buffer[0..root_len],
+        .cwd = "/work",
+        .selection = .{ .provider = "alpha", .model = "m1" },
+        .timestamp = .{ .epoch_seconds = 9 },
+        .uuid = uuid,
+        .writer_version = "test",
+    });
+    defer log.deinit();
+    const items = [_]ai.Item.Item{
+        .{ .user_message = .{ .text = @constCast("one") } },
+        .{ .assistant_message = .{ .text = @constCast("two") } },
+        .turn_boundary,
+    };
+
+    try std.testing.expectEqual(AppendOutcome.unchanged, try log.appendSnapshotClassified(0, items[0..0]));
+    log.commit_fn = failBeforeWrite;
+    try std.testing.expectEqual(AppendOutcome.unchanged, try log.appendSnapshotClassified(0, items[0..1]));
+    try std.testing.expect(!log.materialized());
+    try std.testing.expect(!log.poisoned);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(
+        .cwd(),
+        io,
+        log.path(),
+        .{ .follow_symlinks = false },
+    ));
+
+    const committed_synced: AppendOutcome = .{ .committed = .synced };
+    log.commit_fn = commitAll;
+    try std.testing.expectEqual(
+        committed_synced,
+        try log.appendSnapshotClassified(0, items[0..1]),
+    );
+    log.commit_fn = commitThenFail;
+    try std.testing.expectEqual(
+        committed_synced,
+        try log.appendSnapshotClassified(1, items[0..2]),
+    );
+    try std.testing.expectEqual(@as(usize, 2), log.highWater());
+
+    log.commit_fn = commitAll;
+    log.append_sync_file_fn = failSyncFile;
+    const committed_sync_failed: AppendOutcome = .{ .committed = .sync_failed };
+    try std.testing.expectEqual(
+        committed_sync_failed,
+        try log.appendSnapshotClassified(2, &items),
+    );
+    try std.testing.expectEqual(@as(usize, 3), log.highWater());
+    try std.testing.expect(log.poisoned);
+}
+
+test "classified append reports path collision and partial population" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [4096]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const items = [_]ai.Item.Item{
+        .{ .user_message = .{ .text = @constCast("one") } },
+        .{ .assistant_message = .{ .text = @constCast("two") } },
+    };
+
+    const collision_uuid = [_]u8{ 8, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 8 };
+    var owner = try Log.prepare(allocator, io, .{
+        .state_root = root_buffer[0..root_len],
+        .cwd = "/work",
+        .selection = .{},
+        .timestamp = .{ .epoch_seconds = 8 },
+        .uuid = collision_uuid,
+        .writer_version = "test",
+    });
+    defer owner.deinit();
+    try owner.appendSnapshot(0, items[0..1]);
+    var collision = try Log.prepare(allocator, io, .{
+        .state_root = root_buffer[0..root_len],
+        .cwd = "/work",
+        .selection = .{},
+        .timestamp = .{ .epoch_seconds = 8 },
+        .uuid = collision_uuid,
+        .writer_version = "test",
+    });
+    defer collision.deinit();
+    const path_collision: AppendOutcome = .{ .indeterminate = .path_collision };
+    try std.testing.expectEqual(
+        path_collision,
+        try collision.appendSnapshotClassified(0, items[0..1]),
+    );
+    try std.testing.expect(collision.poisoned);
+
+    const partial_uuid = [_]u8{ 7, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 7 };
+    var partial = try Log.prepare(allocator, io, .{
+        .state_root = root_buffer[0..root_len],
+        .cwd = "/work",
+        .selection = .{},
+        .timestamp = .{ .epoch_seconds = 7 },
+        .uuid = partial_uuid,
+        .writer_version = "test",
+    });
+    defer partial.deinit();
+    try partial.appendSnapshot(0, items[0..1]);
+    partial.commit_fn = failAfterPrefix;
+    const partial_write: AppendOutcome = .{ .indeterminate = .partial_write };
+    try std.testing.expectEqual(
+        partial_write,
+        try partial.appendSnapshotClassified(1, &items),
+    );
+    try std.testing.expectEqual(@as(usize, 1), partial.highWater());
+    try std.testing.expect(partial.poisoned);
+
+    const bounded_uuid = [_]u8{ 6, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 6 };
+    var bounded = try Log.prepare(allocator, io, .{
+        .state_root = root_buffer[0..root_len],
+        .cwd = "/work",
+        .selection = .{},
+        .timestamp = .{ .epoch_seconds = 6 },
+        .uuid = bounded_uuid,
+        .writer_version = "test",
+        .limits = .{ .max_items = 1 },
+    });
+    defer bounded.deinit();
+    try std.testing.expectError(error.TooManyItems, bounded.appendSnapshotClassified(0, &items));
+    try std.testing.expect(!bounded.materialized());
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(
+        .cwd(),
+        io,
+        bounded.path(),
+        .{ .follow_symlinks = false },
+    ));
+
+    const cleanup_uuid = [_]u8{ 5, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 5 };
+    var cleanup = try Log.prepare(allocator, io, .{
+        .state_root = root_buffer[0..root_len],
+        .cwd = "/work",
+        .selection = .{},
+        .timestamp = .{ .epoch_seconds = 5 },
+        .uuid = cleanup_uuid,
+        .writer_version = "test",
+    });
+    defer cleanup.deinit();
+    cleanup.commit_fn = failBeforeWrite;
+    cleanup.append_delete_fn = failDeleteForkTarget;
+    const cleanup_indeterminate: AppendOutcome = .{ .indeterminate = .cleanup_indeterminate };
+    try std.testing.expectEqual(
+        cleanup_indeterminate,
+        try cleanup.appendSnapshotClassified(0, items[0..1]),
+    );
+    try std.testing.expect(cleanup.poisoned);
+    try std.testing.expect(cleanup.file != null);
 }
 
 test "partial append poisons and locks until safe torn-tail recovery" {

@@ -14,6 +14,7 @@ pub const StartupConfig = @import("StartupConfig.zig");
 pub const LocalStartup = @import("LocalStartup.zig");
 pub const ModelOrder = @import("ModelOrder.zig");
 pub const RunSelection = @import("RunSelection.zig");
+pub const RunLogSeam = @import("RunLogSeam.zig");
 pub const Stats = @import("Stats.zig");
 pub const SubagentDepth = @import("SubagentDepth.zig");
 
@@ -222,6 +223,7 @@ test {
     _ = LocalStartup;
     _ = ModelOrder;
     _ = RunSelection;
+    _ = RunLogSeam;
     _ = Stats;
     _ = SubagentDepth;
 }

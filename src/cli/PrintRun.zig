@@ -7,6 +7,7 @@ const render = @import("../render/root.zig");
 const persistence = @import("../persistence/root.zig");
 const tool = @import("../tool/root.zig");
 const terminal_module = @import("../terminal/root.zig");
+const transcript = @import("../transcript/root.zig");
 const SecureAllocator = @import("../ai/SecureAllocator.zig");
 const SecureOpen = @import("../SecureOpen.zig");
 const CatalogService = @import("../CatalogService.zig");
@@ -23,6 +24,7 @@ const GitProbe = @import("../GitProbe.zig");
 const Args = @import("Args.zig");
 const InteractiveCommands = @import("InteractiveCommands.zig");
 const RunSelection = @import("RunSelection.zig");
+const RunLogSeam = @import("RunLogSeam.zig");
 const SelectionPicker = @import("SelectionPicker.zig");
 const ProcessAdapters = @import("ProcessAdapters.zig");
 const ProcessFacts = @import("ProcessFacts.zig");
@@ -514,21 +516,33 @@ pub fn run(
         },
     };
 
-    const durability: ?*SessionDurability.Owner = if (session_run.log()) |log|
-        try SessionDurability.Owner.create(allocator, log, .{})
-    else
-        null;
-    defer if (durability) |value| value.deinit();
-    const durability_seam = if (durability) |value| value.seamHook() else null;
+    var durability_log = session_run.takeLog();
+    defer if (durability_log) |*log_value| log_value.deinit();
+    const durability = try SessionDurability.Owner.create(allocator, &durability_log, .{});
+    defer durability.deinit();
+
+    var configured_transcript = try config.Settings.getString(startup.store(), allocator, "transcript");
+    defer configured_transcript.deinit(allocator);
+    var transcript_open: transcript.SecureOpen.Posix = .{};
+    const transcript_owner = try transcript.Owner.Owner.create(
+        allocator,
+        io,
+        transcript_open.capability(),
+        configured_transcript.value,
+        .{},
+    );
+    defer transcript_owner.deinit();
     var compaction_marker: CompactionMarker = .{
         .stderr = stderr,
         .style = ProcessAdapters.isTty(io, .stderr()),
     };
-    var run_seam: RunSeam = .{
-        .downstream = durability_seam,
-        .marker = &compaction_marker,
-    };
-    const run_seam_hook = agent.Loop.SeamHook.from(&run_seam);
+    var transcript_warning_sink: TranscriptWarningSink = .{ .stderr = stderr };
+    const run_log_seam = try RunLogSeam.Owner.create(allocator, transcript_owner, durability, .{
+        .marker = RunLogSeam.Marker.from(&compaction_marker),
+        .warning_sink = RunLogSeam.WarningSink.from(&transcript_warning_sink),
+    });
+    defer run_log_seam.deinit();
+    const run_seam_hook = run_log_seam.seamHook();
 
     const store = startup.store();
     const no_tasks = (try config.Settings.getBool(store, allocator, "no_tasks")).value;
@@ -768,7 +782,7 @@ pub fn run(
     };
     var terminal: Terminal = .{ .tools = &tools };
     var session_info: SessionInfo = .{
-        .run = session_run,
+        .durability = durability,
         .runtime = &live.runtime,
         .preset = nonEmpty(selected_preset.value),
         .resumed = restored != null,
@@ -790,6 +804,8 @@ pub fn run(
         .compaction = &compaction,
     };
     live.setViews(RunSelection.Views.from(&live_views));
+    run_log_seam.bindSelection(&live);
+    run_log_seam.rebuildTranscript(.open, session_run.session());
 
     var configured_theme = try config.Settings.getString(store, allocator, "theme");
     defer configured_theme.deinit(allocator);
@@ -888,6 +904,7 @@ pub fn run(
                     display_columns.resolve(terminal_module.Size.presentationColumns(stdout_terminal_file.handle)),
                 );
                 commands.setRunSelection(&live);
+                commands.setRunLogSeam(run_log_seam);
                 commands.setIo(io);
                 var cooked_inputs = interactive_inputs;
                 cooked_inputs.command_gateway = commands.gateway();
@@ -911,6 +928,7 @@ pub fn run(
                 &compaction,
                 &terminal,
                 &live,
+                run_log_seam,
                 theme,
                 display_columns,
                 markdown_enabled,
@@ -1221,6 +1239,7 @@ fn runRawInteractive(
     compaction: *AutoCompact,
     terminal_owner: *Terminal,
     live: *RunSelection.Owner,
+    run_log_seam: *RunLogSeam.Owner,
     theme: render.Theme,
     display_columns: terminal_module.DisplayColumns.Policy,
     markdown_enabled: bool,
@@ -1340,6 +1359,7 @@ fn runRawInteractive(
     commands.setWidthSource(.from(&markdown_width));
     commands.setFrame(&frame);
     commands.setRunSelection(live);
+    commands.setRunLogSeam(run_log_seam);
     var selection_picker: SelectionPicker.TerminalRunner = .{
         .allocator = allocator,
         .io = io,
@@ -1898,7 +1918,7 @@ const DynamicImageInput = struct {
 };
 
 const SessionInfo = struct {
-    run: *SessionStartup.Run,
+    durability: *SessionDurability.Owner,
     runtime: *ProviderRuntime.Owned,
     preset: ?[]const u8,
     resumed: bool,
@@ -1911,7 +1931,10 @@ const SessionInfo = struct {
             .effort = self.runtime.effort,
             .provider_autoselected = self.runtime.provider_autoselected,
             .resumed = self.resumed,
-            .materialized_session = self.run.resumeHint(),
+            .materialized_session = if (self.durability.materialized())
+                self.durability.resumeHint()
+            else
+                null,
         };
     }
 };
@@ -1950,6 +1973,25 @@ const DynamicModelMetadata = struct {
     }
 };
 
+const TranscriptWarningSink = struct {
+    stderr: *std.Io.Writer,
+
+    pub fn warn(self: *TranscriptWarningSink, warning: transcript.Warning) void {
+        var storage: [4096]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&storage);
+        writer.print(
+            "zi: warning: transcript {s} failed for '",
+            .{@tagName(warning.operation)},
+        ) catch return;
+        const path_limit: usize = 512;
+        const clipped_path = warning.path[0..@min(warning.path.len, path_limit)];
+        DiagnosticText.write(&writer, clipped_path) catch return;
+        if (clipped_path.len != warning.path.len) writer.writeAll("...") catch return;
+        writer.print("' ({s}); conversation recording continues\n", .{@tagName(warning.failure)}) catch return;
+        self.stderr.writeAll(writer.buffered()) catch |err| ignoreWriterFailure(err);
+    }
+};
+
 const CompactionMarker = struct {
     pending: bool = false,
     stderr: *std.Io.Writer,
@@ -1969,22 +2011,11 @@ const CompactionMarker = struct {
         }
         try self.stderr.writeByte('\n');
     }
-};
 
-const RunSeam = struct {
-    downstream: ?agent.Loop.SeamHook,
-    marker: *CompactionMarker,
-
-    pub fn call(
-        self: *RunSeam,
-        session: *const agent.Session.Session,
-        kind: agent.Loop.SeamKind,
-        next_action: bool,
-    ) agent.Loop.HookError!void {
-        if (self.downstream) |downstream| try downstream.call(session, kind, next_action);
-        if (kind != .compaction or !self.marker.pending) return;
-        self.marker.write() catch return error.Failed;
-        self.marker.pending = false;
+    pub fn emitPending(self: *CompactionMarker) agent.Loop.HookError!void {
+        if (!self.pending) return;
+        self.write() catch return error.Failed;
+        self.pending = false;
     }
 };
 
@@ -1998,7 +2029,7 @@ const AutoCompact = struct {
     system_prompt: []const u8,
     tools: []const tool.Tool.Tool,
     tool_runtime: *ToolRuntime.Owner,
-    durability: ?*SessionDurability.Owner,
+    durability: *SessionDurability.Owner,
     effort: ?[]const u8,
     usage: *agent.UsageStats.UsageStats,
     catalog_runtime: *CatalogRuntime,
@@ -2059,38 +2090,22 @@ const AutoCompact = struct {
             error.PendingDurability => error.Indeterminate,
             error.Reentrant, error.InvalidConfig => error.Failed,
         };
-        if (self.durability) |owner| {
-            const update = owner.updateSelection(session, .{
-                .provider = current.provider_id,
-                .model = current.model,
-                .model_label = current.model_label,
-                .effort = self.effort,
-                .preset = current.preset,
-            }) catch |err| {
-                if (err == error.Indeterminate) return error.Indeterminate;
-                self.rollbackToolEffort(current.effort) catch return error.Indeterminate;
-                return switch (err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.Failed => error.Failed,
-                    error.Indeterminate => unreachable,
-                };
-            };
-            if (update == .partial) return error.Indeterminate;
-            return true;
-        }
-        session.reconfigureSelection(.{
-            .provider_id = current.provider_id,
+        const update = self.durability.updateSelection(session, .{
+            .provider = current.provider_id,
             .model = current.model,
             .model_label = current.model_label,
             .effort = self.effort,
             .preset = current.preset,
         }) catch |err| {
+            if (err == error.Indeterminate) return error.Indeterminate;
             self.rollbackToolEffort(current.effort) catch return error.Indeterminate;
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
-                else => error.Failed,
+                error.Failed => error.Failed,
+                error.Indeterminate => unreachable,
             };
         };
+        if (update == .partial) return error.Indeterminate;
         return true;
     }
 
@@ -2512,94 +2527,51 @@ test "Git environment exists only for a fresh recordable session and is OOM safe
     );
 }
 
-test "run seam prints compaction marker only after durable compaction seam" {
-    const Downstream = struct {
-        const Self = @This();
-        writer: *std.Io.Writer,
-        fail: bool = false,
-
-        pub fn call(
-            self: *Self,
-            _: *const agent.Session.Session,
-            _: agent.Loop.SeamKind,
-            _: bool,
-        ) agent.Loop.HookError!void {
-            self.writer.writeAll("durable\n") catch return error.Failed;
-            if (self.fail) return error.Failed;
-        }
-    };
-
+test "transcript warning diagnostic is bounded and clips its path" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    var session = try agent.Session.Session.init(std.testing.allocator, .{});
-    defer session.deinit();
-    var marker: CompactionMarker = .{
-        .pending = true,
-        .stderr = &output.writer,
-        .style = false,
-    };
-    var downstream: Downstream = .{ .writer = &output.writer };
-    var seam: RunSeam = .{
-        .downstream = agent.Loop.SeamHook.from(&downstream),
-        .marker = &marker,
-    };
+    var sink: TranscriptWarningSink = .{ .stderr = &output.writer };
+    const long_path = "x" ** 4096;
 
-    try seam.call(&session, .compaction, true);
-    try std.testing.expectEqualStrings("durable\n[compacted context]\n", output.written());
-    try std.testing.expect(!marker.pending);
+    sink.warn(.{
+        .path = long_path,
+        .operation = .append,
+        .failure = .write_failed,
+        .sequence = 1,
+    });
+    try std.testing.expect(output.written().len < 4096);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "xxx...") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "conversation recording continues\n"));
 }
 
-test "run seam retains marker when downstream durability fails" {
-    const Downstream = struct {
-        const Self = @This();
-
-        pub fn call(
-            _: *Self,
-            _: *const agent.Session.Session,
-            _: agent.Loop.SeamKind,
-            _: bool,
-        ) agent.Loop.HookError!void {
-            return error.Failed;
-        }
-    };
-
+test "compaction marker clears only after a successful write" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    var session = try agent.Session.Session.init(std.testing.allocator, .{});
-    defer session.deinit();
-    var marker: CompactionMarker = .{
-        .pending = true,
-        .stderr = &output.writer,
-        .style = false,
-    };
-    var downstream: Downstream = .{};
-    var seam: RunSeam = .{
-        .downstream = agent.Loop.SeamHook.from(&downstream),
-        .marker = &marker,
-    };
-
-    try std.testing.expectError(error.Failed, seam.call(&session, .compaction, true));
-    try std.testing.expectEqualStrings("", output.written());
-    try std.testing.expect(marker.pending);
-}
-
-test "run seam prints styled marker without downstream durability" {
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var session = try agent.Session.Session.init(std.testing.allocator, .{});
-    defer session.deinit();
     var marker: CompactionMarker = .{
         .pending = true,
         .stderr = &output.writer,
         .style = true,
     };
-    var seam: RunSeam = .{ .downstream = null, .marker = &marker };
 
-    try seam.call(&session, .compaction, true);
+    try marker.emitPending();
     try std.testing.expectEqualStrings(
         "\x1b[2m[compacted context]\x1b[0m\n",
         output.written(),
     );
+    try std.testing.expect(!marker.pending);
+}
+
+test "compaction marker remains pending after writer failure" {
+    var storage: [0]u8 = .{};
+    var writer = std.Io.Writer.fixed(&storage);
+    var marker: CompactionMarker = .{
+        .pending = true,
+        .stderr = &writer,
+        .style = false,
+    };
+
+    try std.testing.expectError(error.Failed, marker.emitPending());
+    try std.testing.expect(marker.pending);
 }
 
 test "provider warnings use actionable safe prose" {

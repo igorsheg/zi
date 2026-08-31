@@ -1,7 +1,9 @@
-//! Binds the agent loop's synchronous durability seam to one session log.
+//! Owns the replaceable authoritative session log and routes the agent loop's
+//! synchronous durability seam to the current authority.
 //!
-//! `Owner` is heap allocated because `agent.Loop.SeamHook` erases a pointer to
-//! it. The log and optional observation context are borrowed through `deinit`.
+//! `Owner` is heap-stable because `agent.Loop.SeamHook` erases its address.
+//! Stream seam calls are synchronous and serialized with adoption, selection,
+//! reconciliation, quarantine, and destruction.
 
 const std = @import("std");
 const agent = @import("agent/root.zig");
@@ -20,8 +22,8 @@ pub const ObservationError = error{
     Indeterminate,
 };
 
-/// Synchronous output-coordination callback. `Observation` is entirely by
-/// value. The callback must not retain the erased context beyond its lifetime.
+/// Synchronous callback. The callback must not retain its context or any data
+/// borrowed from the durability owner.
 pub const Observer = struct {
     context: *anyopaque,
     observe_fn: *const fn (*anyopaque, Observation) ObservationError!void,
@@ -52,9 +54,50 @@ pub const Options = struct {
 
 pub const CreateError = error{OutOfMemory};
 
-/// A known split means the requested selection is staged on the log while the
-/// live session still has its previous selection. Preexisting divergence means
-/// this helper changed neither side because it could not establish a safe base.
+pub const QuarantineReason = enum {
+    external_change,
+    removed,
+    append_indeterminate,
+    truncate_indeterminate,
+    sync_failed,
+    high_water_diverged,
+};
+
+pub const Authority = union(enum) {
+    unrecorded,
+    active: persistence.SessionFile.Log,
+    quarantined: struct {
+        log: persistence.SessionFile.Log,
+        reason: QuarantineReason,
+    },
+};
+
+pub const State = union(enum) {
+    unrecorded,
+    synchronized: usize,
+    pending_append: struct {
+        durable: usize,
+        memory: usize,
+    },
+    quarantined: QuarantineReason,
+};
+
+pub const ReconcileFailure = enum {
+    out_of_memory,
+    serialization_failed,
+    bounded_output,
+    io_retryable,
+};
+
+pub const ReconcileOutcome = union(enum) {
+    synchronized,
+    unrecorded,
+    retryable: ReconcileFailure,
+    quarantined: QuarantineReason,
+};
+
+/// A known split means the requested selection reached the log while the live
+/// session retained its old selection. The prepared API avoids creating it.
 pub const PartialState = enum {
     log_only,
     preexisting_divergence,
@@ -88,51 +131,118 @@ pub const PrepareSelectionError = error{
     Failed,
     Indeterminate,
     Diverged,
+    PendingAppend,
+    Quarantined,
 };
 
-/// Move-only coordinated session and log replacement. Preparation changes
-/// neither owner; publication consumes both replacements without allocating.
+/// Move-only coordinated session and optional-log selection replacement.
 pub const PreparedSelection = struct {
+    owner: *Owner,
+    generation: u64,
     session: agent.Session.PreparedSelection,
-    log: persistence.SessionFile.PreparedSelection,
+    log: ?persistence.SessionFile.PreparedSelection,
     changed: bool,
     active: bool = true,
 
     pub fn deinit(self: *PreparedSelection) void {
         if (self.active) {
-            self.log.deinit();
+            if (self.log) |*prepared| prepared.deinit();
             self.session.deinit();
         }
         self.* = undefined;
     }
 };
 
-/// Heap-stable owner of the erased seam hook. `log` is borrowed and must
-/// outlive this owner. Calls must remain synchronous and serialized with all
-/// other mutations of the log.
+/// Move-only prospective authority. Preparation consumes `replacement` on
+/// success by setting it to null.
+pub const PreparedAdoption = struct {
+    owner: *Owner,
+    generation: u64,
+    replacement: ?persistence.SessionFile.Log,
+    active: bool = true,
+
+    pub fn deinit(self: *PreparedAdoption) void {
+        if (self.active) if (self.replacement) |*log| log.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Move-only authority displaced by publication.
+pub const RetiredAuthority = struct {
+    authority: Authority,
+    active: bool = true,
+
+    pub fn deinit(self: *RetiredAuthority) void {
+        if (self.active) deinitAuthority(&self.authority);
+        self.* = undefined;
+    }
+};
+
 pub const Owner = struct {
     allocator: std.mem.Allocator,
-    log: *persistence.SessionFile.Log,
+    authority: Authority,
     observer: ?Observer,
+    generation: u64 = 0,
 
+    /// Creates the mandatory stable owner. On success this consumes `log` and
+    /// sets `log.*` to null. On failure the caller retains it unchanged.
     pub fn create(
         allocator: std.mem.Allocator,
-        log: *persistence.SessionFile.Log,
+        log: *?persistence.SessionFile.Log,
         options: Options,
     ) CreateError!*Owner {
         const self = try allocator.create(Owner);
         self.* = .{
             .allocator = allocator,
-            .log = log,
+            .authority = if (log.*) |value| .{ .active = value } else .unrecorded,
             .observer = options.observer,
         };
+        log.* = null;
         return self;
     }
 
     pub fn deinit(self: *Owner) void { // ziglint-ignore: Z030
         const allocator = self.allocator;
+        deinitAuthority(&self.authority);
         self.* = undefined;
         allocator.destroy(self);
+    }
+
+    pub fn state(self: *const Owner, session: *const agent.Session.Session) State {
+        const memory = session.items().len;
+        return switch (self.authority) {
+            .unrecorded => .unrecorded,
+            .quarantined => |value| .{ .quarantined = value.reason },
+            .active => |*log| stateFromCounts(log.highWater(), memory),
+        };
+    }
+
+    pub fn activePath(self: *const Owner) ?[]const u8 {
+        return switch (self.authority) {
+            .unrecorded => null,
+            .active => |*log| log.path(),
+            .quarantined => |*value| value.log.path(),
+        };
+    }
+
+    pub fn materialized(self: *const Owner) bool {
+        return switch (self.authority) {
+            .unrecorded => false,
+            .active => |*log| log.materialized(),
+            .quarantined => |*value| value.log.materialized(),
+        };
+    }
+
+    pub fn resumeHint(self: *const Owner) ?[]const u8 {
+        return switch (self.authority) {
+            .unrecorded => null,
+            .active => |*log| log.resumeHint(),
+            .quarantined => |*value| value.log.resumeHint(),
+        };
+    }
+
+    pub fn generationValue(self: *const Owner) u64 {
+        return self.generation;
     }
 
     pub fn seamHook(self: *Owner) agent.Loop.SeamHook {
@@ -145,58 +255,208 @@ pub const Owner = struct {
         kind: agent.Loop.SeamKind,
         next_action: bool,
     ) agent.Loop.HookError!void {
+        switch (self.authority) {
+            .unrecorded => return,
+            .quarantined => return error.Indeterminate,
+            .active => {},
+        }
+
         const items = session.items();
-        const high_water = self.log.highWater();
-        self.log.appendSnapshot(high_water, items) catch |err| return mapLogError(err);
-        if (items.len == high_water) return;
+        const durable = self.activeLog().highWater();
+        if (items.len < durable) {
+            self.quarantine(.high_water_diverged);
+            return error.Indeterminate;
+        }
+        if (items.len == durable) return;
+
+        const outcome = self.activeLog().appendSnapshotClassified(durable, items) catch |err| {
+            const classification = classifyAppendError(err);
+            return switch (classification) {
+                .retryable => |failure| mapReconcileFailure(failure),
+                .quarantined => |reason| blk: {
+                    self.quarantine(reason);
+                    break :blk error.Indeterminate;
+                },
+            };
+        };
+        switch (outcome) {
+            .unchanged => return error.Failed,
+            .indeterminate => {
+                self.quarantine(.append_indeterminate);
+                return error.Indeterminate;
+            },
+            .committed => |durability| {
+                if (durability == .sync_failed) {
+                    self.quarantine(.sync_failed);
+                    return error.Indeterminate;
+                }
+                self.generation +%= 1;
+            },
+        }
         if (self.observer) |observer| {
             observer.observe(.{
                 .kind = kind,
                 .next_action = next_action,
-                .high_water = self.log.highWater(),
+                .high_water = items.len,
             }) catch |err| return mapObservationError(err);
         }
     }
 
-    /// Verifies the current session and log agree, then owns both prospective
-    /// replacements without changing either side.
+    /// Retries an outstanding append. Quarantine is sticky until adoption or
+    /// destruction, and an unrecorded conversation is an exact no-op.
+    pub fn reconcile(
+        self: *Owner,
+        session: *const agent.Session.Session,
+    ) ReconcileOutcome {
+        switch (self.authority) {
+            .unrecorded => return .unrecorded,
+            .quarantined => |value| return .{ .quarantined = value.reason },
+            .active => {},
+        }
+
+        const items = session.items();
+        const durable = self.activeLog().highWater();
+        if (items.len < durable) {
+            self.quarantine(.high_water_diverged);
+            return .{ .quarantined = .high_water_diverged };
+        }
+        if (items.len == durable) return .synchronized;
+
+        const outcome = self.activeLog().appendSnapshotClassified(durable, items) catch |err| {
+            return switch (classifyAppendError(err)) {
+                .retryable => |failure| .{ .retryable = failure },
+                .quarantined => |reason| blk: {
+                    self.quarantine(reason);
+                    break :blk .{ .quarantined = reason };
+                },
+            };
+        };
+        return switch (outcome) {
+            .unchanged => .{ .retryable = .io_retryable },
+            .indeterminate => blk: {
+                self.quarantine(.append_indeterminate);
+                break :blk .{ .quarantined = .append_indeterminate };
+            },
+            .committed => |durability| blk: {
+                if (durability == .sync_failed) {
+                    self.quarantine(.sync_failed);
+                    break :blk .{ .quarantined = .sync_failed };
+                }
+                self.generation +%= 1;
+                break :blk .synchronized;
+            },
+        };
+    }
+
+    /// Consumes `replacement` into a generation-bound adoption candidate.
+    pub fn prepareAdoption(
+        self: *Owner,
+        replacement: *?persistence.SessionFile.Log,
+    ) error{StaleGeneration}!PreparedAdoption {
+        const prepared: PreparedAdoption = .{
+            .owner = self,
+            .generation = self.generation,
+            .replacement = replacement.*,
+        };
+        replacement.* = null;
+        return prepared;
+    }
+
+    /// Installs a prepared authority without allocation and returns ownership
+    /// of the displaced authority.
+    pub fn publishAdoption(
+        self: *Owner,
+        prepared: *PreparedAdoption,
+    ) RetiredAuthority {
+        std.debug.assert(prepared.active);
+        std.debug.assert(prepared.owner == self);
+        std.debug.assert(prepared.generation == self.generation);
+        const retired: RetiredAuthority = .{ .authority = self.authority };
+        self.authority = if (prepared.replacement) |log| .{ .active = log } else .unrecorded;
+        prepared.replacement = null;
+        prepared.active = false;
+        self.generation +%= 1;
+        return retired;
+    }
+
+    /// Quarantine keeps the logger and its lifetime lock owned until adoption
+    /// or shutdown. The first reason is retained.
+    pub fn quarantine(self: *Owner, reason: QuarantineReason) void {
+        switch (self.authority) {
+            .unrecorded, .quarantined => return,
+            .active => |log| self.authority = .{ .quarantined = .{
+                .log = log,
+                .reason = reason,
+            } },
+        }
+        self.generation +%= 1;
+    }
+
+    /// Stages a session selection and, when active, the matching log
+    /// selection. Unrecorded owners stage only the session. Quarantine rejects
+    /// ordinary selection preparation.
     pub fn prepareSelection(
         self: *Owner,
         session: *agent.Session.Session,
         requested: persistence.SessionFile.Selection,
     ) PrepareSelectionError!PreparedSelection {
-        const old_session = session.currentSelection();
-        if (!crossSelectionEqual(self.log.currentSelection(), old_session)) return error.Diverged;
-
+        switch (self.state(session)) {
+            .unrecorded, .synchronized => {},
+            .pending_append => return error.PendingAppend,
+            .quarantined => |reason| {
+                self.quarantine(reason);
+                return error.Quarantined;
+            },
+        }
         const normalized = normalizeSelection(requested);
-        const changed = !crossSelectionEqual(normalized.log, old_session);
+        const old_session = session.currentSelection();
+
         var session_prepared = session.prepareSelection(normalized.session) catch |err|
             return mapSessionError(err);
         errdefer session_prepared.deinit();
-        var log_prepared = self.log.prepareSelection(normalized.log) catch |err|
-            return mapSelectionLogError(err);
-        errdefer log_prepared.deinit();
+
+        var log_prepared: ?persistence.SessionFile.PreparedSelection = null;
+        errdefer if (log_prepared) |*prepared| prepared.deinit();
+        switch (self.authority) {
+            .unrecorded => {},
+            .quarantined => unreachable,
+            .active => |*log| {
+                if (!crossSelectionEqual(log.currentSelection(), old_session)) return error.Diverged;
+                log_prepared = log.prepareSelection(normalized.log) catch |err|
+                    return mapSelectionLogError(err);
+            },
+        }
         return .{
+            .owner = self,
+            .generation = self.generation,
             .session = session_prepared,
             .log = log_prepared,
-            .changed = changed,
+            .changed = !crossSelectionEqual(normalized.log, old_session),
         };
     }
 
-    /// Publishes a coordinated replacement without allocating. Consumes `prepared`.
+    /// Publishes a coordinated replacement without allocation.
     pub fn publishSelection(
         self: *Owner,
         session: *agent.Session.Session,
         prepared: *PreparedSelection,
     ) void {
         std.debug.assert(prepared.active);
+        std.debug.assert(prepared.owner == self);
+        std.debug.assert(prepared.generation == self.generation);
+        switch (self.authority) {
+            .unrecorded => std.debug.assert(prepared.log == null),
+            .active => |*log| {
+                std.debug.assert(prepared.log != null);
+                log.publishSelection(&prepared.log.?);
+            },
+            .quarantined => unreachable,
+        }
         session.publishSelection(&prepared.session);
-        self.log.publishSelection(&prepared.log);
         prepared.active = false;
+        self.generation +%= 1;
     }
 
-    /// Preserves the original unchanged, updated, and divergence outcomes while
-    /// delegating all fallible work to preparation.
     pub fn updateSelection(
         self: *Owner,
         session: *agent.Session.Session,
@@ -207,6 +467,8 @@ pub const Owner = struct {
                 .state = .preexisting_divergence,
                 .failure = .indeterminate,
             } },
+            error.Quarantined => return error.Indeterminate,
+            error.PendingAppend => return error.Failed,
             error.OutOfMemory => return error.OutOfMemory,
             error.Failed => return error.Failed,
             error.Indeterminate => return error.Indeterminate,
@@ -216,7 +478,60 @@ pub const Owner = struct {
         self.publishSelection(session, &prepared);
         return if (changed) .updated else .unchanged;
     }
+
+    fn activeLog(self: *Owner) *persistence.SessionFile.Log {
+        return switch (self.authority) {
+            .active => |*log| log,
+            .unrecorded, .quarantined => unreachable,
+        };
+    }
 };
+
+const AppendErrorClass = union(enum) {
+    retryable: ReconcileFailure,
+    quarantined: QuarantineReason,
+};
+
+fn classifyAppendError(err: persistence.SessionFile.AppendError) AppendErrorClass {
+    return switch (err) {
+        error.OutOfMemory => .{ .retryable = .out_of_memory },
+        error.InvalidSelection, error.InvalidHeader => .{ .retryable = .serialization_failed },
+        error.FileTooLarge, error.LineTooLarge, error.TooManyItems => .{ .retryable = .bounded_output },
+        error.InvalidPath, error.Cancelled, error.IoFailure => .{ .retryable = .io_retryable },
+        error.HighWaterMismatch => .{ .quarantined = .high_water_diverged },
+        error.Removed => .{ .quarantined = .removed },
+        error.Poisoned, error.NotRegular => .{ .quarantined = .external_change },
+    };
+}
+
+fn mapReconcileFailure(failure: ReconcileFailure) agent.Loop.HookError {
+    return switch (failure) {
+        .out_of_memory => error.OutOfMemory,
+        .serialization_failed, .bounded_output, .io_retryable => error.Failed,
+    };
+}
+
+fn mapObservationError(err: ObservationError) agent.Loop.HookError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Failed => error.Failed,
+        error.Indeterminate => error.Indeterminate,
+    };
+}
+
+fn deinitAuthority(authority: *Authority) void {
+    switch (authority.*) {
+        .unrecorded => {},
+        .active => |*log| log.deinit(),
+        .quarantined => |*value| value.log.deinit(),
+    }
+}
+
+fn stateFromCounts(durable: usize, memory: usize) State {
+    if (memory < durable) return .{ .quarantined = .high_water_diverged };
+    if (memory == durable) return .{ .synchronized = durable };
+    return .{ .pending_append = .{ .durable = durable, .memory = memory } };
+}
 
 const NormalizedSelection = struct {
     log: persistence.SessionFile.Selection,
@@ -262,27 +577,11 @@ fn optionalEqual(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
-fn mapLogError(err: persistence.SessionFile.Error) agent.Loop.HookError {
+fn mapSelectionLogError(err: persistence.SessionFile.Error) SelectionError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Poisoned, error.Removed, error.IoFailure, error.IndeterminateCleanup => error.Indeterminate,
         else => error.Failed,
-    };
-}
-
-fn mapObservationError(err: ObservationError) agent.Loop.HookError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Failed => error.Failed,
-        error.Indeterminate => error.Indeterminate,
-    };
-}
-
-fn mapSelectionLogError(err: persistence.SessionFile.Error) SelectionError {
-    return switch (mapLogError(err)) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Failed => error.Failed,
-        error.Indeterminate => error.Indeterminate,
     };
 }
 
@@ -294,7 +593,7 @@ fn mapSessionError(err: agent.Session.Error) SelectionError {
 }
 
 const TestRecorder = struct {
-    values: [8]Observation = undefined,
+    values: [4]Observation = undefined,
     length: usize = 0,
     failure: ?ObservationError = null,
 
@@ -324,50 +623,153 @@ fn testLog(
     });
 }
 
-test "every loop seam durably appends and preserves observation values" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root);
+fn failBeforeWrite(
+    _: std.Io,
+    _: std.Io.File,
+    _: []const u8,
+    _: u64,
+) error{IoFailure}!void {
+    return error.IoFailure;
+}
 
-    var log = try testLog(allocator, io, root, .{});
-    defer log.deinit();
+fn commitWrite(
+    io: std.Io,
+    file: std.Io.File,
+    bytes: []const u8,
+    offset: u64,
+) error{IoFailure}!void {
+    file.writePositionalAll(io, bytes, offset) catch return error.IoFailure;
+}
+
+fn writePrefixThenFail(
+    io: std.Io,
+    file: std.Io.File,
+    bytes: []const u8,
+    offset: u64,
+) error{IoFailure}!void {
+    const prefix_len = @max(@as(usize, 1), bytes.len / 2);
+    file.writePositionalAll(io, bytes[0..prefix_len], offset) catch return error.IoFailure;
+    return error.IoFailure;
+}
+
+fn failSync(_: std.Io, _: std.Io.File) error{IoFailure}!void {
+    return error.IoFailure;
+}
+
+test "owner consumes optional authority and owns unrecorded state" {
+    const allocator = std.testing.allocator;
+    var none: ?persistence.SessionFile.Log = null;
+    const owner = try Owner.create(allocator, &none, .{});
+    defer owner.deinit();
     var session = try agent.Session.Session.init(allocator, .{});
     defer session.deinit();
-    var recorder: TestRecorder = .{};
-    const owner = try Owner.create(allocator, &log, .{ .observer = Observer.from(&recorder) });
-    defer owner.deinit();
-    const hook = owner.seamHook();
 
-    // An empty seam is an exact no-op: it neither writes the lazy header nor
-    // reports an observation that could be mistaken for a durable append.
-    try hook.call(&session, .completion, true);
-    try std.testing.expect(!log.materialized());
-    try std.testing.expectEqual(@as(usize, 0), recorder.length);
-
-    const kinds = [_]agent.Loop.SeamKind{
-        .provider_failure,
-        .completion,
-        .tool_batch,
-        .compaction,
-        .interruption,
-        .pause,
-    };
-    for (kinds, 0..) |kind, index| {
-        try session.appendCopy(&.{ .user_message = .{ .text = @constCast("item") } });
-        const next_action = index % 2 == 0;
-        try hook.call(&session, kind, next_action);
-        try std.testing.expectEqual(kind, recorder.values[index].kind);
-        try std.testing.expectEqual(next_action, recorder.values[index].next_action);
-        try std.testing.expectEqual(index + 1, recorder.values[index].high_water);
-    }
-    try std.testing.expect(log.materialized());
-    try std.testing.expectEqual(session.items().len, log.highWater());
+    try std.testing.expect(none == null);
+    try std.testing.expectEqual(State.unrecorded, owner.state(&session));
+    try std.testing.expect(owner.activePath() == null);
+    try std.testing.expect(!owner.materialized());
+    try std.testing.expect(owner.resumeHint() == null);
+    try std.testing.expectEqual(ReconcileOutcome.unrecorded, owner.reconcile(&session));
+    try owner.seamHook().call(&session, .completion, false);
 }
 
-test "hook maps mismatch and callback failures without advancing observations" {
+test "create allocation failure leaves optional log with caller" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var optional_log: ?persistence.SessionFile.Log = try testLog(allocator, io, root, .{});
+    defer if (optional_log) |*log| log.deinit();
+    var storage: [0]u8 = .{};
+    var fixed: std.heap.FixedBufferAllocator = .init(&storage);
+    try std.testing.expectError(error.OutOfMemory, Owner.create(fixed.allocator(), &optional_log, .{}));
+    try std.testing.expect(optional_log != null);
+}
+
+test "active seam exposes pending state then synchronizes through classified append" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var optional_log: ?persistence.SessionFile.Log = try testLog(allocator, io, root, .{});
+    var recorder: TestRecorder = .{};
+    const owner = try Owner.create(allocator, &optional_log, .{ .observer = Observer.from(&recorder) });
+    defer owner.deinit();
+    var session = try agent.Session.Session.init(allocator, .{});
+    defer session.deinit();
+    try session.appendCopy(&.{ .user_message = .{ .text = @constCast("one") } });
+
+    const pending = owner.state(&session).pending_append;
+    try std.testing.expectEqual(@as(usize, 0), pending.durable);
+    try std.testing.expectError(error.PendingAppend, owner.prepareSelection(&session, .{}));
+    try std.testing.expectEqual(@as(usize, 1), pending.memory);
+    try owner.seamHook().call(&session, .completion, true);
+    try std.testing.expectEqual(@as(u64, 1), owner.generationValue());
+    try std.testing.expectEqual(@as(usize, 1), owner.state(&session).synchronized);
+    try std.testing.expect(owner.materialized());
+    try std.testing.expectEqual(@as(usize, 1), recorder.length);
+    try std.testing.expectEqual(agent.Loop.SeamKind.completion, recorder.values[0].kind);
+    try std.testing.expect(recorder.values[0].next_action);
+}
+
+test "reconcile keeps proven unchanged retryable and quarantines sync failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var optional_log: ?persistence.SessionFile.Log = try testLog(allocator, io, root, .{});
+    optional_log.?.commit_fn = failBeforeWrite;
+    const owner = try Owner.create(allocator, &optional_log, .{});
+    defer owner.deinit();
+    var session = try agent.Session.Session.init(allocator, .{});
+    defer session.deinit();
+    try session.appendCopy(&.{ .user_message = .{ .text = @constCast("one") } });
+
+    const retry = owner.reconcile(&session);
+    try std.testing.expectEqual(ReconcileFailure.io_retryable, retry.retryable);
+    try std.testing.expectEqual(@as(usize, 0), owner.state(&session).pending_append.durable);
+
+    owner.activeLog().commit_fn = commitWrite;
+    owner.activeLog().append_sync_file_fn = failSync;
+    const quarantined = owner.reconcile(&session);
+    try std.testing.expectEqual(QuarantineReason.sync_failed, quarantined.quarantined);
+    try std.testing.expectEqual(QuarantineReason.sync_failed, owner.state(&session).quarantined);
+    try std.testing.expectError(error.Indeterminate, owner.seamHook().call(&session, .completion, false));
+}
+
+test "indeterminate append quarantines and retains the owned log" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var optional_log: ?persistence.SessionFile.Log = try testLog(allocator, io, root, .{});
+    optional_log.?.commit_fn = writePrefixThenFail;
+    const owner = try Owner.create(allocator, &optional_log, .{});
+    defer owner.deinit();
+    var session = try agent.Session.Session.init(allocator, .{});
+    defer session.deinit();
+    try session.appendCopy(&.{ .user_message = .{ .text = @constCast("one") } });
+
+    const outcome = owner.reconcile(&session);
+    try std.testing.expectEqual(QuarantineReason.append_indeterminate, outcome.quarantined);
+    try std.testing.expectEqual(QuarantineReason.append_indeterminate, owner.state(&session).quarantined);
+    try std.testing.expect(owner.activePath() != null);
+    try std.testing.expectEqual(@as(u64, 1), owner.generationValue());
+}
+
+test "memory behind high water quarantines without appending" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -376,199 +778,118 @@ test "hook maps mismatch and callback failures without advancing observations" {
     defer allocator.free(root);
 
     var log = try testLog(allocator, io, root, .{});
-    defer log.deinit();
-    const initial = [_]ai.Item.Item{
+    const item = [_]ai.Item.Item{
         .{ .user_message = .{ .text = @constCast("persisted") } },
     };
-    try log.appendSnapshot(0, &initial);
-    var empty = try agent.Session.Session.init(allocator, .{});
-    defer empty.deinit();
-    var recorder: TestRecorder = .{ .failure = error.Indeterminate };
-    const owner = try Owner.create(allocator, &log, .{ .observer = Observer.from(&recorder) });
+    try log.appendSnapshot(0, &item);
+    var optional_log: ?persistence.SessionFile.Log = log;
+    const owner = try Owner.create(allocator, &optional_log, .{});
     defer owner.deinit();
-    try std.testing.expectError(error.Failed, owner.seamHook().call(&empty, .completion, false));
+    var session = try agent.Session.Session.init(allocator, .{});
+    defer session.deinit();
 
-    try empty.appendCopy(&initial[0]);
-    try empty.appendCopy(&.{ .assistant_message = .{ .text = @constCast("new") } });
-    try std.testing.expectError(
-        error.Indeterminate,
-        owner.seamHook().call(&empty, .tool_batch, true),
-    );
-    // Callback failure happens after the append and cannot roll it back.
-    try std.testing.expectEqual(@as(usize, 2), log.highWater());
-
-    try std.testing.expectEqual(error.Indeterminate, mapLogError(error.IoFailure));
-    try std.testing.expectEqual(error.Indeterminate, mapLogError(error.Removed));
-    try std.testing.expectEqual(error.Indeterminate, mapLogError(error.Poisoned));
-    try std.testing.expectEqual(error.OutOfMemory, mapLogError(error.OutOfMemory));
-    try std.testing.expectEqual(error.Failed, mapLogError(error.FileTooLarge));
+    try std.testing.expectEqual(QuarantineReason.high_water_diverged, owner.state(&session).quarantined);
+    try std.testing.expectError(error.Quarantined, owner.prepareSelection(&session, .{}));
+    try std.testing.expectEqual(QuarantineReason.high_water_diverged, owner.state(&session).quarantined);
+    const outcome = owner.reconcile(&session);
+    try std.testing.expectEqual(QuarantineReason.high_water_diverged, outcome.quarantined);
+    try std.testing.expectEqual(@as(u64, 1), owner.generationValue());
 }
 
-test "prepared selection can be dropped, published, and rejects divergence" {
+test "adoption replaces quarantine and retires the held authority" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
-    const original: persistence.SessionFile.Selection = .{ .provider = "a", .model = "m" };
 
-    var log = try testLog(allocator, io, root, original);
-    defer log.deinit();
+    var first: ?persistence.SessionFile.Log = try testLog(allocator, io, root, .{});
+    const owner = try Owner.create(allocator, &first, .{});
+    defer owner.deinit();
+    owner.quarantine(.external_change);
+    const generation = owner.generationValue();
+
+    var replacement: ?persistence.SessionFile.Log = null;
+    var prepared = try owner.prepareAdoption(&replacement);
+    defer prepared.deinit();
+    var retired = owner.publishAdoption(&prepared);
+    defer retired.deinit();
+
+    try std.testing.expect(replacement == null);
+    try std.testing.expectEqual(generation +% 1, owner.generationValue());
+    try std.testing.expect(owner.activePath() == null);
+    try std.testing.expect(retired.authority == .quarantined);
+}
+
+test "active selection preparation coordinates log and session and detects divergence" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var optional_log: ?persistence.SessionFile.Log = try testLog(allocator, io, root, .{
+        .provider = "old",
+        .model = "model",
+    });
+    const owner = try Owner.create(allocator, &optional_log, .{});
+    defer owner.deinit();
     var session = try agent.Session.Session.init(allocator, .{
-        .provider_id = "a",
-        .model = "m",
-        .limits = .{ .provider_id_bytes = 1 },
+        .provider_id = "old",
+        .model = "model",
     });
     defer session.deinit();
-    const owner = try Owner.create(allocator, &log, .{});
-    defer owner.deinit();
 
-    var no_op = try owner.prepareSelection(&session, original);
-    try std.testing.expect(!no_op.changed);
-    owner.publishSelection(&session, &no_op);
-    no_op.deinit();
-
-    var dropped = try owner.prepareSelection(&session, .{ .provider = "b", .model = "m2" });
+    var dropped = try owner.prepareSelection(&session, .{ .provider = "new", .model = "next" });
     dropped.deinit();
-    try std.testing.expectEqualStrings("a", session.currentSelection().provider_id.?);
-    try std.testing.expectEqualStrings("a", log.currentSelection().provider.?);
+    try std.testing.expectEqualStrings("old", session.currentSelection().provider_id.?);
+    try std.testing.expectEqualStrings("old", owner.activeLog().currentSelection().provider.?);
 
-    try std.testing.expectEqual(SelectionUpdate.unchanged, try owner.updateSelection(&session, original));
-    const changed = try owner.updateSelection(&session, .{ .provider = "b", .model = "m2" });
-    try std.testing.expectEqual(SelectionUpdate.updated, changed);
-    try std.testing.expectEqualStrings("b", session.currentSelection().provider_id.?);
-    try std.testing.expectEqualStrings("b", log.currentSelection().provider.?);
+    var prepared = try owner.prepareSelection(&session, .{ .provider = "new", .model = "next" });
+    defer prepared.deinit();
+    try std.testing.expect(prepared.log != null);
+    owner.publishSelection(&session, &prepared);
+    try std.testing.expectEqualStrings("new", session.currentSelection().provider_id.?);
+    try std.testing.expectEqualStrings("new", owner.activeLog().currentSelection().provider.?);
 
-    // Preparation validates both replacements before either side changes.
-    try std.testing.expectError(
-        error.Failed,
-        owner.updateSelection(&session, .{ .provider = "too-long", .model = "m2" }),
-    );
-    try std.testing.expectEqualStrings("b", session.currentSelection().provider_id.?);
-    try std.testing.expectEqualStrings("b", log.currentSelection().provider.?);
-
-    try log.setSelection(.{ .provider = "other", .model = "m2" });
+    try owner.activeLog().setSelection(.{ .provider = "other", .model = "next" });
     try std.testing.expectError(
         error.Diverged,
-        owner.prepareSelection(&session, .{ .provider = "c", .model = "m2" }),
+        owner.prepareSelection(&session, .{ .provider = "third", .model = "next" }),
     );
-    const partial = try owner.updateSelection(&session, .{ .provider = "c", .model = "m2" });
-    try std.testing.expectEqual(PartialState.preexisting_divergence, partial.partial.state);
-    try std.testing.expectEqual(FailureClass.indeterminate, partial.partial.failure);
 }
 
-fn exerciseSelectionPreparationAllocations(
-    allocator: std.mem.Allocator,
-    root: []const u8,
-) !void {
-    const original: persistence.SessionFile.Selection = .{
-        .provider = "old-provider",
-        .model = "old-model",
-        .model_label = "Old Model",
-        .effort = "low",
-        .preset = "old-preset",
-    };
-    var log = try testLog(allocator, std.testing.io, root, original);
-    defer log.deinit();
-    var session = try agent.Session.Session.init(allocator, .{
-        .provider_id = original.provider,
-        .model = original.model,
-        .model_label = original.model_label,
-        .effort = original.effort,
-        .preset = original.preset,
-    });
-    defer session.deinit();
-    const owner = try Owner.create(allocator, &log, .{});
+test "selection preparation supports unrecorded authority and rejects quarantine" {
+    const allocator = std.testing.allocator;
+    var none: ?persistence.SessionFile.Log = null;
+    const owner = try Owner.create(allocator, &none, .{});
     defer owner.deinit();
+    var session = try agent.Session.Session.init(allocator, .{ .provider_id = "old" });
+    defer session.deinit();
 
-    var prepared = try owner.prepareSelection(&session, .{
-        .provider = "new-provider",
-        .model = "new-model",
-        .model_label = "New Model",
-        .effort = "high",
-        .preset = "new-preset",
-    });
+    var prepared = try owner.prepareSelection(&session, .{ .provider = "new", .preset = "" });
     defer prepared.deinit();
-    try std.testing.expectEqualStrings("old-provider", session.currentSelection().provider_id.?);
-    try std.testing.expectEqualStrings("old-provider", log.currentSelection().provider.?);
-}
+    try std.testing.expect(prepared.log == null);
+    owner.publishSelection(&session, &prepared);
+    try std.testing.expectEqualStrings("new", session.currentSelection().provider_id.?);
+    try std.testing.expect(session.currentSelection().preset == null);
 
-test "coordinated selection preparation frees every allocation failure" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
-    try std.testing.checkAllAllocationFailures(
-        allocator,
-        exerciseSelectionPreparationAllocations,
-        .{root},
-    );
-}
-
-test "resumed log continues from loaded session high water" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root);
-
-    var path: []u8 = undefined;
-    {
-        var prepared = try testLog(allocator, io, root, .{});
-        defer prepared.deinit();
-        const first = [_]ai.Item.Item{
-            .{ .user_message = .{ .text = @constCast("first") } },
-        };
-        try prepared.appendSnapshot(0, &first);
-        path = try allocator.dupe(u8, prepared.path());
-    }
-    defer allocator.free(path);
-
-    var loaded = try persistence.SessionFile.load(allocator, io, path, .{});
-    defer loaded.deinit();
-    try std.testing.expectEqual(@as(usize, 1), loaded.item_high_water);
-    var resumed = try persistence.SessionFile.Log.resumeExisting(allocator, io, .{
-        .path = path,
-        .selection = .{},
-        .loaded_item_count = loaded.item_high_water,
+    var next: ?persistence.SessionFile.Log = try testLog(allocator, std.testing.io, root, .{
+        .provider = "new",
     });
-    defer resumed.deinit();
-    const owner = try Owner.create(allocator, &resumed, .{});
-    defer owner.deinit();
-
-    try loaded.session.appendCopy(&.{ .assistant_message = .{ .text = @constCast("second") } });
-    try owner.seamHook().call(&loaded.session, .completion, false);
-    try std.testing.expectEqual(@as(usize, 2), resumed.highWater());
-}
-
-test "hook maps allocation failure before lazy commit" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-
-    var storage: [32 * 1024]u8 = undefined;
-    var fixed: std.heap.FixedBufferAllocator = .init(&storage);
-    const log_allocator = fixed.allocator();
-    var log = try testLog(log_allocator, io, root, .{});
-    defer log.deinit();
-    var session = try agent.Session.Session.init(std.testing.allocator, .{});
-    defer session.deinit();
-    try session.appendCopy(&.{ .user_message = .{ .text = @constCast("item") } });
-    const owner = try Owner.create(std.testing.allocator, &log, .{});
-    defer owner.deinit();
-
-    const remaining = storage.len - fixed.end_index;
-    _ = try log_allocator.alloc(u8, remaining);
+    var adoption = try owner.prepareAdoption(&next);
+    defer adoption.deinit();
+    var retired = owner.publishAdoption(&adoption);
+    retired.deinit();
+    owner.quarantine(.append_indeterminate);
     try std.testing.expectError(
-        error.OutOfMemory,
-        owner.seamHook().call(&session, .completion, false),
+        error.Quarantined,
+        owner.prepareSelection(&session, .{ .provider = "other" }),
     );
-    try std.testing.expect(!log.materialized());
-    try std.testing.expectEqual(@as(usize, 0), log.highWater());
 }

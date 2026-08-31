@@ -255,24 +255,11 @@ pub const Views = struct {
     }
 };
 
-const PreparedSession = union(enum) {
-    session: agent.Session.PreparedSelection,
-    durability: SessionDurability.PreparedSelection,
-
-    fn deinit(self: *PreparedSession) void {
-        switch (self.*) {
-            .session => |*prepared| prepared.deinit(),
-            .durability => |*prepared| prepared.deinit(),
-        }
-        self.* = undefined;
-    }
-};
-
 pub const Candidate = struct {
     allocator: std.mem.Allocator,
     config_run: config.Selection.PreparedRun,
     built: Built,
-    session: PreparedSession,
+    session: SessionDurability.PreparedSelection,
     tool_selection: tool.Bash.RunSelection,
     reported_metadata: ?ai.ModelMeta.Metadata,
     model_provenance: ModelProvenance,
@@ -317,7 +304,7 @@ pub const Owner = struct {
     provider_source: ?ProviderSource = null,
     tools: ToolSelection,
     session: *agent.Session.Session,
-    durability: ?*SessionDurability.Owner,
+    durability: *SessionDurability.Owner,
     runtime: ProviderRuntime.Owned,
     prompt: ?PromptAssembly.OwnedPrompt,
     tool_list: []const tool.Tool.Tool,
@@ -534,10 +521,7 @@ pub const Owner = struct {
             .effort = selection.effort,
             .preset = selection.preset,
         };
-        var prepared_session: PreparedSession = if (self.durability) |durability|
-            .{ .durability = try durability.prepareSelection(self.session, log_selection) }
-        else
-            .{ .session = try self.session.prepareSelection(selection) };
+        var prepared_session = try self.durability.prepareSelection(self.session, log_selection);
         errdefer prepared_session.deinit();
 
         const tool_selection: tool.Bash.RunSelection = .{
@@ -588,10 +572,7 @@ pub const Owner = struct {
         self.sort_models = candidate.built.sort_models;
         candidate.built.active = false;
 
-        switch (candidate.session) {
-            .session => |*prepared| self.session.publishSelection(prepared),
-            .durability => |*prepared| self.durability.?.publishSelection(self.session, prepared),
-        }
+        self.durability.publishSelection(self.session, &candidate.session);
         self.tools.publish(candidate.tool_selection);
         self.reported_metadata = candidate.reported_metadata;
         self.model_provenance = candidate.model_provenance;
@@ -774,6 +755,7 @@ const TestRig = struct {
     allocator: std.mem.Allocator,
     selection: config.Selection,
     session: agent.Session.Session,
+    durability: *SessionDurability.Owner,
     builder: TestBuilder,
     tools: TestTools = .{},
     views: TestViews = .{},
@@ -831,11 +813,15 @@ const TestRig = struct {
             .preset = "work",
         });
         errdefer session.deinit();
+        var no_log: ?persistence.SessionFile.Log = null;
+        const durability = try SessionDurability.Owner.create(allocator, &no_log, .{});
+        errdefer durability.deinit();
 
         var rig: TestRig = undefined;
         rig.allocator = allocator;
         rig.selection = selection;
         rig.session = session;
+        rig.durability = durability;
         rig.builder = .{
             .allocator = allocator,
             .environment = environment,
@@ -851,7 +837,7 @@ const TestRig = struct {
             .builder = Builder.from(&rig.builder),
             .tools = ToolSelection.from(&rig.tools),
             .session = &rig.session,
-            .durability = null,
+            .durability = rig.durability,
             .runtime = runtime,
             .prompt = .{ .bytes = prompt_bytes },
             .tool_list = &.{},
@@ -868,6 +854,7 @@ const TestRig = struct {
         self.live.builder = Builder.from(&self.builder);
         self.live.tools = ToolSelection.from(&self.tools);
         self.live.session = &self.session;
+        self.live.durability = self.durability;
         self.live.setViews(Views.from(&self.views));
     }
 
@@ -877,6 +864,7 @@ const TestRig = struct {
         const transport = self.builder.transport;
         const metadata = self.builder.metadata;
         self.live.deinit();
+        self.durability.deinit();
         self.session.deinit();
         self.selection.deinit();
         self.allocator.destroy(metadata);
@@ -926,27 +914,30 @@ test "successful publication changes every next-turn and derived selection view"
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
-    var log = try persistence.SessionFile.Log.prepare(std.testing.allocator, std.testing.io, .{
-        .state_root = root,
-        .cwd = "/work",
-        .selection = .{
-            .provider = "selection-test",
-            .model = "old-model",
-            .model_label = "old-model",
-            .effort = "low",
-            .preset = "work",
+    var optional_log: ?persistence.SessionFile.Log = try persistence.SessionFile.Log.prepare(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .state_root = root,
+            .cwd = "/work",
+            .selection = .{
+                .provider = "selection-test",
+                .model = "old-model",
+                .model_label = "old-model",
+                .effort = "low",
+                .preset = "work",
+            },
+            .timestamp = .{ .epoch_seconds = 0 },
+            .uuid = [_]u8{
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+                0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+            },
+            .writer_version = "test",
         },
-        .timestamp = .{ .epoch_seconds = 0 },
-        .uuid = [_]u8{
-            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
-            0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
-        },
-        .writer_version = "test",
-    });
-    defer log.deinit();
-    const durability = try SessionDurability.Owner.create(std.testing.allocator, &log, .{});
-    defer durability.deinit();
-    rig.live.durability = durability;
+    );
+    rig.durability.deinit();
+    rig.durability = try SessionDurability.Owner.create(std.testing.allocator, &optional_log, .{});
+    rig.live.durability = rig.durability;
     const runtime_address = @intFromPtr(&rig.live.runtime);
     const view_publications_before = rig.views.publications;
 
@@ -972,9 +963,7 @@ test "successful publication changes every next-turn and derived selection view"
     try std.testing.expectEqual(ai.Provider.ImageInput.supported, turn.image_input);
     try std.testing.expectEqualStrings("high", rig.session.currentSelection().effort.?);
     try std.testing.expect(rig.session.currentSelection().preset == null);
-    try std.testing.expectEqualStrings("high", log.currentSelection().effort.?);
-    try std.testing.expect(log.currentSelection().preset == null);
-    try std.testing.expect(!log.materialized());
+    try std.testing.expect(!rig.durability.materialized());
     try std.testing.expectEqual(@as(usize, 1), rig.tools.publications);
     try std.testing.expectEqualStrings("selection-test", rig.tools.provider[0..rig.tools.provider_len]);
     try std.testing.expectEqualStrings("old-model", rig.tools.model[0..rig.tools.model_len]);
