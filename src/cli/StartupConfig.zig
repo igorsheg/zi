@@ -191,6 +191,26 @@ pub const Owner = struct {
         self.state.selection.publishRun(prepared);
     }
 
+    /// Returns a bounded borrowed view into the cached preset enumeration.
+    /// The result is valid until Owner mutation or deinit and must not be deinitialized.
+    pub fn lookupPreset(self: *const Owner, name: []const u8) config.Preset.BorrowedLookup {
+        return borrowedCachedLookup(&self.state.presets, name);
+    }
+
+    pub fn preparePreset(
+        self: *const Owner,
+        plan: *const config.Preset.Plan,
+    ) config.Selection.Error!config.Selection.PreparedPreset {
+        return self.state.selection.preparePreset(.run, plan);
+    }
+
+    pub fn publishPreset(
+        self: *Owner,
+        prepared: *config.Selection.PreparedPreset,
+    ) config.Selection.RetiredOverlay {
+        return self.state.selection.publishPreset(prepared);
+    }
+
     pub fn presetPlans(self: *const Owner) []const config.Preset.Plan {
         return self.state.presets.plans;
     }
@@ -581,7 +601,20 @@ fn cloneWarnings(
     };
 }
 
-/// Returns a borrowed lookup view. It must never be deinitialized.
+fn borrowedCachedLookup(
+    presets: *const config.Preset.Enumeration,
+    name: []const u8,
+) config.Preset.BorrowedLookup {
+    for (presets.plans) |*plan| {
+        if (std.mem.eql(u8, plan.name, name)) return .{ .plan = plan };
+    }
+    for (presets.invalid) |*invalid| {
+        if (std.mem.eql(u8, invalid.name, name)) return .{ .invalid = invalid };
+    }
+    return .missing;
+}
+
+/// Returns a shallow borrowed compatibility value. It must never be deinitialized.
 fn cachedLookup(
     presets: *const config.Preset.Enumeration,
     name: []const u8,

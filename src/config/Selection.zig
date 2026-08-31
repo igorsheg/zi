@@ -126,6 +126,90 @@ pub const PreparedRun = struct {
     }
 };
 
+/// Move-only complete prospective preset overlay.
+pub const PreparedPreset = struct {
+    allocator: std.mem.Allocator,
+    run_document: ?Document,
+    conversation_document: ?Document,
+    run_tint: ?[]u8,
+    conversation_tint: ?[]u8,
+    base_options: Store.Options,
+    active: bool = true,
+
+    pub fn store(self: *const PreparedPreset) Store {
+        std.debug.assert(self.active);
+        return overlayStore(
+            self.base_options,
+            &self.run_document,
+            &self.conversation_document,
+        );
+    }
+
+    pub fn deinit(self: *PreparedPreset) void {
+        if (self.active) deinitOverlayValues(
+            self.allocator,
+            &self.run_document,
+            &self.conversation_document,
+            &self.run_tint,
+            &self.conversation_tint,
+        );
+        self.* = undefined;
+    }
+};
+
+/// Move-only complete prospective conversation restore overlay.
+pub const PreparedRestore = struct {
+    allocator: std.mem.Allocator,
+    run_document: ?Document,
+    conversation_document: ?Document,
+    run_tint: ?[]u8,
+    conversation_tint: ?[]u8,
+    outcome: RestoreOutcome,
+    base_options: Store.Options,
+    active: bool = true,
+
+    pub fn store(self: *const PreparedRestore) Store {
+        std.debug.assert(self.active);
+        return overlayStore(
+            self.base_options,
+            &self.run_document,
+            &self.conversation_document,
+        );
+    }
+
+    pub fn deinit(self: *PreparedRestore) void {
+        if (self.active) deinitOverlayValues(
+            self.allocator,
+            &self.run_document,
+            &self.conversation_document,
+            &self.run_tint,
+            &self.conversation_tint,
+        );
+        self.* = undefined;
+    }
+};
+
+/// Owns an overlay displaced by allocation-free publication.
+pub const RetiredOverlay = struct {
+    allocator: std.mem.Allocator,
+    run_document: ?Document,
+    conversation_document: ?Document,
+    run_tint: ?[]u8,
+    conversation_tint: ?[]u8,
+    active: bool = true,
+
+    pub fn deinit(self: *RetiredOverlay) void {
+        if (self.active) deinitOverlayValues(
+            self.allocator,
+            &self.run_document,
+            &self.conversation_document,
+            &self.run_tint,
+            &self.conversation_tint,
+        );
+        self.* = undefined;
+    }
+};
+
 allocator: std.mem.Allocator,
 base: Store.Options,
 run: ?Document = null,
@@ -196,9 +280,8 @@ pub fn exitPreset(self: *Selection, tier: Tier) Error!void {
     }
 }
 
-/// Applies an already validated Plan as one overlay transaction. The Plan is
-/// borrowed and remains owned by its caller.
-pub fn applyPreset(self: *Selection, tier: Tier, plan: *const Preset.Plan) Error!void {
+/// Builds a complete prospective preset overlay without changing Selection.
+pub fn preparePreset(self: *const Selection, tier: Tier, plan: *const Preset.Plan) Error!PreparedPreset {
     const plan_changes = [_]Change{
         .{ .key = "preset", .value = plan.name },
         .{ .key = "provider", .value = plan.provider },
@@ -209,45 +292,69 @@ pub fn applyPreset(self: *Selection, tier: Tier, plan: *const Preset.Plan) Error
         .{ .key = "tint", .value = null },
     };
     try validateChanges(&plan_changes);
-    const tint = try self.copyOptional(plan.tint.value);
-    errdefer if (tint) |value| self.wipeFree(value);
+
+    var prepared: PreparedPreset = .{
+        .allocator = self.allocator,
+        .run_document = null,
+        .conversation_document = null,
+        .run_tint = null,
+        .conversation_tint = null,
+        .base_options = self.base,
+    };
+    errdefer prepared.deinit();
     switch (tier) {
         .conversation => {
-            const document = try self.changedDocument(.conversation, &plan_changes);
-            self.publishDocument(.conversation, document);
-            self.publishTint(.conversation, tint);
+            prepared.run_document = try self.cloneOptionalDocument(&self.run);
+            prepared.conversation_document = try self.changedDocument(.conversation, &plan_changes);
+            prepared.run_tint = try self.copyOptional(self.run_preset_tint);
+            prepared.conversation_tint = try self.copyOptional(plan.tint.value);
         },
         .run => {
-            // A run stance ends the resumed stance below it. Stage both
-            // documents before publishing either one so omitted prompts cannot
-            // expose the resumed preset, including under allocation failure.
-            var new_run = try self.changedDocument(.run, &plan_changes);
-            errdefer {
-                wipeDocument(&new_run);
-                new_run.deinit();
-            }
-            const new_conversation = try self.changedDocument(.conversation, &.{
+            prepared.run_document = try self.changedDocument(.run, &plan_changes);
+            prepared.conversation_document = try self.changedDocument(.conversation, &.{
                 .{ .key = "preset", .value = null },
                 .{ .key = "system_prompt", .value = null },
                 .{ .key = "system_prompt_append", .value = null },
             });
-            self.publishDocument(.run, new_run);
-            self.publishDocument(.conversation, new_conversation);
-            self.publishTint(.run, tint);
-            self.freeSecret(&self.conversation_preset_tint);
+            prepared.run_tint = try self.copyOptional(plan.tint.value);
         },
     }
+    return prepared;
+}
+
+/// Consumes prepared, installs it without allocation, and returns the displaced overlay.
+pub fn publishPreset(self: *Selection, prepared: *PreparedPreset) RetiredOverlay {
+    std.debug.assert(prepared.active);
+    std.debug.assert(prepared.allocator.ptr == self.allocator.ptr);
+    std.debug.assert(prepared.allocator.vtable == self.allocator.vtable);
+    const retired = self.replaceOverlay(
+        &prepared.run_document,
+        &prepared.conversation_document,
+        &prepared.run_tint,
+        &prepared.conversation_tint,
+    );
+    prepared.active = false;
+    return retired;
+}
+
+/// Applies an already validated Plan as one overlay transaction. The Plan is
+/// borrowed and remains owned by its caller.
+pub fn applyPreset(self: *Selection, tier: Tier, plan: *const Preset.Plan) Error!void {
+    var prepared = try self.preparePreset(tier, plan);
+    defer prepared.deinit();
+    var retired = self.publishPreset(&prepared);
+    defer retired.deinit();
 }
 
 /// Restores provider-bound metadata and the recorded preset stance. A missing
 /// or invalid lookup is reported after the core selection is restored, which
 /// matches hax's resume behavior. No mutation occurs until every replacement
 /// allocation succeeds.
-pub fn restoreConversation(
-    self: *Selection,
+pub fn prepareRestoreConversation(
+    self: *const Selection,
     metadata: RestoreMetadata,
     lookup: ?*const Preset.Lookup,
-) Error!RestoreOutcome {
+) Error!PreparedRestore {
     var changes: [13]Change = undefined;
     var count: usize = 0;
     if (metadata.provider) |provider| {
@@ -281,11 +388,52 @@ pub fn restoreConversation(
     };
 
     try validateChanges(changes[0..count]);
-    const tint = if (plan) |value| try self.copyOptional(value.tint.value) else null;
-    errdefer if (tint) |value| self.wipeFree(value);
-    const document = try self.changedDocument(.conversation, changes[0..count]);
-    self.publishDocument(.conversation, document);
-    self.publishTint(.conversation, tint);
+    var prepared: PreparedRestore = .{
+        .allocator = self.allocator,
+        .run_document = null,
+        .conversation_document = null,
+        .run_tint = null,
+        .conversation_tint = null,
+        .outcome = outcome,
+        .base_options = self.base,
+    };
+    errdefer prepared.deinit();
+    prepared.run_document = try self.cloneOptionalDocument(&self.run);
+    prepared.conversation_document = try self.changedDocument(.conversation, changes[0..count]);
+    prepared.run_tint = try self.copyOptional(self.run_preset_tint);
+    prepared.conversation_tint = if (plan) |value| try self.copyOptional(value.tint.value) else null;
+    return prepared;
+}
+
+/// Consumes prepared, installs it without allocation, and returns the displaced overlay.
+pub fn publishRestoreConversation(self: *Selection, prepared: *PreparedRestore) RetiredOverlay {
+    std.debug.assert(prepared.active);
+    std.debug.assert(prepared.allocator.ptr == self.allocator.ptr);
+    std.debug.assert(prepared.allocator.vtable == self.allocator.vtable);
+    const retired = self.replaceOverlay(
+        &prepared.run_document,
+        &prepared.conversation_document,
+        &prepared.run_tint,
+        &prepared.conversation_tint,
+    );
+    prepared.active = false;
+    return retired;
+}
+
+/// Restores provider-bound metadata and the recorded preset stance. A missing
+/// or invalid lookup is reported after the core selection is restored, which
+/// matches hax's resume behavior. No mutation occurs until every replacement
+/// allocation succeeds.
+pub fn restoreConversation(
+    self: *Selection,
+    metadata: RestoreMetadata,
+    lookup: ?*const Preset.Lookup,
+) Error!RestoreOutcome {
+    var prepared = try self.prepareRestoreConversation(metadata, lookup);
+    defer prepared.deinit();
+    const outcome = prepared.outcome;
+    var retired = self.publishRestoreConversation(&prepared);
+    defer retired.deinit();
     return outcome;
 }
 
@@ -419,6 +567,26 @@ fn validateChanges(changes: []const Change) Error!void {
     }
 }
 
+fn cloneOptionalDocument(self: *const Selection, source: *const ?Document) Error!?Document {
+    return if (source.*) |*document| try self.cloneDocument(document) else null;
+}
+
+fn cloneDocument(self: *const Selection, source: *const Document) Error!Document {
+    var scratch: Document.WipingAllocator = .{ .backing = self.allocator };
+    const scratch_allocator = scratch.allocator();
+    const bytes = std.json.Stringify.valueAlloc(
+        scratch_allocator,
+        source.parsed.value,
+        .{},
+    ) catch return error.OutOfMemory;
+    defer {
+        std.crypto.secureZero(u8, bytes);
+        scratch_allocator.free(bytes);
+    }
+    return Document.parse(self.allocator, bytes, Document.runtime_limits) catch |err|
+        return mapDocumentError(err);
+}
+
 fn changedDocument(self: *const Selection, tier: Tier, changes: []const Change) Error!Document {
     try validateChanges(changes);
     const source = self.tierDocument(tier);
@@ -496,6 +664,31 @@ fn replaceTier(self: *Selection, tier: Tier, changes: []const Change) Error!void
     self.publishDocument(tier, document);
 }
 
+fn replaceOverlay(
+    self: *Selection,
+    run_document: *?Document,
+    conversation_document: *?Document,
+    run_tint: *?[]u8,
+    conversation_tint: *?[]u8,
+) RetiredOverlay {
+    const retired: RetiredOverlay = .{
+        .allocator = self.allocator,
+        .run_document = self.run,
+        .conversation_document = self.conversation,
+        .run_tint = self.run_preset_tint,
+        .conversation_tint = self.conversation_preset_tint,
+    };
+    self.run = run_document.*;
+    self.conversation = conversation_document.*;
+    self.run_preset_tint = run_tint.*;
+    self.conversation_preset_tint = conversation_tint.*;
+    run_document.* = null;
+    conversation_document.* = null;
+    run_tint.* = null;
+    conversation_tint.* = null;
+    return retired;
+}
+
 fn publishDocument(self: *Selection, tier: Tier, document: Document) void {
     const destination = switch (tier) {
         .run => &self.run,
@@ -512,6 +705,46 @@ fn clearOwnedDocument(self: *Selection, document: *?Document) void {
         value.deinit();
     }
     document.* = null;
+}
+
+fn overlayStore(
+    base_options: Store.Options,
+    run_document: *const ?Document,
+    conversation_document: *const ?Document,
+) Store {
+    var options = base_options;
+    options.run = if (run_document.*) |*document| document else base_options.run;
+    options.conversation = if (conversation_document.*) |*document| document else base_options.conversation;
+    return .init(options);
+}
+
+fn deinitOverlayValues(
+    allocator: std.mem.Allocator,
+    run_document: *?Document,
+    conversation_document: *?Document,
+    run_tint: *?[]u8,
+    conversation_tint: *?[]u8,
+) void {
+    deinitOptionalDocument(run_document);
+    deinitOptionalDocument(conversation_document);
+    freeOptionalSecret(allocator, run_tint);
+    freeOptionalSecret(allocator, conversation_tint);
+}
+
+fn deinitOptionalDocument(document: *?Document) void {
+    if (document.*) |*value| {
+        wipeDocument(value);
+        value.deinit();
+    }
+    document.* = null;
+}
+
+fn freeOptionalSecret(allocator: std.mem.Allocator, value: *?[]u8) void {
+    if (value.*) |bytes| {
+        @memset(bytes, 0);
+        allocator.free(bytes);
+    }
+    value.* = null;
 }
 
 fn wipeDocument(document: *Document) void {
@@ -678,6 +911,14 @@ fn exerciseSelectionAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "mutations roll back and release allocations on OOM" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseSelectionAllocationFailures, .{});
+}
+
+fn conversationPlan() Preset.Plan {
+    var plan = testPlan();
+    plan.name = @constCast("resumed");
+    plan.provider = @constCast("conversation-provider");
+    plan.tint.value = @constCast("amber");
+    return plan;
 }
 
 fn runPlanWithoutPromptOrTint() Preset.Plan {
@@ -886,6 +1127,7 @@ const SecretFreeObserver = struct {
     backing: std.mem.Allocator,
     fail_index: ?usize = null,
     allocations: usize = 0,
+    frees: usize = 0,
     secret_seen: bool = false,
 
     fn allocator(self: *SecretFreeObserver) std.mem.Allocator {
@@ -936,6 +1178,7 @@ const SecretFreeObserver = struct {
         ret_addr: usize,
     ) void {
         const self: *SecretFreeObserver = @ptrCast(@alignCast(context));
+        self.frees += 1;
         if (std.mem.indexOf(u8, memory, "wipe-marker") != null) self.secret_seen = true;
         self.backing.rawFree(memory, alignment, ret_addr);
     }
@@ -958,6 +1201,106 @@ test "prepared run publication performs no allocation" {
     try expectSelectionRead(&selection, "provider", "new-p", .run);
     try expectSelectionRead(&selection, "model", "new-m", .run);
     try expectSelectionRead(&selection, "effort", "high", .run);
+}
+
+test "prepared preset owns a complete overlay and cancellation changes nothing" {
+    var selection = Selection.init(std.testing.allocator, testBase(null, null));
+    defer selection.deinit();
+    const run_plan = testPlan();
+    try selection.applyPreset(.run, &run_plan);
+    const conversation_plan = conversationPlan();
+    try selection.applyPreset(.conversation, &conversation_plan);
+
+    var replacement = conversationPlan();
+    replacement.model.value = @constCast("replacement-model");
+    var original = try selection.preparePreset(.conversation, &replacement);
+    var prepared = original;
+    original = undefined;
+    defer prepared.deinit();
+
+    try std.testing.expect(prepared.run_document != null);
+    try std.testing.expect(prepared.conversation_document != null);
+    try std.testing.expectEqualStrings("rose", prepared.run_tint.?);
+    try std.testing.expectEqualStrings("amber", prepared.conversation_tint.?);
+    try expectStoreRead(prepared.store(), "preset", "work", .run);
+    try std.testing.expectEqualStrings(
+        "replacement-model",
+        prepared.conversation_document.?.getRaw("model").?.string,
+    );
+
+    try expectSelectionRead(&selection, "preset", "work", .run);
+    var live_below = try selection.store().readBelowRun(std.testing.allocator, "preset");
+    defer live_below.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("resumed", live_below.value.?);
+    try std.testing.expectEqualStrings("rose", selection.run_preset_tint.?);
+    try std.testing.expectEqualStrings("amber", selection.conversation_preset_tint.?);
+}
+
+test "preset publication retires all old ownership without allocation or cleanup" {
+    var observer: SecretFreeObserver = .{ .backing = std.testing.allocator };
+    const allocator = observer.allocator();
+    var selection = Selection.init(allocator, testBase(null, null));
+    defer selection.deinit();
+    const run_plan = testPlan();
+    try selection.applyPreset(.run, &run_plan);
+    const conversation_plan = conversationPlan();
+    try selection.applyPreset(.conversation, &conversation_plan);
+    const fresh = runPlanWithoutPromptOrTint();
+    var prepared = try selection.preparePreset(.run, &fresh);
+    defer prepared.deinit();
+
+    observer.fail_index = observer.allocations;
+    const frees_before = observer.frees;
+    var retired = selection.publishPreset(&prepared);
+    try std.testing.expectEqual(frees_before, observer.frees);
+    try std.testing.expect(!prepared.active);
+    try std.testing.expect(retired.run_document != null);
+    try std.testing.expect(retired.conversation_document != null);
+    try std.testing.expectEqualStrings("work", retired.run_document.?.getRaw("preset").?.string);
+    try std.testing.expectEqualStrings("resumed", retired.conversation_document.?.getRaw("preset").?.string);
+    try std.testing.expectEqualStrings("rose", retired.run_tint.?);
+    try std.testing.expectEqualStrings("amber", retired.conversation_tint.?);
+    try expectSelectionRead(&selection, "preset", "fresh", .run);
+
+    retired.deinit();
+    try std.testing.expect(observer.frees > frees_before);
+}
+
+fn exercisePreparedOverlayAllocationFailures(allocator: std.mem.Allocator) !void {
+    var selection = Selection.init(allocator, testBase(null, null));
+    defer selection.deinit();
+    const run_plan = testPlan();
+    try selection.applyPreset(.run, &run_plan);
+    const conversation_plan = conversationPlan();
+    try selection.applyPreset(.conversation, &conversation_plan);
+
+    const fresh = runPlanWithoutPromptOrTint();
+    var preset = selection.preparePreset(.run, &fresh) catch |err| {
+        try expectSelectionRead(&selection, "preset", "work", .run);
+        try std.testing.expectEqualStrings("rose", selection.presetTint().?);
+        return err;
+    };
+    preset.deinit();
+
+    const lookup: Preset.Lookup = .{ .plan = conversation_plan };
+    var restore = selection.prepareRestoreConversation(.{
+        .provider = "conversation-provider",
+        .model = "recorded-model",
+        .preset = "resumed",
+    }, &lookup) catch |err| {
+        try expectSelectionRead(&selection, "preset", "work", .run);
+        try std.testing.expectEqualStrings("rose", selection.presetTint().?);
+        return err;
+    };
+    restore.deinit();
+}
+
+test "prepared preset and restore release ownership and leave selection atomic on OOM" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exercisePreparedOverlayAllocationFailures,
+        .{},
+    );
 }
 
 test "owned config secrets are wiped before allocator free" {

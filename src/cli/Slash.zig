@@ -15,6 +15,7 @@ pub const DisplayPolicy = enum {
 
 pub const HandlerOutcome = enum {
     handled,
+    history_changed,
     exit,
 };
 
@@ -271,7 +272,7 @@ const TestHandler = struct {
         self.calls += 1;
         self.argument = call_value.argument;
         if (self.fail) return error.HandlerFailed;
-        return .handled;
+        return if (call_value.argument != null) .history_changed else .handled;
     }
 };
 
@@ -389,7 +390,7 @@ test "execution begins output and handles every usage" {
     try std.testing.expect(handler.argument == null);
 
     try std.testing.expectEqual(
-        HandlerOutcome.handled,
+        HandlerOutcome.history_changed,
         try execute(classify("/new focus", &test_specs).command, &test_specs, &handler, sink),
     );
     try std.testing.expectEqualStrings("focus", handler.argument.?);

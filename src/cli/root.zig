@@ -4,6 +4,7 @@ const version = "0.1.0-dev";
 
 pub const Args = @import("Args.zig");
 pub const CodexFiles = @import("CodexFiles.zig");
+pub const ConversationRuntime = @import("ConversationRuntime.zig");
 pub const ProcessAdapters = @import("ProcessAdapters.zig");
 pub const ProcessFacts = @import("ProcessFacts.zig");
 pub const OneShot = @import("OneShot.zig");
@@ -13,6 +14,7 @@ pub const SessionStartup = @import("SessionStartup.zig");
 pub const StartupConfig = @import("StartupConfig.zig");
 pub const LocalStartup = @import("LocalStartup.zig");
 pub const ModelOrder = @import("ModelOrder.zig");
+pub const NewConversation = @import("NewConversation.zig");
 pub const RunSelection = @import("RunSelection.zig");
 pub const RunLogSeam = @import("RunLogSeam.zig");
 pub const Stats = @import("Stats.zig");
@@ -213,6 +215,7 @@ fn writeHelp(writer: *std.Io.Writer) !void {
 test {
     _ = Args;
     _ = CodexFiles;
+    _ = ConversationRuntime;
     _ = ProcessAdapters;
     _ = ProcessFacts;
     _ = OneShot;
@@ -222,6 +225,7 @@ test {
     _ = StartupConfig;
     _ = LocalStartup;
     _ = ModelOrder;
+    _ = NewConversation;
     _ = RunSelection;
     _ = RunLogSeam;
     _ = Stats;

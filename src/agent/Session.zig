@@ -97,6 +97,43 @@ pub const PreparedSelection = struct {
     }
 };
 
+/// Move-only selection strings displaced by publication.
+pub const RetiredSelection = struct {
+    allocator: std.mem.Allocator,
+    selection: ?OwnedSelection,
+    active: bool = true,
+
+    pub fn deinit(self: *RetiredSelection) void {
+        if (self.active) if (self.selection) |*selection| selection.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+/// Move-only whole-session replacement prepared without changing the live session.
+pub const PreparedReplacement = struct {
+    owner: *Session,
+    history_generation: u64,
+    selection_generation: u64,
+    replacement: Session,
+    active: bool = true,
+
+    pub fn deinit(self: *PreparedReplacement) void {
+        if (self.active) self.replacement.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Owns the session displaced by whole-session publication.
+pub const Retired = struct {
+    session: Session,
+    active: bool = true,
+
+    pub fn deinit(self: *Retired) void {
+        if (self.active) self.session.deinit();
+        self.* = undefined;
+    }
+};
+
 /// Move-only usage footer prepared for an allocation-free session commit.
 pub const PreparedUsage = struct {
     item: ai.Item.Item,
@@ -117,6 +154,7 @@ pub const Session = struct {
 
     allocator: std.mem.Allocator,
     run_state: RunState = .idle,
+    history_generation: u64 = 0,
     selection_generation: u64 = 0,
     limits: Limits,
     provider_id: ?[]u8,
@@ -182,8 +220,12 @@ pub const Session = struct {
         };
     }
 
-    /// Publishes a prepared replacement without allocating. Consumes `prepared`.
-    pub fn publishSelection(self: *Session, prepared: *PreparedSelection) void {
+    /// Publishes a prepared replacement without allocating or freeing. Consumes
+    /// `prepared`; the caller must later deinitialize the returned owner.
+    pub fn publishSelectionRetired(
+        self: *Session,
+        prepared: *PreparedSelection,
+    ) RetiredSelection {
         std.debug.assert(prepared.active);
         std.debug.assert(prepared.owner == self);
         std.debug.assert(prepared.generation == self.selection_generation);
@@ -191,7 +233,11 @@ pub const Session = struct {
         std.debug.assert(self.run_state != .compacting);
         prepared.active = false;
         self.selection_generation +%= 1;
-        var replacement = prepared.replacement orelse return;
+        const replacement = prepared.replacement orelse return .{
+            .allocator = self.allocator,
+            .selection = null,
+        };
+        prepared.replacement = null;
         const previous: OwnedSelection = .{
             .provider_id = self.provider_id,
             .model = self.model,
@@ -204,8 +250,13 @@ pub const Session = struct {
         self.model_label = replacement.model_label;
         self.effort = replacement.effort;
         self.preset = replacement.preset;
-        replacement = previous;
-        replacement.deinit(self.allocator);
+        return .{ .allocator = self.allocator, .selection = previous };
+    }
+
+    /// Publishes and immediately releases displaced selection strings.
+    pub fn publishSelection(self: *Session, prepared: *PreparedSelection) void {
+        var retired = self.publishSelectionRetired(prepared);
+        retired.deinit();
     }
 
     /// Atomically owns and replaces the live selection. Conversation items and
@@ -214,6 +265,47 @@ pub const Session = struct {
         var prepared = try self.prepareSelection(selection);
         defer if (prepared.active) prepared.deinit();
         self.publishSelection(&prepared);
+    }
+
+    /// Moves a validated idle replacement into a candidate. On failure, the
+    /// source remains owned by the caller.
+    pub fn prepareReplacement(
+        self: *Session,
+        replacement: *Session,
+    ) Error!PreparedReplacement {
+        std.debug.assert(replacement != self);
+        if (self.run_state != .idle or replacement.run_state != .idle) return error.SessionBusy;
+        try replacement.validateOwnedState();
+        const moved = replacement.*;
+        replacement.* = undefined;
+        return .{
+            .owner = self,
+            .history_generation = self.history_generation,
+            .selection_generation = self.selection_generation,
+            .replacement = moved,
+        };
+    }
+
+    /// Publishes a prepared whole-session replacement without allocating. The
+    /// returned retired session owns all state displaced from the stable address.
+    pub fn publishReplacement(
+        self: *Session,
+        prepared: *PreparedReplacement,
+    ) Retired {
+        std.debug.assert(prepared.active);
+        std.debug.assert(prepared.owner == self);
+        std.debug.assert(prepared.history_generation == self.history_generation);
+        std.debug.assert(prepared.selection_generation == self.selection_generation);
+        std.debug.assert(self.run_state == .idle);
+        std.debug.assert(prepared.replacement.run_state == .idle);
+
+        prepared.active = false;
+        var replacement = prepared.replacement;
+        replacement.history_generation = self.history_generation +% 1;
+        replacement.selection_generation = self.selection_generation +% 1;
+        const retired: Retired = .{ .session = self.* };
+        self.* = replacement;
+        return retired;
     }
 
     /// Replaces admission limits without cloning history. The existing selection
@@ -237,6 +329,7 @@ pub const Session = struct {
         self.retained_bytes = 0;
         self.image_count = 0;
         self.image_base64_bytes = 0;
+        self.history_generation +%= 1;
     }
 
     /// Acquires the exclusive Loop run lease.
@@ -301,6 +394,14 @@ pub const Session = struct {
         }
     }
 
+    pub fn historyGeneration(self: *const Session) u64 {
+        return self.history_generation;
+    }
+
+    pub fn selectionGeneration(self: *const Session) u64 {
+        return self.selection_generation;
+    }
+
     /// Returns the live selection borrowed until the next selection change or deinit.
     pub fn currentSelection(self: *const Session) Selection {
         return .{
@@ -360,6 +461,7 @@ pub const Session = struct {
         self.retained_bytes = retained_without_old + new_retained;
         self.image_count = images_without_old + new_images;
         self.image_base64_bytes = image_bytes_without_old + new_image_bytes;
+        self.history_generation +%= 1;
     }
 
     /// Replaces one tool-result placeholder by consuming an item allocated by
@@ -392,6 +494,7 @@ pub const Session = struct {
         self.retained_bytes = retained_without_old + new_retained;
         self.image_count = images_without_old + new_images;
         self.image_base64_bytes = image_bytes_without_old + new_image_bytes;
+        self.history_generation +%= 1;
     }
 
     /// Atomically appends a boundary followed by a copied user message.
@@ -776,6 +879,28 @@ pub const Session = struct {
         self.retained_bytes += admission.retained_bytes;
         self.image_count += admission.image_count;
         self.image_base64_bytes += admission.image_base64_bytes;
+        self.history_generation +%= 1;
+    }
+
+    fn validateOwnedState(self: *const Session) Error!void {
+        try validateSelection(self.currentSelection(), self.limits);
+        if (self.record.items.len > self.limits.items) return error.TooManyItems;
+
+        var retained_bytes: usize = 0;
+        for (self.record.items) |item| {
+            try validateItemLimits(item, self.limits);
+            retained_bytes +|= ai.Item.retainedBytes(item);
+        }
+        const image_count = ai.Item.imageCount(self.record.items);
+        const image_base64_bytes = ai.Item.imageBase64Bytes(self.record.items);
+        if (retained_bytes != self.retained_bytes or image_count != self.image_count or
+            image_base64_bytes != self.image_base64_bytes)
+        {
+            return error.InvalidItem;
+        }
+        if (retained_bytes > self.limits.retained_bytes) return error.RetainedDataTooLarge;
+        if (image_count > self.limits.images) return error.TooManyImages;
+        if (image_base64_bytes > self.limits.image_base64_bytes) return error.ImageDataTooLarge;
     }
 };
 
@@ -979,6 +1104,191 @@ test "prepared selection can be dropped or publish a no-op without mutation" {
     try std.testing.expect(no_op.replacement == null);
     session.publishSelection(&no_op);
     try std.testing.expectEqualStrings("old-provider", session.currentSelection().provider_id.?);
+}
+
+test "selection publication advances its generation even for a no-op" {
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+
+    const history_before = session.historyGeneration();
+    var prepared = try session.prepareSelection(session.currentSelection());
+    session.publishSelection(&prepared);
+
+    try std.testing.expectEqual(history_before, session.historyGeneration());
+    try std.testing.expectEqual(@as(u64, 1), session.selectionGeneration());
+}
+
+test "history mutations advance generation only after success" {
+    var session = try Session.init(std.testing.allocator, .{
+        .limits = .{ .retained_bytes = 32 },
+    });
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), session.historyGeneration());
+    try session.addUser("one");
+    try std.testing.expectEqual(@as(u64, 1), session.historyGeneration());
+
+    const replacement: Item = .{ .assistant_message = .{ .text = @constCast("answer") } };
+    try std.testing.expectError(error.InvalidItemIndex, session.replaceItemCopy(9, &replacement));
+    try std.testing.expectEqual(@as(u64, 1), session.historyGeneration());
+    try session.appendCopy(&replacement);
+    try std.testing.expectEqual(@as(u64, 2), session.historyGeneration());
+    try session.replaceItemCopy(2, &replacement);
+    try std.testing.expectEqual(@as(u64, 3), session.historyGeneration());
+
+    try std.testing.expect(!try session.addTurnUsage(.{}));
+    try std.testing.expectEqual(@as(u64, 3), session.historyGeneration());
+    session.reset();
+    try std.testing.expectEqual(@as(u64, 4), session.historyGeneration());
+}
+
+test "whole-session publication preserves address and retires displaced ownership" {
+    var current = try Session.init(std.testing.allocator, .{
+        .provider_id = "old-provider",
+        .model = "old-model",
+    });
+    defer current.deinit();
+    try current.addUser("old history");
+    try current.reconfigureSelection(.{
+        .provider_id = "old-provider-2",
+        .model = "old-model-2",
+    });
+    const current_address = &current;
+    const old_history_generation = current.historyGeneration();
+    const old_selection_generation = current.selectionGeneration();
+
+    var replacement = try Session.init(std.testing.allocator, .{
+        .provider_id = "new-provider",
+        .model = "new-model",
+    });
+    try replacement.addUser("new history");
+    try replacement.addBoundary();
+    try replacement.addBoundary();
+    const replacement_history_generation = replacement.historyGeneration();
+
+    var prepared = try current.prepareReplacement(&replacement);
+    try std.testing.expectEqual(old_history_generation, prepared.history_generation);
+    try std.testing.expectEqual(old_selection_generation, prepared.selection_generation);
+    var retired = current.publishReplacement(&prepared);
+    defer retired.deinit();
+
+    try std.testing.expectEqual(current_address, &current);
+    try std.testing.expectEqual(old_history_generation +% 1, current.historyGeneration());
+    try std.testing.expectEqual(old_selection_generation +% 1, current.selectionGeneration());
+    try std.testing.expect(replacement_history_generation != current.historyGeneration());
+    try std.testing.expectEqualStrings("new-provider", current.currentSelection().provider_id.?);
+    try std.testing.expectEqualStrings("new history", current.items()[1].user_message.text);
+    try std.testing.expectEqualStrings(
+        "old-provider-2",
+        retired.session.currentSelection().provider_id.?,
+    );
+    try std.testing.expectEqualStrings("old history", retired.session.items()[1].user_message.text);
+}
+
+test "prepared replacement owns its source and can be dropped" {
+    var current = try Session.init(std.testing.allocator, .{});
+    defer current.deinit();
+    var replacement = try Session.init(std.testing.allocator, .{ .provider_id = "replacement" });
+    try replacement.addUser("owned by candidate");
+
+    var prepared = try current.prepareReplacement(&replacement);
+    try std.testing.expect(prepared.active);
+    try std.testing.expectEqualStrings("replacement", prepared.replacement.provider_id.?);
+    prepared.deinit();
+}
+
+test "failed replacement preparation retains source ownership" {
+    var current = try Session.init(std.testing.allocator, .{});
+    defer current.deinit();
+    var replacement = try Session.init(std.testing.allocator, .{ .provider_id = "replacement" });
+    defer replacement.deinit();
+    try replacement.addUser("still owned by caller");
+
+    current.beginRun() catch unreachable;
+    try std.testing.expectError(error.SessionBusy, current.prepareReplacement(&replacement));
+    current.endRun();
+    try std.testing.expectEqualStrings("replacement", replacement.provider_id.?);
+    try std.testing.expectEqualStrings("still owned by caller", replacement.items()[1].user_message.text);
+
+    replacement.beginRun() catch unreachable;
+    try std.testing.expectError(error.SessionBusy, current.prepareReplacement(&replacement));
+    replacement.endRun();
+    try std.testing.expectEqualStrings("replacement", replacement.provider_id.?);
+
+    replacement.retained_bytes += 1;
+    try std.testing.expectError(error.InvalidItem, current.prepareReplacement(&replacement));
+    replacement.retained_bytes -= 1;
+    try std.testing.expectEqualStrings("still owned by caller", replacement.items()[1].user_message.text);
+}
+
+test "history and selection changes stale a prepared replacement" {
+    var current = try Session.init(std.testing.allocator, .{});
+    defer current.deinit();
+    var replacement = try Session.init(std.testing.allocator, .{});
+    var prepared = try current.prepareReplacement(&replacement);
+    defer prepared.deinit();
+
+    try current.addBoundary();
+    try std.testing.expect(prepared.history_generation != current.historyGeneration());
+    try std.testing.expectEqual(prepared.selection_generation, current.selectionGeneration());
+    try current.reconfigureSelection(.{ .model = "changed" });
+    try std.testing.expect(prepared.selection_generation != current.selectionGeneration());
+}
+
+fn exerciseWholeSessionReplacementAllocations(allocator: std.mem.Allocator) !void {
+    var current = try Session.init(allocator, .{
+        .provider_id = "old-provider",
+        .model = "old-model",
+    });
+    defer current.deinit();
+    try current.addUser("old history");
+
+    var replacement = try Session.init(allocator, .{
+        .provider_id = "new-provider",
+        .model = "new-model",
+        .preset = "new-preset",
+    });
+    var replacement_owned = true;
+    defer if (replacement_owned) replacement.deinit();
+    try replacement.addUser("new history");
+
+    var prepared = try current.prepareReplacement(&replacement);
+    replacement_owned = false;
+    defer if (prepared.active) prepared.deinit();
+    var retired = current.publishReplacement(&prepared);
+    defer retired.deinit();
+
+    try std.testing.expectEqualStrings("new-provider", current.provider_id.?);
+    try std.testing.expectEqualStrings("new history", current.items()[1].user_message.text);
+    try std.testing.expectEqualStrings("old-provider", retired.session.provider_id.?);
+}
+
+test "whole-session replacement handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseWholeSessionReplacementAllocations,
+        .{},
+    );
+}
+
+test "replacement publication performs no allocations" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var current = try Session.init(allocator, .{ .provider_id = "old" });
+    defer current.deinit();
+    try current.addUser("old");
+    var replacement = try Session.init(allocator, .{ .provider_id = "new" });
+    try replacement.addUser("new");
+    var prepared = try current.prepareReplacement(&replacement);
+
+    failing.fail_index = failing.alloc_index;
+    const allocations_before = failing.alloc_index;
+    var retired = current.publishReplacement(&prepared);
+    defer retired.deinit();
+
+    try std.testing.expectEqual(allocations_before, failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqualStrings("new", current.provider_id.?);
 }
 
 test "reconfigure selection allocation failure preserves selection and items" {

@@ -4,6 +4,7 @@ const render = @import("../render/root.zig");
 const text = @import("../text/root.zig");
 const DiagnosticText = @import("DiagnosticText.zig");
 const Interactive = @import("Interactive.zig");
+const NewConversation = @import("NewConversation.zig");
 const ProviderConfig = @import("../ProviderConfig.zig");
 const RunSelection = @import("RunSelection.zig");
 const RunLogSeam = @import("RunLogSeam.zig");
@@ -57,6 +58,13 @@ const shortcuts = [_]Shortcut{
 
 const specs = [_]Slash.Spec{
     .{
+        .name = "new",
+        .alias = "clear",
+        .summary = "start a fresh conversation (optional: preset)",
+        .arguments = .optional,
+        .handler_fn = runNew,
+    },
+    .{
         .name = "provider",
         .summary = "switch provider, then model and effort",
         .display = .managed,
@@ -100,6 +108,7 @@ pub const Owner = struct {
     listing_generation: ?Interactive.Generation = null,
     listing_tick: ?ai.Provider.Tick = null,
     selection_picker: ?SelectionPicker.Runner = null,
+    new_conversation: ?NewConversation.Runner = null,
     persistence_warning_written: bool = false,
 
     pub fn init(
@@ -150,6 +159,10 @@ pub const Owner = struct {
         self.selection_picker = picker;
     }
 
+    pub fn setNewConversation(self: *Owner, runner: NewConversation.Runner) void {
+        self.new_conversation = runner;
+    }
+
     pub fn gateway(self: *Owner) Interactive.CommandGateway {
         return Interactive.CommandGateway.from(self);
     }
@@ -189,6 +202,7 @@ pub const Owner = struct {
         try self.flush();
         return switch (outcome) {
             .handled => .handled,
+            .history_changed => .history_changed,
             .exit => .exit,
         };
     }
@@ -228,6 +242,18 @@ pub const Owner = struct {
 
     fn columnsNow(self: *const Owner) usize {
         return @max(if (self.width_source) |source| source.resolve() else self.columns, 1);
+    }
+
+    fn renderNewBanner(self: *Owner, current: RunSelection.CurrentSelection) !void {
+        const frame = self.frame orelse return;
+        try render.Banner.render(self.writer, self.theme, self.columnsNow(), .{
+            .preset = current.preset,
+            .provider = current.provider_label,
+            .model_label = current.model_label,
+            .model = current.model,
+            .effort = current.effort,
+        });
+        frame.syncExternal(1);
     }
 
     fn renderHelp(self: *Owner) !void {
@@ -405,6 +431,40 @@ pub const Owner = struct {
     }
 };
 
+fn runNew(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
+    const self: *Owner = @ptrCast(@alignCast(context));
+    const runner = self.new_conversation orelse return .handled;
+    const outcome = runner.run(call.argument);
+    switch (outcome) {
+        .changed => |result| {
+            if (result.preset_persistence) |persistence_result| {
+                try writePersistenceWarning(self, persistence_result);
+            }
+            if (result.old_branch_incomplete) {
+                try self.writeDiagnosticNote(
+                    "the previous conversation was already unrecordable; its final state may be incomplete",
+                );
+            }
+            if (self.frame != null) {
+                const live = self.run_selection orelse return .history_changed;
+                try self.renderNewBanner(live.current());
+            }
+            return .history_changed;
+        },
+        .unchanged => |reason| {
+            try writeNewUnchanged(self, call.argument, reason);
+            return .handled;
+        },
+        .partial => |partial| {
+            if (partial.preset_persistence) |persistence_result| {
+                try writePersistenceWarning(self, persistence_result);
+            }
+            try writeNewPartial(self, call.argument, partial);
+            return .handled;
+        },
+    }
+}
+
 fn runProvider(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
     const self: *Owner = @ptrCast(@alignCast(context));
     const live = self.run_selection orelse return .handled;
@@ -452,7 +512,7 @@ fn runProvider(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome
         }
     }
     if (std.mem.eql(u8, selected_provider.id, before.provider)) {
-        return runModel(context, .{ .spec = &specs[1], .argument = null });
+        return runModel(context, .{ .spec = &specs[2], .argument = null });
     }
 
     var prospective = live.prepareProviderListing(selected_provider.id) catch {
@@ -766,6 +826,78 @@ fn runEffort(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
     return .handled;
 }
 
+fn writeNewUnchanged(
+    self: *Owner,
+    preset: ?[]const u8,
+    reason: NewConversation.Unchanged,
+) !void {
+    switch (reason) {
+        .preset => |preset_reason| switch (preset_reason) {
+            .missing => try writeNamedPresetError(self, "unknown preset '", preset orelse "", "'"),
+            .invalid => try writeNamedPresetError(self, "invalid preset '", preset orelse "", "'"),
+            .preparation => try writeNamedPresetError(self, "couldn't apply preset '", preset orelse "", "'"),
+        },
+        .reconcile_retryable => try self.writeError(
+            "couldn't finish recording the current conversation; try /new again",
+        ),
+        .reconcile_quarantined => try self.writeError(
+            "the current conversation became unrecordable; it was not cleared",
+        ),
+        .preparation => try self.writeError("couldn't prepare a fresh conversation; nothing changed"),
+    }
+}
+
+fn writeNewPartial(
+    self: *Owner,
+    preset: ?[]const u8,
+    partial: NewConversation.Partial,
+) !void {
+    if (partial.preset_committed) {
+        try writeNamedPresetError(
+            self,
+            "preset '",
+            preset orelse "",
+            "' was applied, but the current conversation was not cleared",
+        );
+    } else switch (partial.cause) {
+        .settlement => |settlement| switch (settlement.shutdown) {
+            .partial, .failed => try self.writeError(
+                "couldn't stop every background task; the current conversation was not cleared",
+            ),
+            .no_tasks, .complete => try self.writeError(
+                "couldn't finish the current conversation safely; it was not cleared",
+            ),
+        },
+        .binding, .publication, .unexpected_preset_publication => try self.writeError(
+            "the conversation changed while /new was committing; the current history remains active",
+        ),
+    }
+    if (partial.selection_restore) |restore| switch (restore) {
+        .synchronized, .unrecorded => {},
+        .retryable => try self.writeError(
+            "the preset is active, but recording its metadata is still pending; retry /new before exiting",
+        ),
+        .quarantined => try self.writeError(
+            "the preset is active, but the current conversation is now unrecordable",
+        ),
+    };
+}
+
+fn writeNamedPresetError(
+    self: *Owner,
+    prefix: []const u8,
+    name: []const u8,
+    suffix: []const u8,
+) !void {
+    if (self.styled) try self.writer.writeAll(self.theme.error_style.open);
+    try self.writer.writeAll(prefix);
+    try DiagnosticText.write(self.writer, name);
+    try self.writer.writeAll(suffix);
+    if (self.styled) try self.writer.writeAll(self.theme.error_style.close);
+    try self.writer.writeByte('\n');
+    if (self.frame) |frame| frame.syncExternal(1);
+}
+
 fn isLocalProvider(provider_id: []const u8) bool {
     return std.mem.eql(u8, provider_id, "llamacpp") or std.mem.eql(u8, provider_id, "ollama");
 }
@@ -877,6 +1009,84 @@ fn executeTestCommand(owner: *Owner, line: []const u8) !Interactive.CommandOutco
     };
 }
 
+const FakeNewRunner = struct {
+    outcome: NewConversation.Outcome,
+    calls: usize = 0,
+    argument: ?[]const u8 = null,
+
+    pub fn run(self: *FakeNewRunner, argument: ?[]const u8) NewConversation.Outcome {
+        self.calls += 1;
+        self.argument = argument;
+        return self.outcome;
+    }
+};
+
+test "new and clear forward optional presets and map only changed history" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+    var runner: FakeNewRunner = .{ .outcome = .{ .changed = .{} } };
+    owner.setNewConversation(NewConversation.Runner.from(&runner));
+
+    try std.testing.expectEqual(.history_changed, try executeTestCommand(&owner, "/clear review"));
+    try std.testing.expectEqualStrings("review", runner.argument.?);
+    runner.outcome = .{ .unchanged = .{ .preparation = error.OutOfMemory } };
+    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/new"));
+    try std.testing.expect(runner.argument == null);
+    try std.testing.expectEqual(@as(usize, 2), runner.calls);
+}
+
+test "new preset diagnostics escape names and report committed partial state" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+    var runner: FakeNewRunner = .{ .outcome = .{ .unchanged = .{ .preset = .missing } } };
+    owner.setNewConversation(NewConversation.Runner.from(&runner));
+
+    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/new bad\x1b[2J"));
+    try std.testing.expectEqualStrings("unknown preset 'bad\\x1b[2J'\n", output.written());
+    output.clearRetainingCapacity();
+    runner.outcome = .{ .partial = .{
+        .cause = .unexpected_preset_publication,
+        .preset_committed = true,
+        .preset_persistence = .run_only,
+        .selection_restore = .{ .retryable = .io_retryable },
+    } };
+    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/new review"));
+    try std.testing.expectEqualStrings(
+        "couldn't save to state.json — this choice applies to this run only\n" ++
+            "preset 'review' was applied, but the current conversation was not cleared\n" ++
+            "the preset is active, but recording its metadata is still pending; " ++
+            "retry /new before exiting\n",
+        output.written(),
+    );
+}
+
+test "fresh banner uses current selection and synchronizes the bound frame" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var frame = render.Frame.init(&output.writer);
+    var owner = Owner.init(&output.writer, try testTheme(), true, 80);
+    owner.setFrame(&frame);
+    const empty_efforts = try ai.Effort.Set.init(&.{});
+
+    try owner.renderNewBanner(.{
+        .provider = "provider-id",
+        .provider_label = "Provider",
+        .model = "model-id",
+        .model_label = "Model",
+        .effort = "high",
+        .preset = "review",
+        .provider_efforts = empty_efforts,
+        .efforts = empty_efforts,
+        .model_metadata = .{},
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "[review]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "› Provider · Model · high") != null);
+    try std.testing.expectEqual(@as(u2, 1), frame.trailing_newlines);
+}
+
 test "help lists only implemented commands and supported shortcuts" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -885,6 +1095,8 @@ test "help lists only implemented commands and supported shortcuts" {
     try std.testing.expectEqual(Interactive.CommandOutcome.handled, try executeTestCommand(&owner, "/help"));
     try std.testing.expectEqualStrings(
         "commands\n" ++
+            "  /new         start a fresh conversation (optional: preset)\n" ++
+            "  /clear       alias for /new\n" ++
             "  /provider    switch provider, then model and effort\n" ++
             "  /model       switch model, then effort\n" ++
             "  /effort      set reasoning effort\n" ++

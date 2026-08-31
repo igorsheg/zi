@@ -223,115 +223,149 @@ pub const StartOptions = struct {
 
 pub const StartError = persistence.SessionFile.Error || agent.Session.Error || error{MissingIdentity};
 
-pub const Warning = union(enum) { resume_append_unavailable: []const u8 };
+pub const RecordingPolicy = enum {
+    disabled,
+    enabled,
+    automatic,
 
-const History = union(enum) {
-    fresh: agent.Session.Session,
-    resumed: persistence.SessionFile.Loaded,
-
-    fn deinit(self: *History) void {
-        switch (self.*) {
-            .fresh => |*value| value.deinit(),
-            .resumed => |*loaded| loaded.deinit(),
-        }
-        self.* = undefined;
-    }
-
-    fn session(self: *History) *agent.Session.Session {
-        return switch (self.*) {
-            .fresh => |*value| value,
-            .resumed => |*value| &value.session,
+    pub fn permits(self: RecordingPolicy, provider: []const u8) bool {
+        return switch (self) {
+            .disabled => false,
+            .enabled => true,
+            .automatic => !std.mem.eql(u8, provider, "mock"),
         };
     }
 };
 
-/// Heap-stable move-only owner of the live session and optional append log.
-/// On success `start` consumes `resolved`; callers must not deinit or use it.
-/// On error ownership remains with the caller.
+pub const Identity = struct {
+    pub const Origin = enum { fresh, resumed };
+
+    active_path: ?[]u8 = null,
+    id: ?[]u8 = null,
+    origin: Origin,
+
+    pub fn deinit(self: *Identity, allocator: std.mem.Allocator) void {
+        if (self.active_path) |value| allocator.free(value);
+        if (self.id) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const Warning = union(enum) {
+    resume_append_unavailable: []u8,
+
+    pub fn deinit(self: *Warning, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .resume_append_unavailable => |path| allocator.free(path),
+        }
+        self.* = undefined;
+    }
+};
+
+/// Move-only startup value. Every retained fact is independent of `Resolved`.
+pub const Candidate = struct {
+    allocator: std.mem.Allocator,
+    session: agent.Session.Session,
+    log: ?persistence.SessionFile.Log,
+    identity: Identity,
+    meta: ?persistence.SessionFile.Meta,
+    recovery: ?persistence.SessionFile.Recovery,
+    index_recovery: ?persistence.SessionIndex.Recovery,
+    warning: ?Warning,
+    active: bool = true,
+
+    pub fn deinit(self: *Candidate) void {
+        if (self.active) {
+            if (self.log) |*value| value.deinit();
+            self.session.deinit();
+            self.identity.deinit(self.allocator);
+            if (self.meta) |*value| value.deinit(self.allocator);
+            if (self.warning) |*value| value.deinit(self.allocator);
+        }
+        self.* = undefined;
+    }
+};
+
+/// Temporary compatibility owner for composition code not yet converted to
+/// `ConversationRuntime`. New code should call `startCandidate`.
 pub const Run = struct {
     allocator: std.mem.Allocator,
-    history: History,
-    resolved: ?*Resolved,
-    log_value: ?persistence.SessionFile.Log,
-    warning_value: ?Warning,
+    candidate: Candidate,
 
     pub fn deinit(self: *Run) void { // ziglint-ignore: Z030
         const allocator = self.allocator;
-        if (self.log_value) |*log_value| log_value.deinit();
-        self.history.deinit();
-        if (self.resolved) |value| value.deinit();
+        self.candidate.deinit();
         self.* = undefined;
         allocator.destroy(self);
     }
 
     pub fn session(self: *Run) *agent.Session.Session {
-        return self.history.session();
+        return &self.candidate.session;
     }
 
     pub fn meta(self: *const Run) ?*const persistence.SessionFile.Meta {
-        return switch (self.history) {
-            .fresh => null,
-            .resumed => |*loaded| &loaded.meta,
-        };
+        return if (self.candidate.meta) |*value| value else null;
     }
 
     pub fn recovery(self: *const Run) ?persistence.SessionFile.Recovery {
-        return switch (self.history) {
-            .fresh => null,
-            .resumed => |loaded| loaded.recovery,
-        };
+        return self.candidate.recovery;
     }
 
     pub fn indexRecovery(self: *const Run) ?persistence.SessionIndex.Recovery {
-        return if (self.resolved) |value| value.recovery() else null;
+        return self.candidate.index_recovery;
     }
 
     pub fn log(self: *Run) ?*persistence.SessionFile.Log {
-        return if (self.log_value) |*value| value else null;
+        return if (self.candidate.log) |*value| value else null;
     }
 
-    /// Moves the optional append log out of startup ownership.
     pub fn takeLog(self: *Run) ?persistence.SessionFile.Log {
-        const value = self.log_value;
-        self.log_value = null;
+        const value = self.candidate.log;
+        self.candidate.log = null;
         return value;
     }
 
     pub fn warning(self: *const Run) ?Warning {
-        return self.warning_value;
+        return self.candidate.warning;
     }
 
     pub fn recordingAvailable(self: *const Run) bool {
-        return self.log_value != null;
+        return self.candidate.log != null;
     }
 
     pub fn materialized(self: *const Run) bool {
-        return if (self.log_value) |*value| value.materialized() else false;
+        return if (self.candidate.log) |*value| value.materialized() else false;
     }
 
-    /// Stable borrowed resume hint for a materialized, available append log.
     pub fn resumeHint(self: *const Run) ?[]const u8 {
-        if (self.log_value) |*value| {
+        if (self.candidate.log) |*value| {
             if (value.materialized()) return value.resumeHint();
         }
         return null;
     }
 };
 
-/// Builds the post-provider-selection run. Resume loading is fatal. Opening or
-/// preparing the append log is best effort and degrades to an unrecorded run.
-/// No prompt item is appended here.
+/// Builds a complete startup candidate. On success this consumes and destroys
+/// `resolved`. On error the caller still owns it.
 // ziglint-ignore: Z015
-pub fn start(
+pub fn startCandidate(
     resolved: ?*Resolved,
     final_selection: persistence.SessionFile.Selection,
     options: StartOptions,
-) StartError!*Run {
+) StartError!Candidate {
     var pending_log: ?persistence.SessionFile.Log = null;
     errdefer if (pending_log) |*value| value.deinit();
     var pending_warning: ?Warning = null;
+    errdefer if (pending_warning) |*value| value.deinit(options.allocator);
 
-    var history: History = if (resolved) |selected| resumed: {
+    var session: agent.Session.Session = undefined;
+    var meta: ?persistence.SessionFile.Meta = null;
+    var recovery: ?persistence.SessionFile.Recovery = null;
+    var session_owned = false;
+    errdefer if (session_owned) session.deinit();
+    errdefer if (meta) |*value| value.deinit(options.allocator);
+
+    if (resolved) |selected| {
         var loaded: persistence.SessionFile.Loaded = undefined;
         if (options.no_session) {
             loaded = try persistence.SessionFile.load(
@@ -340,25 +374,24 @@ pub fn start(
                 selected.path(),
                 options.file_limits,
             );
-        } else {
-            if (persistence.SessionFile.loadForResume(
+        } else if (persistence.SessionFile.loadForResume(
+            options.allocator,
+            options.io,
+            selected.path(),
+            options.file_limits,
+        )) |atomic_value| {
+            const atomic = atomic_value;
+            loaded = atomic.loaded;
+            pending_log = atomic.log;
+        } else |resume_err| {
+            if (resume_err == error.OutOfMemory) return error.OutOfMemory;
+            loaded = try persistence.SessionFile.load(
                 options.allocator,
                 options.io,
                 selected.path(),
                 options.file_limits,
-            )) |atomic| {
-                loaded = atomic.loaded;
-                pending_log = atomic.log;
-            } else |resume_err| {
-                if (resume_err == error.OutOfMemory) return error.OutOfMemory;
-                loaded = try persistence.SessionFile.load(
-                    options.allocator,
-                    options.io,
-                    selected.path(),
-                    options.file_limits,
-                );
-                pending_warning = .{ .resume_append_unavailable = selected.path() };
-            }
+            );
+            pending_warning = .{ .resume_append_unavailable = try options.allocator.dupe(u8, selected.path()) };
         }
         errdefer loaded.deinit();
         try loaded.session.reconfigureLimits(options.session_limits);
@@ -367,12 +400,20 @@ pub fn start(
             log_value.setSelection(final_selection) catch {
                 log_value.deinit();
                 pending_log = null;
-                pending_warning = .{ .resume_append_unavailable = selected.path() };
+                if (pending_warning == null) {
+                    pending_warning = .{
+                        .resume_append_unavailable = try options.allocator.dupe(u8, selected.path()),
+                    };
+                }
             };
         }
-        break :resumed .{ .resumed = loaded };
-    } else fresh: {
-        const session = try agent.Session.Session.init(options.allocator, .{
+        const parts = loaded.takeParts();
+        session = parts.session;
+        meta = parts.meta;
+        recovery = parts.recovery;
+        session_owned = true;
+    } else {
+        session = try agent.Session.Session.init(options.allocator, .{
             .provider_id = final_selection.provider,
             .model = final_selection.model,
             .model_label = final_selection.model_label,
@@ -380,48 +421,95 @@ pub fn start(
             .preset = nonEmpty(final_selection.preset),
             .limits = options.session_limits,
         });
-        break :fresh .{ .fresh = session };
-    };
-    var history_owned = true;
-    errdefer if (history_owned) history.deinit();
+        session_owned = true;
+        if (!options.no_session) {
+            if (options.state_root) |state_root| {
+                const identity_value = options.new_identity orelse return error.MissingIdentity;
+                pending_log = persistence.SessionFile.Log.prepare(options.allocator, options.io, .{
+                    .state_root = state_root,
+                    .cwd = options.cwd,
+                    .selection = final_selection,
+                    .timestamp = identity_value.timestamp,
+                    .uuid = identity_value.uuid,
+                    .writer_version = options.writer_version,
+                    .git_probe = identity_value.git_probe,
+                    .limits = options.file_limits,
+                }) catch null;
+            }
+        }
+    }
 
+    var identity = try makeIdentity(options.allocator, resolved, pending_log, options.new_identity);
+    errdefer identity.deinit(options.allocator);
+    const index_recovery = if (resolved) |selected| selected.recovery() else null;
+    const candidate: Candidate = .{
+        .allocator = options.allocator,
+        .session = session,
+        .log = pending_log,
+        .identity = identity,
+        .meta = meta,
+        .recovery = recovery,
+        .index_recovery = index_recovery,
+        .warning = pending_warning,
+    };
+    session_owned = false;
+    pending_log = null;
+    meta = null;
+    pending_warning = null;
+    if (resolved) |selected| selected.deinit();
+    return candidate;
+}
+
+/// Compatibility wrapper around `startCandidate`.
+// ziglint-ignore: Z015
+pub fn start(
+    resolved: ?*Resolved,
+    final_selection: persistence.SessionFile.Selection,
+    options: StartOptions,
+) StartError!*Run {
     const run = try options.allocator.create(Run);
     errdefer options.allocator.destroy(run);
-    run.* = .{
-        .allocator = options.allocator,
-        .history = history,
-        .resolved = null,
-        .log_value = pending_log,
-        .warning_value = pending_warning,
-    };
-    pending_log = null;
-    history_owned = false;
-    errdefer {
-        if (run.log_value) |*value| value.deinit();
-        run.history.deinit();
-    }
-
-    if (!options.no_session and resolved == null) {
-        const state_root = options.state_root orelse return runWithoutRecording(run, resolved);
-        const identity = options.new_identity orelse return error.MissingIdentity;
-        run.log_value = persistence.SessionFile.Log.prepare(options.allocator, options.io, .{
-            .state_root = state_root,
-            .cwd = options.cwd,
-            .selection = final_selection,
-            .timestamp = identity.timestamp,
-            .uuid = identity.uuid,
-            .writer_version = options.writer_version,
-            .git_probe = identity.git_probe,
-            .limits = options.file_limits,
-        }) catch return runWithoutRecording(run, resolved);
-    }
-    run.resolved = resolved;
+    var candidate = try startCandidate(resolved, final_selection, options);
+    run.* = .{ .allocator = options.allocator, .candidate = candidate };
+    candidate.active = false;
     return run;
 }
 
-fn runWithoutRecording(run: *Run, resolved: ?*Resolved) *Run {
-    run.resolved = resolved;
-    return run;
+fn makeIdentity(
+    allocator: std.mem.Allocator,
+    resolved: ?*Resolved,
+    log: ?persistence.SessionFile.Log,
+    new_identity: ?NewIdentity,
+) error{OutOfMemory}!Identity {
+    if (resolved) |selected| {
+        const active_path = try allocator.dupe(u8, selected.path());
+        errdefer allocator.free(active_path);
+        return .{
+            .active_path = active_path,
+            .id = try dupeOptional(allocator, selected.id()),
+            .origin = .resumed,
+        };
+    }
+    if (log) |log_value| {
+        const active_path = try allocator.dupe(u8, log_value.path());
+        errdefer allocator.free(active_path);
+        return .{
+            .active_path = active_path,
+            .id = try dupeOptional(allocator, log_value.resumeHint()),
+            .origin = .fresh,
+        };
+    }
+    const identity = new_identity orelse return .{ .origin = .fresh };
+    const name = persistence.Paths.canonicalName(identity.timestamp, identity.uuid) catch
+        return .{ .origin = .fresh };
+    return .{
+        .id = try allocator.dupe(u8, name[21..57]),
+        .origin = .fresh,
+    };
+}
+
+fn dupeOptional(allocator: std.mem.Allocator, value: ?[]const u8) error{OutOfMemory}!?[]u8 {
+    return if (value) |bytes| try allocator.dupe(u8, bytes) else null;
 }
 
 fn toAgentSelection(value: persistence.SessionFile.Selection) agent.Session.Selection {
@@ -486,6 +574,21 @@ test "only Unix slash makes a resume id a path" {
     try std.testing.expect((try resolve(inputs)) == .id_is_path);
     inputs.resume_state = .{ .id = "part\\id" };
     try std.testing.expect((try resolve(inputs)) == .not_found);
+}
+
+test "startup candidate owns a fresh session without a compatibility wrapper" {
+    var candidate = try startCandidate(null, .{ .provider = "p", .model = "m" }, .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .state_root = null,
+        .cwd = "/work",
+        .no_session = true,
+        .writer_version = "test",
+    });
+    defer candidate.deinit();
+    try std.testing.expect(candidate.active);
+    try std.testing.expect(candidate.identity.origin == .fresh);
+    try std.testing.expectEqualStrings("p", candidate.session.currentSelection().provider_id.?);
 }
 
 test "new no-session run needs neither state root nor identity" {
@@ -728,6 +831,7 @@ test "busy resume keeps loaded session and warns that recording is unavailable" 
     try std.testing.expectEqual(@as(usize, 1), run.session().items().len);
     try std.testing.expect(run.warning().? == .resume_append_unavailable);
     try std.testing.expectEqualStrings(path, run.warning().?.resume_append_unavailable);
+    try std.testing.expect(path.ptr != run.warning().?.resume_append_unavailable.ptr);
     try std.testing.expect(!run.recordingAvailable());
     try std.testing.expect(run.resumeHint() == null);
 }

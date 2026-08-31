@@ -96,6 +96,13 @@ pub const ReconcileOutcome = union(enum) {
     quarantined: QuarantineReason,
 };
 
+pub const TransitionSelectionFlush = union(enum) {
+    synchronized,
+    unrecorded,
+    retryable: ReconcileFailure,
+    quarantined: QuarantineReason,
+};
+
 /// A known split means the requested selection reached the log while the live
 /// session retained its old selection. The prepared API avoids creating it.
 pub const PartialState = enum {
@@ -149,6 +156,64 @@ pub const PreparedSelection = struct {
             if (self.log) |*prepared| prepared.deinit();
             self.session.deinit();
         }
+        self.* = undefined;
+    }
+};
+
+/// Move-only session metadata update used only when a lifecycle transition is
+/// abandoning authority that was already quarantined at command entry.
+pub const PreparedQuarantinedTransitionSelection = struct {
+    owner: *Owner,
+    generation: u64,
+    session: agent.Session.PreparedSelection,
+    reason: QuarantineReason,
+    active: bool = true,
+
+    pub fn deinit(self: *PreparedQuarantinedTransitionSelection) void {
+        if (self.active) self.session.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Move-only session and optional-log selections displaced by publication.
+pub const RetiredSelection = struct {
+    session: agent.Session.RetiredSelection,
+    log: ?persistence.SessionFile.RetiredSelection,
+    active: bool = true,
+
+    pub fn deinit(self: *RetiredSelection) void {
+        if (self.active) {
+            if (self.log) |*selection| selection.deinit();
+            self.session.deinit();
+        }
+        self.* = undefined;
+    }
+};
+
+/// Move-only old-branch settlement selection. Deinit keeps the old selection live;
+/// restore puts the published selection back and leaves the token owning the old one.
+pub const TransitionSelection = struct {
+    owner: *Owner,
+    generation: u64,
+    log: ?persistence.SessionFile.TransitionSelection,
+    restored: bool = false,
+    active: bool = true,
+
+    pub fn restore(self: *TransitionSelection) void {
+        std.debug.assert(self.active);
+        std.debug.assert(!self.restored);
+        if (self.log) |*selection| switch (self.owner.authority) {
+            .active => |*log| log.restoreTransitionSelection(selection),
+            .quarantined => |*value| value.log.restoreTransitionSelection(selection),
+            .unrecorded => unreachable,
+        };
+        self.owner.generation +%= 1;
+        self.generation = self.owner.generation;
+        self.restored = true;
+    }
+
+    pub fn deinit(self: *TransitionSelection) void {
+        if (self.active) if (self.log) |*selection| selection.deinit();
         self.* = undefined;
     }
 };
@@ -213,7 +278,10 @@ pub const Owner = struct {
         return switch (self.authority) {
             .unrecorded => .unrecorded,
             .quarantined => |value| .{ .quarantined = value.reason },
-            .active => |*log| stateFromCounts(log.highWater(), memory),
+            .active => |*log| if (log.hasPendingSelection())
+                .{ .pending_append = .{ .durable = log.highWater(), .memory = memory } }
+            else
+                stateFromCounts(log.highWater(), memory),
         };
     }
 
@@ -267,7 +335,7 @@ pub const Owner = struct {
             self.quarantine(.high_water_diverged);
             return error.Indeterminate;
         }
-        if (items.len == durable) return;
+        if (items.len == durable and !self.activeLog().hasPendingSelection()) return;
 
         const outcome = self.activeLog().appendSnapshotClassified(durable, items) catch |err| {
             const classification = classifyAppendError(err);
@@ -320,7 +388,7 @@ pub const Owner = struct {
             self.quarantine(.high_water_diverged);
             return .{ .quarantined = .high_water_diverged };
         }
-        if (items.len == durable) return .synchronized;
+        if (items.len == durable and !self.activeLog().hasPendingSelection()) return .synchronized;
 
         const outcome = self.activeLog().appendSnapshotClassified(durable, items) catch |err| {
             return switch (classifyAppendError(err)) {
@@ -435,26 +503,148 @@ pub const Owner = struct {
         };
     }
 
-    /// Publishes a coordinated replacement without allocation.
+    /// Stages only stable in-memory session metadata for a lifecycle transition
+    /// that entered with quarantined authority. Ordinary selection must use
+    /// prepareSelection and therefore continues to reject quarantine.
+    pub fn prepareSelectionForQuarantinedTransition(
+        self: *Owner,
+        session: *agent.Session.Session,
+        requested: persistence.SessionFile.Selection,
+    ) PrepareSelectionError!PreparedQuarantinedTransitionSelection {
+        const reason = switch (self.state(session)) {
+            .quarantined => |value| value,
+            .unrecorded, .synchronized, .pending_append => return error.Quarantined,
+        };
+        const normalized = normalizeSelection(requested);
+        return .{
+            .owner = self,
+            .generation = self.generation,
+            .session = session.prepareSelection(normalized.session) catch |err| return mapSessionError(err),
+            .reason = reason,
+        };
+    }
+
+    /// Publishes the narrowly scoped quarantined-transition metadata update
+    /// without allocating or freeing. The unusable log remains unchanged.
+    pub fn publishSelectionForQuarantinedTransitionRetired(
+        self: *Owner,
+        session: *agent.Session.Session,
+        prepared: *PreparedQuarantinedTransitionSelection,
+    ) RetiredSelection {
+        std.debug.assert(prepared.active);
+        std.debug.assert(prepared.owner == self);
+        std.debug.assert(prepared.generation == self.generation);
+        switch (self.authority) {
+            .quarantined => |value| std.debug.assert(value.reason == prepared.reason),
+            .unrecorded, .active => unreachable,
+        }
+        const retired_session = session.publishSelectionRetired(&prepared.session);
+        prepared.active = false;
+        self.generation +%= 1;
+        return .{ .session = retired_session, .log = null };
+    }
+
+    pub fn publishSelectionForQuarantinedTransition(
+        self: *Owner,
+        session: *agent.Session.Session,
+        prepared: *PreparedQuarantinedTransitionSelection,
+    ) void {
+        var retired = self.publishSelectionForQuarantinedTransitionRetired(session, prepared);
+        retired.deinit();
+    }
+
+    /// Publishes a coordinated replacement without allocating or freeing.
+    pub fn publishSelectionRetired(
+        self: *Owner,
+        session: *agent.Session.Session,
+        prepared: *PreparedSelection,
+    ) RetiredSelection {
+        std.debug.assert(prepared.active);
+        std.debug.assert(prepared.owner == self);
+        std.debug.assert(prepared.generation == self.generation);
+        const retired_log: ?persistence.SessionFile.RetiredSelection = switch (self.authority) {
+            .unrecorded => blk: {
+                std.debug.assert(prepared.log == null);
+                break :blk null;
+            },
+            .active => |*log| blk: {
+                std.debug.assert(prepared.log != null);
+                break :blk log.publishSelectionRetired(&prepared.log.?);
+            },
+            .quarantined => unreachable,
+        };
+        const retired_session = session.publishSelectionRetired(&prepared.session);
+        prepared.active = false;
+        self.generation +%= 1;
+        return .{ .session = retired_session, .log = retired_log };
+    }
+
     pub fn publishSelection(
         self: *Owner,
         session: *agent.Session.Session,
         prepared: *PreparedSelection,
     ) void {
-        std.debug.assert(prepared.active);
-        std.debug.assert(prepared.owner == self);
-        std.debug.assert(prepared.generation == self.generation);
-        switch (self.authority) {
-            .unrecorded => std.debug.assert(prepared.log == null),
-            .active => |*log| {
-                std.debug.assert(prepared.log != null);
-                log.publishSelection(&prepared.log.?);
-            },
+        var retired = self.publishSelectionRetired(session, prepared);
+        retired.deinit();
+    }
+
+    /// Moves retired old-log metadata back into the active log before task settlement.
+    pub fn beginTransitionSelection(self: *Owner, retired: *RetiredSelection) TransitionSelection {
+        const log_selection: ?persistence.SessionFile.TransitionSelection = switch (self.authority) {
+            .active => |*log| if (retired.log) |*selection| log.beginTransitionSelection(selection) else null,
+            .unrecorded => null,
             .quarantined => unreachable,
-        }
-        session.publishSelection(&prepared.session);
-        prepared.active = false;
+        };
         self.generation +%= 1;
+        return .{
+            .owner = self,
+            .generation = self.generation,
+            .log = log_selection,
+        };
+    }
+
+    /// Flushes only a restored transition selection. Item high-water may already match.
+    pub fn flushRestoredTransitionSelection(
+        self: *Owner,
+        session: *const agent.Session.Session,
+    ) TransitionSelectionFlush {
+        switch (self.authority) {
+            .unrecorded => return .unrecorded,
+            .quarantined => |value| return .{ .quarantined = value.reason },
+            .active => {},
+        }
+        const items = session.items();
+        const log = self.activeLog();
+        const durable = log.highWater();
+        if (items.len < durable) {
+            self.quarantine(.high_water_diverged);
+            return .{ .quarantined = .high_water_diverged };
+        }
+        if (!log.hasPendingSelection()) return .synchronized;
+        const outcome = log.appendSnapshotClassified(durable, items) catch |err| {
+            return switch (classifyAppendError(err)) {
+                .retryable => |failure| .{ .retryable = failure },
+                .quarantined => |reason| blk: {
+                    self.quarantine(reason);
+                    break :blk .{ .quarantined = reason };
+                },
+            };
+        };
+        return switch (outcome) {
+            .unchanged => .{ .retryable = .io_retryable },
+            .indeterminate => blk: {
+                self.quarantine(.append_indeterminate);
+                break :blk .{ .quarantined = .append_indeterminate };
+            },
+            .committed => |durability| blk: {
+                if (durability == .sync_failed) {
+                    self.quarantine(.sync_failed);
+                    break :blk .{ .quarantined = .sync_failed };
+                }
+                self.generation +%= 1;
+                break :blk .synchronized;
+            },
+        };
     }
 
     pub fn updateSelection(
@@ -655,6 +845,62 @@ fn writePrefixThenFail(
 fn failSync(_: std.Io, _: std.Io.File) error{IoFailure}!void {
     return error.IoFailure;
 }
+
+const FreeObserver = struct {
+    backing: std.mem.Allocator,
+    allocations: usize = 0,
+    frees: usize = 0,
+
+    fn allocator(self: *FreeObserver) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *FreeObserver = @ptrCast(@alignCast(context));
+        self.allocations += 1;
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *FreeObserver = @ptrCast(@alignCast(context));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *FreeObserver = @ptrCast(@alignCast(context));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        const self: *FreeObserver = @ptrCast(@alignCast(context));
+        self.frees += 1;
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
 
 test "owner consumes optional authority and owns unrecorded state" {
     const allocator = std.testing.allocator;
@@ -859,6 +1105,179 @@ test "active selection preparation coordinates log and session and detects diver
         error.Diverged,
         owner.prepareSelection(&session, .{ .provider = "third", .model = "next" }),
     );
+}
+
+test "retired coordinated publication defers all ten selection frees" {
+    var observer: FreeObserver = .{ .backing = std.testing.allocator };
+    const allocator = observer.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const old: persistence.SessionFile.Selection = .{
+        .provider = "old-provider",
+        .model = "old-model",
+        .model_label = "old-label",
+        .effort = "old-effort",
+        .preset = "old-preset",
+    };
+    var optional_log: ?persistence.SessionFile.Log = try testLog(allocator, std.testing.io, root, old);
+    const owner = try Owner.create(allocator, &optional_log, .{});
+    defer owner.deinit();
+    var session = try agent.Session.Session.init(allocator, .{
+        .provider_id = old.provider,
+        .model = old.model,
+        .model_label = old.model_label,
+        .effort = old.effort,
+        .preset = old.preset,
+    });
+    defer session.deinit();
+    var prepared = try owner.prepareSelection(&session, .{
+        .provider = "new-provider",
+        .model = "new-model",
+        .model_label = "new-label",
+        .effort = "new-effort",
+        .preset = "new-preset",
+    });
+
+    const frees_before = observer.frees;
+    var retired = owner.publishSelectionRetired(&session, &prepared);
+    try std.testing.expectEqual(frees_before, observer.frees);
+    retired.deinit();
+    try std.testing.expectEqual(frees_before + 10, observer.frees);
+}
+
+test "lazy old log task note materializes with old selection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var optional_log: ?persistence.SessionFile.Log = try testLog(allocator, io, root, .{
+        .provider = "old",
+        .model = "old-model",
+    });
+    const owner = try Owner.create(allocator, &optional_log, .{});
+    defer owner.deinit();
+    var session = try agent.Session.Session.init(allocator, .{
+        .provider_id = "old",
+        .model = "old-model",
+    });
+    defer session.deinit();
+
+    var prepared = try owner.prepareSelection(&session, .{
+        .provider = "new",
+        .model = "new-model",
+        .preset = "review",
+    });
+    var retired = owner.publishSelectionRetired(&session, &prepared);
+    var transition = owner.beginTransitionSelection(&retired);
+    retired.deinit();
+    defer transition.deinit();
+    try session.addTaskNote("[task t1 killed at exit]");
+    try owner.seamHook().call(&session, .task_note, false);
+
+    const bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, owner.activePath().?, allocator, .unlimited);
+    defer allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "task_note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"provider\":\"old\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"preset\":\"review\"") == null);
+}
+
+test "materialized old log omits published preset selection after settlement" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var optional_log: ?persistence.SessionFile.Log = try testLog(allocator, io, root, .{
+        .provider = "old",
+        .model = "old-model",
+    });
+    const owner = try Owner.create(allocator, &optional_log, .{});
+    defer owner.deinit();
+    var session = try agent.Session.Session.init(allocator, .{
+        .provider_id = "old",
+        .model = "old-model",
+    });
+    defer session.deinit();
+    try session.addUser("old conversation");
+    try owner.seamHook().call(&session, .completion, false);
+
+    var prepared = try owner.prepareSelection(&session, .{
+        .provider = "new",
+        .model = "new-model",
+        .preset = "review",
+    });
+    var retired = owner.publishSelectionRetired(&session, &prepared);
+    var transition = owner.beginTransitionSelection(&retired);
+    retired.deinit();
+    defer transition.deinit();
+    try session.addTaskNote("[task t1 killed at exit]");
+    try owner.seamHook().call(&session, .task_note, false);
+
+    const bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, owner.activePath().?, allocator, .unlimited);
+    defer allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "task_note") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"type\":\"selection\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"preset\":\"review\"") == null);
+}
+
+test "restored transition selection flushes without a new item" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var optional_log: ?persistence.SessionFile.Log = try testLog(allocator, io, root, .{
+        .provider = "old",
+        .model = "old-model",
+    });
+    const owner = try Owner.create(allocator, &optional_log, .{});
+    defer owner.deinit();
+    var session = try agent.Session.Session.init(allocator, .{
+        .provider_id = "old",
+        .model = "old-model",
+    });
+    defer session.deinit();
+    try session.addUser("old conversation");
+    try owner.seamHook().call(&session, .completion, false);
+
+    var prepared = try owner.prepareSelection(&session, .{
+        .provider = "new",
+        .model = "new-model",
+        .preset = "review",
+    });
+    var retired = owner.publishSelectionRetired(&session, &prepared);
+    var transition = owner.beginTransitionSelection(&retired);
+    retired.deinit();
+    defer transition.deinit();
+    transition.restore();
+    const commit_fn = owner.activeLog().commit_fn;
+    owner.activeLog().commit_fn = failBeforeWrite;
+    const retryable: TransitionSelectionFlush = .{ .retryable = .io_retryable };
+    try std.testing.expectEqual(retryable, owner.flushRestoredTransitionSelection(&session));
+    switch (owner.state(&session)) {
+        .pending_append => |pending| try std.testing.expectEqual(pending.durable, pending.memory),
+        else => return error.TestUnexpectedResult,
+    }
+    owner.activeLog().commit_fn = commit_fn;
+    try std.testing.expectEqual(
+        TransitionSelectionFlush.synchronized,
+        owner.flushRestoredTransitionSelection(&session),
+    );
+
+    const bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, owner.activePath().?, allocator, .unlimited);
+    defer allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"type\":\"selection\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"preset\":\"review\"") != null);
 }
 
 test "selection preparation supports unrecorded authority and rejects quarantine" {

@@ -1,6 +1,9 @@
 # Conversation lifecycle program design
 
-Status: draft for review
+Status: approved
+
+Implementation progress: Slice 1 is complete in commit `9f5e07fb`. Slice 2 is wired
+end to end, including `/new [PRESET]`, `/clear`, task settlement, reset, and fresh-banner presentation.
 
 References:
 
@@ -745,10 +748,13 @@ cut.
 projections over the same prepared selection: the live old-branch commit and borrowed
 effective values used to construct the detached fresh session and lazy log. The live
 commit publishes config, runtime, tools, current session selection, and current log
-selection together before task settlement. It consumes the wrapper's publishable
-selection state. The later `publishNew` candidate therefore carries no detached
-selection to publish a second time; it carries only fresh conversation values already
-normalized to the committed effective selection.
+selection together before task settlement. A move-only transition token then swaps the
+retired old-log selection back into the old live log without allocation. The token owns
+the published selection while settlement runs. Successful conversation publication drops
+that temporary selection; a partial path restores it and flushes a pending selection
+record even when item high-water already matches. The later `publishNew` candidate
+therefore carries no detached selection to publish a second time; it carries only fresh
+conversation values already normalized to the committed effective selection.
 
 Under quarantine that existed at command entry, `preparePresetForTransition` creates an
 operation-specific session-only live wrapper. Its commit updates stable old-memory

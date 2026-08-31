@@ -115,6 +115,14 @@ pub const Plan = struct {
     }
 };
 
+/// Non-owning view into a bounded Enumeration. Pointer payloads remain valid
+/// only until that enumeration is mutated or deinitialized.
+pub const BorrowedLookup = union(enum) {
+    missing,
+    invalid: *const Invalid,
+    plan: *const Plan,
+};
+
 pub const Lookup = union(enum) {
     missing,
     invalid: Invalid,

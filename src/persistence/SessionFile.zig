@@ -115,6 +115,12 @@ pub const Recovery = struct {
 };
 
 pub const Loaded = struct {
+    pub const Parts = struct {
+        session: agent.Session.Session,
+        meta: Meta,
+        recovery: Recovery,
+    };
+
     session: agent.Session.Session,
     meta: Meta,
     last_selection: OwnedSelection,
@@ -127,6 +133,19 @@ pub const Loaded = struct {
         self.meta.deinit(allocator);
         self.last_selection.deinit(allocator);
         self.* = undefined;
+    }
+
+    /// Moves the session and metadata out while releasing loader-only selection state.
+    pub fn takeParts(self: *Loaded) Parts {
+        const allocator = self.session.allocator;
+        const parts: Parts = .{
+            .session = self.session,
+            .meta = self.meta,
+            .recovery = self.recovery,
+        };
+        self.last_selection.deinit(allocator);
+        self.* = undefined;
+        return parts;
     }
 };
 
@@ -288,6 +307,32 @@ pub const PreparedSelection = struct {
 
     pub fn deinit(self: *PreparedSelection) void {
         if (self.active) if (self.replacement) |*replacement| replacement.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+/// Move-only log selection strings displaced by publication.
+pub const RetiredSelection = struct {
+    allocator: std.mem.Allocator,
+    selection: ?OwnedSelection,
+    active: bool = true,
+
+    pub fn deinit(self: *RetiredSelection) void {
+        if (self.active) if (self.selection) |*selection| selection.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+/// Move-only selection displaced while the old branch receives terminal notes.
+pub const TransitionSelection = struct {
+    generation: u64,
+    allocator: std.mem.Allocator,
+    selection: ?OwnedSelection,
+    restored: bool = false,
+    active: bool = true,
+
+    pub fn deinit(self: *TransitionSelection) void {
+        if (self.active) if (self.selection) |*selection| selection.deinit(self.allocator);
         self.* = undefined;
     }
 };
@@ -500,6 +545,10 @@ pub const Log = struct {
         return self.written_items;
     }
 
+    pub fn hasPendingSelection(self: *const Log) bool {
+        return self.selection_pending;
+    }
+
     /// Returns the configured selection borrowed until setSelection or deinit.
     pub fn currentSelection(self: *const Log) Selection {
         return self.selection.borrow();
@@ -527,7 +576,7 @@ pub const Log = struct {
     ) AppendError!AppendOutcome {
         if (self.poisoned) return error.Poisoned;
         if (start_index != self.written_items or start_index > items.len) return error.HighWaterMismatch;
-        if (start_index == items.len) return .unchanged;
+        if (start_index == items.len and (!self.header_written or !self.selection_pending)) return .unchanged;
         if (items.len > self.limits.max_items) return error.TooManyItems;
 
         var output: std.Io.Writer.Allocating = .init(self.allocator);
@@ -924,24 +973,69 @@ pub const Log = struct {
         };
     }
 
-    /// Publishes a prepared replacement without allocating. Consumes `prepared`.
-    pub fn publishSelection(self: *Log, prepared: *PreparedSelection) void {
+    /// Publishes a prepared replacement without allocating or freeing. Consumes
+    /// `prepared`; the caller must later deinitialize the returned owner.
+    pub fn publishSelectionRetired(
+        self: *Log,
+        prepared: *PreparedSelection,
+    ) RetiredSelection {
         std.debug.assert(prepared.active);
         std.debug.assert(prepared.owner == self);
         std.debug.assert(prepared.generation == self.selection_generation);
         prepared.active = false;
         self.selection_generation +%= 1;
-        var replacement = prepared.replacement orelse return;
-        if (!prepared.core_changed) {
-            if (self.selection.model_label) |value| self.allocator.free(value);
-            self.selection.model_label = replacement.model_label;
-            replacement.model_label = null;
-            replacement.deinit(self.allocator);
-            return;
-        }
-        self.selection.deinit(self.allocator);
+        const replacement = prepared.replacement orelse return .{
+            .allocator = self.allocator,
+            .selection = null,
+        };
+        prepared.replacement = null;
+        const previous = self.selection;
         self.selection = replacement;
-        if (self.header_written) self.selection_pending = true;
+        if (prepared.core_changed and self.header_written) self.selection_pending = true;
+        return .{ .allocator = self.allocator, .selection = previous };
+    }
+
+    /// Publishes and immediately releases displaced selection strings.
+    pub fn publishSelection(self: *Log, prepared: *PreparedSelection) void {
+        var retired = self.publishSelectionRetired(prepared);
+        retired.deinit();
+    }
+
+    /// Moves the retired old selection back into the live log for settlement.
+    /// The token owns the temporary next-conversation selection until deinit or restore.
+    pub fn beginTransitionSelection(self: *Log, retired: *RetiredSelection) TransitionSelection {
+        std.debug.assert(retired.active);
+        std.debug.assert(retired.allocator.ptr == self.allocator.ptr);
+        const old = retired.selection orelse return .{
+            .generation = self.selection_generation,
+            .allocator = self.allocator,
+            .selection = null,
+        };
+        retired.selection = null;
+        const next = self.selection;
+        self.selection = old;
+        self.selection_pending = false;
+        self.selection_generation +%= 1;
+        return .{
+            .generation = self.selection_generation,
+            .allocator = self.allocator,
+            .selection = next,
+        };
+    }
+
+    pub fn restoreTransitionSelection(self: *Log, transition: *TransitionSelection) void {
+        std.debug.assert(transition.active);
+        std.debug.assert(!transition.restored);
+        std.debug.assert(transition.generation == self.selection_generation);
+        if (transition.selection) |next| {
+            const old = self.selection;
+            self.selection = next;
+            transition.selection = old;
+            self.selection_pending = self.header_written;
+            self.selection_generation +%= 1;
+            transition.generation = self.selection_generation;
+        }
+        transition.restored = true;
     }
 
     pub fn setSelection(self: *Log, selection: Selection) Error!void {

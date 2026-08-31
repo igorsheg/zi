@@ -188,6 +188,7 @@ pub const PromptRecall = struct {
 
 pub const CommandOutcome = enum {
     handled,
+    history_changed,
     exit,
 };
 
@@ -586,6 +587,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
                     if (inputs.prompt_recall) |recall| try recall.admit(submitted, .session);
                     switch (try command.execute()) {
                         .handled => continue,
+                        .history_changed => {
+                            resume_reason = .none;
+                            abort_marker_placed = false;
+                            continue;
+                        },
                         .exit => return 0,
                     }
                 },
@@ -963,6 +969,86 @@ test "commands are classified before recall and bypass session provider flow" {
     try std.testing.expect(provider.valid);
     try std.testing.expectEqual(@as(usize, 1), seam.prompts);
     try std.testing.expectEqualStrings("answer\n", stdout.written());
+}
+
+test "history-changing command clears resume state without rerunning first-send hook" {
+    const State = struct {
+        const Self = @This();
+        hook_calls: usize = 0,
+        prompt_reasons: [4]ResumeReason = undefined,
+        prompt_count: usize = 0,
+
+        pub fn call(self: *Self) BeforeFirstSendError!void {
+            self.hook_calls += 1;
+        }
+
+        pub fn beforePrompt(self: *Self, reason: ResumeReason) !void {
+            self.prompt_reasons[self.prompt_count] = reason;
+            self.prompt_count += 1;
+        }
+
+        pub fn beforeGeneration(_: *Self) !void {}
+        pub fn afterTurn(_: *Self, _: TurnSummary) !void {}
+
+        pub fn classifyCommand(self: *Self, line: []const u8) CommandClassification {
+            if (!std.mem.eql(u8, line, "/new")) return .prompt;
+            return .{ .command = .{
+                .context = self,
+                .execute_fn = execute,
+                .registry_index = 0,
+                .name = "new",
+                .argument = null,
+                .usage = .valid,
+            } };
+        }
+
+        fn execute(_: *anyopaque, _: CommandToken) anyerror!CommandOutcome {
+            return .history_changed;
+        }
+    };
+    const Provider = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn stream(
+            _: std.mem.Allocator,
+            _: std.Io,
+            self: *Self,
+            _: ai.Provider.Request,
+            _: ai.Provider.EventSink,
+        ) ai.Provider.StreamError!void {
+            self.calls += 1;
+            return error.InvalidRequest;
+        }
+    };
+
+    var state: State = .{};
+    var provider: Provider = .{};
+    var session = try agent.Session.Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var reader = std.Io.Reader.fixed("prompt\n/new\n");
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+
+    _ = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "fake"),
+        .model = "model",
+        .system_prompt = "",
+        .reader = &reader,
+        .command_gateway = CommandGateway.from(&state),
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .show_prompt = false,
+        .presentation = Presentation.from(&state),
+        .before_first_send = BeforeFirstSend.from(&state),
+    });
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expectEqual(@as(usize, 1), state.hook_calls);
+    try std.testing.expectEqual(@as(usize, 3), state.prompt_count);
+    try std.testing.expectEqual(ResumeReason.none, state.prompt_reasons[2]);
 }
 
 test "command admission precedes failing execution" {

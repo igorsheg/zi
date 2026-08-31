@@ -234,10 +234,10 @@ shutdown may skip its unusable seam and new/resume may replace that authority wi
 explicit incomplete-old-branch warning.
 
 `/new PRESET` matches hax’s two commit points: after complete preparation, it publishes
-and persists the preset selection first. Task settlement then records against that new
-selection in the old conversation. If settlement cannot safely finish, the new preset
-remains active while history stays in place, and the command reports that partial
-result.
+and persists the preset selection first. A move-only token temporarily restores the old
+log selection while task settlement appends to the old conversation. If settlement
+cannot safely finish, the token restores the published preset selection and attempts a
+metadata-only durable flush before the command reports the original partial cause.
 
 `/undo` and `/compact` do not settle tasks. `/fork` preserves tasks. Task state may retain the stable session and routing-owner
 pointers already established by `ToolRuntime`, but never a replaceable log slot or

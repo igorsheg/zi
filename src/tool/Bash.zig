@@ -264,6 +264,15 @@ pub const Bash = struct {
         self.* = undefined;
     }
 
+    /// Releases conversation-local spill outputs while retaining list capacity.
+    /// The caller must shut down every task before calling this method.
+    pub fn resetConversation(self: *Bash) void {
+        std.debug.assert(self.task_registry == null or self.task_registry.?.shut_down);
+        for (self.kept_outputs.items) |*output| output.deinit();
+        self.kept_outputs.clearRetainingCapacity();
+        self.retained_spill_bytes = 0;
+    }
+
     /// Returns the resolved command shell borrowed until `deinit`.
     pub fn commandShell(self: *const Bash) []const u8 {
         return self.shell;
@@ -1744,6 +1753,31 @@ test "bash spills use a private directory and owner-only files" {
     const path = bash.kept_outputs.items[0].savedPath().?;
     const file_stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
     try std.testing.expectEqual(@as(u16, 0o600), @intFromEnum(file_stat.permissions) & 0o777);
+}
+
+test "reset conversation releases retained spills and keeps list capacity" {
+    var bash = try Bash.init(std.testing.allocator, std.testing.io, .{
+        .environment = std.testing.environ,
+        .output = .{ .memory_cap = 1, .temp_directory = ".zig-cache/tmp" },
+    });
+    defer bash.deinit();
+    var result = try bash.tool().run(
+        std.testing.allocator,
+        std.testing.io,
+        "{\"command\":\"printf 'retained spill'\"}",
+        .{},
+    );
+    defer result.deinit(std.testing.allocator);
+    const path = try std.testing.allocator.dupe(u8, bash.kept_outputs.items[0].savedPath().?);
+    defer std.testing.allocator.free(path);
+    const capacity = bash.kept_outputs.capacity;
+
+    bash.resetConversation();
+
+    try std.testing.expectEqual(@as(usize, 0), bash.kept_outputs.items.len);
+    try std.testing.expectEqual(capacity, bash.kept_outputs.capacity);
+    try std.testing.expectEqual(@as(usize, 0), bash.retained_spill_bytes);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, path, .{}));
 }
 
 test "bash bounds retained spill files and evicts the oldest" {

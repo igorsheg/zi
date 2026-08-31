@@ -40,6 +40,27 @@ pub const UsageStats = struct {
         self.* = undefined;
     }
 
+    /// Clears all conversation usage while retaining the preallocated attempt capacity.
+    pub fn reset(self: *UsageStats) void {
+        self.attempts.clearRetainingCapacity();
+        self.input_tokens = 0;
+        self.output_tokens = 0;
+        self.cached_tokens = 0;
+        self.cache_write_tokens = 0;
+        self.cache_write_1h_tokens = 0;
+        self.uncached_input_tokens = 0;
+        self.spend_usd = 0;
+        self.spend_estimated = false;
+        self.spend_unreliable = false;
+        self.has_unpriced = false;
+        self.last_ordinary_context_tokens = null;
+    }
+
+    /// Invalidates only the context snapshot associated with the current branch.
+    pub fn invalidateContext(self: *UsageStats) void {
+        self.last_ordinary_context_tokens = null;
+    }
+
     /// Consumes the same typed payload delivered by Loop and CompactRunner.
     pub fn observe(self: *UsageStats, observation: Loop.UsageObservation) Loop.UsageObserverError!void {
         if (observation.attempts.len > self.attempt_limit - self.attempts.items.len) {
@@ -236,6 +257,63 @@ test "reprice applies nonlinear tiers and cache rates to retained physical attem
     try std.testing.expect(stats.spend_estimated);
     try std.testing.expectEqual(input_before, stats.input_tokens);
     try std.testing.expectEqual(context_before, stats.last_ordinary_context_tokens);
+}
+
+test "reset clears totals and attempts while retaining capacity" {
+    var stats = try UsageStats.init(std.testing.allocator, 4);
+    defer stats.deinit();
+    try stats.observe(.{
+        .footer = .{
+            .stream = .{
+                .input_tokens = 10,
+                .output_tokens = 2,
+                .cached_tokens = 3,
+                .cache_write_tokens = 4,
+                .cache_write_1h_tokens = 5,
+            },
+            .uncached_input_tokens = 7,
+        },
+        .spend = .{ .known_usd = 1, .has_unpriced = true, .estimated = true, .unreliable = true },
+        .attempts = &.{.{ .input_tokens = 10 }},
+        .kind = .ordinary,
+        .terminal_context_tokens = 9,
+    });
+    const capacity = stats.attempts.capacity;
+
+    stats.reset();
+
+    try std.testing.expectEqual(@as(usize, 0), stats.attempts.items.len);
+    try std.testing.expectEqual(capacity, stats.attempts.capacity);
+    try std.testing.expectEqual(@as(u64, 0), stats.input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), stats.output_tokens);
+    try std.testing.expectEqual(@as(u64, 0), stats.cached_tokens);
+    try std.testing.expectEqual(@as(u64, 0), stats.cache_write_tokens);
+    try std.testing.expectEqual(@as(u64, 0), stats.cache_write_1h_tokens);
+    try std.testing.expectEqual(@as(u64, 0), stats.uncached_input_tokens);
+    try std.testing.expectEqual(@as(f64, 0), stats.spend_usd);
+    try std.testing.expect(!stats.spend_estimated);
+    try std.testing.expect(!stats.spend_unreliable);
+    try std.testing.expect(!stats.has_unpriced);
+    try std.testing.expect(stats.last_ordinary_context_tokens == null);
+}
+
+test "invalidate context preserves cumulative usage" {
+    var stats = try UsageStats.init(std.testing.allocator, 2);
+    defer stats.deinit();
+    try stats.observe(.{
+        .footer = .{ .stream = .{ .input_tokens = 10 }, .cost_total_usd = 1 },
+        .spend = .{ .known_usd = 1 },
+        .attempts = &.{.{ .input_tokens = 10, .cost_usd = 1 }},
+        .kind = .ordinary,
+        .terminal_context_tokens = 9,
+    });
+
+    stats.invalidateContext();
+
+    try std.testing.expectEqual(@as(usize, 1), stats.attempts.items.len);
+    try std.testing.expectEqual(@as(u64, 10), stats.input_tokens);
+    try std.testing.expectEqual(@as(f64, 1), stats.spend_usd);
+    try std.testing.expect(stats.last_ordinary_context_tokens == null);
 }
 
 test "capacity failure leaves retained attempts and totals unchanged" {

@@ -17,7 +17,6 @@ const ProviderHeaders = @import("../ProviderHeaders.zig");
 const CodexRuntime = @import("../CodexRuntime.zig");
 const CodexAuth = @import("../CodexAuth.zig");
 const ToolRuntime = @import("../ToolRuntime.zig");
-const SessionDurability = @import("../SessionDurability.zig");
 const SessionRetentionService = @import("../SessionRetentionService.zig");
 const PromptAssembly = @import("../PromptAssembly.zig");
 const GitProbe = @import("../GitProbe.zig");
@@ -31,6 +30,8 @@ const ProcessFacts = @import("ProcessFacts.zig");
 const CodexFiles = @import("CodexFiles.zig");
 const SessionPicker = @import("SessionPicker.zig");
 const SessionStartup = @import("SessionStartup.zig");
+const ConversationRuntime = @import("ConversationRuntime.zig");
+const NewConversation = @import("NewConversation.zig");
 const StartupConfig = @import("StartupConfig.zig");
 const LocalStartup = @import("LocalStartup.zig");
 const OneShot = @import("OneShot.zig");
@@ -476,10 +477,8 @@ pub fn run(
 
     var no_session_setting = try config.Settings.getString(startup.store(), allocator, "no_session");
     defer no_session_setting.deinit(allocator);
-    const no_session = options.no_session or noSessionConfigured(
-        no_session_setting.value,
-        provider_runtime.metadata.provider_id,
-    );
+    const recording_policy = recordingPolicy(options.no_session, no_session_setting.value);
+    const no_session = !recording_policy.permits(provider_runtime.metadata.provider_id);
     const needs_git_probe = shouldCreateGitEnvironment(resolved != null, no_session, paths.state_root != null);
     var environment_wiper = SecureAllocator.WipingAllocator.init(allocator);
     var environment_map: ?std.process.Environ.Map = if (needs_git_probe)
@@ -493,7 +492,7 @@ pub fn run(
         .path = environment.get("PATH"),
     } } else null;
     const git_probe = if (git_adapter) |*value| persistence.SessionFile.GitProbe.from(value) else null;
-    var session_run = try SessionStartup.start(resolved, final_selection, .{
+    var startup_candidate = try SessionStartup.startCandidate(resolved, final_selection, .{
         .allocator = allocator,
         .io = io,
         .state_root = paths.state_root,
@@ -507,19 +506,30 @@ pub fn run(
         .writer_version = version,
     });
     resolved = null;
-    defer session_run.deinit();
-    if (session_run.warning()) |warning| switch (warning) {
+    defer if (startup_candidate.active) startup_candidate.deinit();
+    var identity_provider: ConversationIdentityProvider = .{ .io = io, .random = &random };
+    const conversation = try ConversationRuntime.Owner.create(allocator, &startup_candidate, .{
+        .io = io,
+        .recording_policy = recording_policy,
+        .fresh = .{
+            .state_root = paths.state_root,
+            .cwd = cwd,
+            .writer_version = version,
+            .git_probe = git_probe,
+            .session_limits = .{},
+            .file_limits = .{},
+            .timestamp_provider = ConversationRuntime.TimestampProvider.from(&identity_provider),
+            .uuid_provider = ConversationRuntime.UuidProvider.from(&identity_provider),
+        },
+    });
+    defer conversation.deinit();
+    if (conversation.startupWarning()) |warning| switch (warning) {
         .resume_append_unavailable => |path| {
             try stderr.writeAll("zi: warning: cannot append to session '");
             try DiagnosticText.write(stderr, path);
             try stderr.writeAll("'; this run won't be recorded\n");
         },
     };
-
-    var durability_log = session_run.takeLog();
-    defer if (durability_log) |*log_value| log_value.deinit();
-    const durability = try SessionDurability.Owner.create(allocator, &durability_log, .{});
-    defer durability.deinit();
 
     var configured_transcript = try config.Settings.getString(startup.store(), allocator, "transcript");
     defer configured_transcript.deinit(allocator);
@@ -537,7 +547,7 @@ pub fn run(
         .style = ProcessAdapters.isTty(io, .stderr()),
     };
     var transcript_warning_sink: TranscriptWarningSink = .{ .stderr = stderr };
-    const run_log_seam = try RunLogSeam.Owner.create(allocator, transcript_owner, durability, .{
+    const run_log_seam = try RunLogSeam.Owner.create(allocator, transcript_owner, conversation.durability(), .{
         .marker = RunLogSeam.Marker.from(&compaction_marker),
         .warning_sink = RunLogSeam.WarningSink.from(&transcript_warning_sink),
     });
@@ -719,8 +729,8 @@ pub fn run(
         .builder = RunSelection.Builder.from(&live_builder),
         .provider_source = RunSelection.ProviderSource.from(&live_provider_source),
         .tools = RunSelection.ToolSelection.from(&live_tool_selection),
-        .session = session_run.session(),
-        .durability = durability,
+        .session = conversation.session(),
+        .durability = conversation.durability(),
         .runtime = provider_runtime,
         .prompt = system_prompt,
         .tool_list = tools.tools(),
@@ -769,7 +779,7 @@ pub fn run(
         .system_prompt = live.snapshot().system_prompt,
         .tools = tools.tools(),
         .tool_runtime = &tools,
-        .durability = durability,
+        .conversation = conversation,
         .effort = live.runtime.effort,
         .usage = &usage,
         .catalog_runtime = &catalog_runtime,
@@ -780,13 +790,26 @@ pub fn run(
         .enabled = compact_enabled,
         .threshold = compact_threshold,
     };
-    var terminal: Terminal = .{ .tools = &tools };
+    var terminal: Terminal = .{ .tools = &tools, .conversation = conversation };
     var session_info: SessionInfo = .{
-        .durability = durability,
+        .conversation = conversation,
         .runtime = &live.runtime,
-        .preset = nonEmpty(selected_preset.value),
         .resumed = restored != null,
     };
+    var conversation_reset: ConversationReset = .{
+        .marker = &compaction_marker,
+        .tools = &tools,
+        .session_info = &session_info,
+    };
+    var new_conversation_service: NewConversation.Service = .{
+        .conversation = conversation,
+        .selection = &live,
+        .tools = &tools,
+        .usage = &usage,
+        .run_log = run_log_seam,
+        .reset_sink = NewConversation.ResetSink.from(&conversation_reset),
+    };
+    const new_conversation_runner = NewConversation.Runner.from(&new_conversation_service);
     var catalog_hook: CatalogHook = .{
         .catalog_runtime = &catalog_runtime,
         .stats = &stats,
@@ -805,7 +828,7 @@ pub fn run(
     };
     live.setViews(RunSelection.Views.from(&live_views));
     run_log_seam.bindSelection(&live);
-    run_log_seam.rebuildTranscript(.open, session_run.session());
+    run_log_seam.rebuildTranscript(.open, conversation.session());
 
     var configured_theme = try config.Settings.getString(store, allocator, "theme");
     defer configured_theme.deinit(allocator);
@@ -827,7 +850,7 @@ pub fn run(
 
     const run_result = switch (mode) {
         .print => |prompt| OneShot.run(allocator, io, .{
-            .session = session_run.session(),
+            .session = conversation.session(),
             .provider = live.runtime.provider(),
             .model = live.runtime.model,
             .model_metadata = live.runtime.metadata.model,
@@ -866,7 +889,7 @@ pub fn run(
             const interactive_terminal = ProcessAdapters.isTty(io, .stdin()) and
                 ProcessAdapters.isTty(io, .stdout());
             const interactive_inputs: Interactive.Inputs = .{
-                .session = session_run.session(),
+                .session = conversation.session(),
                 .provider = live.runtime.provider(),
                 .model = live.runtime.model,
                 .model_metadata = live.runtime.metadata.model,
@@ -905,6 +928,7 @@ pub fn run(
                 );
                 commands.setRunSelection(&live);
                 commands.setRunLogSeam(run_log_seam);
+                commands.setNewConversation(new_conversation_runner);
                 commands.setIo(io);
                 var cooked_inputs = interactive_inputs;
                 cooked_inputs.command_gateway = commands.gateway();
@@ -929,6 +953,8 @@ pub fn run(
                 &terminal,
                 &live,
                 run_log_seam,
+                conversation,
+                new_conversation_runner,
                 theme,
                 display_columns,
                 markdown_enabled,
@@ -1240,6 +1266,8 @@ fn runRawInteractive(
     terminal_owner: *Terminal,
     live: *RunSelection.Owner,
     run_log_seam: *RunLogSeam.Owner,
+    conversation: *ConversationRuntime.Owner,
+    new_conversation: NewConversation.Runner,
     theme: render.Theme,
     display_columns: terminal_module.DisplayColumns.Policy,
     markdown_enabled: bool,
@@ -1308,7 +1336,7 @@ fn runRawInteractive(
         inputs_value.stdout,
         theme,
         display_columns.resolve(terminal_module.Size.presentationColumns(stdout_file.handle)),
-        rawBannerIdentity(inputs_value.session, banner_fallbacks),
+        rawBannerIdentity(conversation.session(), banner_fallbacks),
     );
     frame.syncExternal(1);
     try frame.flush();
@@ -1360,6 +1388,7 @@ fn runRawInteractive(
     commands.setFrame(&frame);
     commands.setRunSelection(live);
     commands.setRunLogSeam(run_log_seam);
+    commands.setNewConversation(new_conversation);
     var selection_picker: SelectionPicker.TerminalRunner = .{
         .allocator = allocator,
         .io = io,
@@ -1401,7 +1430,7 @@ fn runRawInteractive(
             .theme = theme,
             .columns = markdown_width.resolve(),
             .show_reasoning = show_reasoning,
-            .items = inputs_value.session.items(),
+            .items = conversation.session().items(),
             .tools = inputs_value.tools,
         };
         if (markdown_enabled) {
@@ -1489,6 +1518,19 @@ fn runInteractiveWithFinish(
     try terminal_owner.finish(inputs.session, inputs.seam_hook);
     return exit_code;
 }
+
+const ConversationIdentityProvider = struct {
+    io: std.Io,
+    random: *ProcessAdapters.Random,
+
+    pub fn nextTimestamp(self: *ConversationIdentityProvider) persistence.Paths.Timestamp {
+        return ProcessAdapters.wallTimestamp(self.io);
+    }
+
+    pub fn nextUuid(self: *ConversationIdentityProvider) ConversationRuntime.UuidProvider.Error![16]u8 {
+        return self.random.uuidV4() catch error.Unavailable;
+    }
+};
 
 const LazyGit = struct {
     options: GitProbe.Options,
@@ -1917,37 +1959,47 @@ const DynamicImageInput = struct {
     }
 };
 
+const ConversationReset = struct {
+    marker: *CompactionMarker,
+    tools: *ToolRuntime.Owner,
+    session_info: *SessionInfo,
+
+    pub fn reset(self: *ConversationReset) void {
+        self.marker.pending = false;
+        self.tools.resetConversation() catch unreachable;
+        self.session_info.resumed = false;
+    }
+};
+
 const SessionInfo = struct {
-    durability: *SessionDurability.Owner,
+    conversation: *ConversationRuntime.Owner,
     runtime: *ProviderRuntime.Owned,
-    preset: ?[]const u8,
     resumed: bool,
 
     pub fn get(self: *SessionInfo) OneShot.CallbackError!OneShot.SessionInfo {
         return .{
-            .preset = self.preset,
+            .preset = self.conversation.session().currentSelection().preset,
             .provider_name = self.runtime.metadata.display_name,
             .model_label = self.runtime.model,
             .effort = self.runtime.effort,
             .provider_autoselected = self.runtime.provider_autoselected,
             .resumed = self.resumed,
-            .materialized_session = if (self.durability.materialized())
-                self.durability.resumeHint()
-            else
-                null,
+            .materialized_session = self.conversation.resumeHint(),
         };
     }
 };
 
 const Terminal = struct {
     tools: *ToolRuntime.Owner,
+    conversation: *ConversationRuntime.Owner,
 
     pub fn finish(
         self: *Terminal,
         session: *agent.Session.Session,
         seam: ?agent.Loop.SeamHook,
     ) OneShot.CallbackError!void {
-        self.tools.finish(session, seam) catch |err| return switch (err) {
+        if (session != self.conversation.session()) return error.Failed;
+        self.tools.finish(self.conversation.session(), seam) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.HookIndeterminate => error.Indeterminate,
             else => error.Failed,
@@ -2029,7 +2081,7 @@ const AutoCompact = struct {
     system_prompt: []const u8,
     tools: []const tool.Tool.Tool,
     tool_runtime: *ToolRuntime.Owner,
-    durability: *SessionDurability.Owner,
+    conversation: *ConversationRuntime.Owner,
     effort: ?[]const u8,
     usage: *agent.UsageStats.UsageStats,
     catalog_runtime: *CatalogRuntime,
@@ -2046,6 +2098,8 @@ const AutoCompact = struct {
         self: *AutoCompact,
         session: *agent.Session.Session,
     ) agent.Loop.HookError!agent.Loop.ContinuationResult {
+        const conversation_session = self.conversation.session();
+        if (session != conversation_session) return error.Failed;
         try self.refreshCatalog();
         if (!agent.Compact.shouldAuto(
             self.usage.last_ordinary_context_tokens,
@@ -2053,9 +2107,9 @@ const AutoCompact = struct {
             self.enabled,
             self.threshold,
         )) return .unchanged;
-        const effort_changed = try self.syncEffort(session);
+        const effort_changed = try self.syncEffort(conversation_session);
         var result = agent.CompactRunner.runContinuation(self.allocator, self.io, .{
-            .session = session,
+            .session = conversation_session,
             .provider = self.provider,
             .model = self.model,
             .model_metadata = self.metadata,
@@ -2090,7 +2144,7 @@ const AutoCompact = struct {
             error.PendingDurability => error.Indeterminate,
             error.Reentrant, error.InvalidConfig => error.Failed,
         };
-        const update = self.durability.updateSelection(session, .{
+        const update = self.conversation.durability().updateSelection(session, .{
             .provider = current.provider_id,
             .model = current.model,
             .model_label = current.model_label,
@@ -2169,11 +2223,13 @@ fn nonEmpty(value: ?[]const u8) ?[]const u8 {
     return if (text.len == 0) null else text;
 }
 
-fn noSessionConfigured(value: ?[]const u8, provider_id: []const u8) bool {
-    const text = value orelse return false;
-    if (std.ascii.eqlIgnoreCase(text, "auto")) return std.mem.eql(u8, provider_id, "mock");
-    return std.mem.eql(u8, text, "1") or std.ascii.eqlIgnoreCase(text, "true") or
-        std.ascii.eqlIgnoreCase(text, "yes") or std.ascii.eqlIgnoreCase(text, "on");
+fn recordingPolicy(cli_no_session: bool, value: ?[]const u8) SessionStartup.RecordingPolicy {
+    if (cli_no_session) return .disabled;
+    const text = value orelse return .enabled;
+    if (std.ascii.eqlIgnoreCase(text, "auto")) return .automatic;
+    if (std.mem.eql(u8, text, "1") or std.ascii.eqlIgnoreCase(text, "true") or
+        std.ascii.eqlIgnoreCase(text, "yes") or std.ascii.eqlIgnoreCase(text, "on")) return .disabled;
+    return .enabled;
 }
 
 fn ignoreWriterFailure(err: std.Io.Writer.Error) void {
@@ -2500,6 +2556,16 @@ test "fresh provider cache key is the canonical session UUID" {
     var next = uuid;
     next[15] = 0xfe;
     try std.testing.expect(!std.mem.eql(u8, &formatUuid(uuid), &formatUuid(next)));
+}
+
+test "recording policy preserves CLI and explicit setting behavior" {
+    try std.testing.expectEqual(SessionStartup.RecordingPolicy.enabled, recordingPolicy(false, null));
+    try std.testing.expectEqual(SessionStartup.RecordingPolicy.enabled, recordingPolicy(false, "false"));
+    try std.testing.expectEqual(SessionStartup.RecordingPolicy.disabled, recordingPolicy(false, "true"));
+    try std.testing.expectEqual(SessionStartup.RecordingPolicy.automatic, recordingPolicy(false, "auto"));
+    try std.testing.expectEqual(SessionStartup.RecordingPolicy.disabled, recordingPolicy(true, "false"));
+    try std.testing.expect(SessionStartup.RecordingPolicy.automatic.permits("openai"));
+    try std.testing.expect(!SessionStartup.RecordingPolicy.automatic.permits("mock"));
 }
 
 test "fresh Git environment releases every inherited value through the wiping allocator" {

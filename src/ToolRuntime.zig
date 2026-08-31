@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent = @import("agent/root.zig");
+const persistence = @import("persistence/root.zig");
 const tool = @import("tool/root.zig");
 
 const Read = tool.Read.Read;
@@ -11,6 +12,7 @@ const TaskWait = tool.TaskWait.TaskWait;
 const Tool = tool.Tool.Tool;
 const Loop = agent.Loop;
 const Session = agent.Session.Session;
+const SessionDurability = @import("SessionDurability.zig");
 
 pub const InitError = error{ OutOfMemory, InvalidConfig };
 pub const BindingError = error{ Reentrant, PendingDurability };
@@ -23,6 +25,35 @@ pub const FinishError = agent.Session.Error || tool.TaskRegistry.Error || error{
     PendingDurability,
     HookFailed,
     HookIndeterminate,
+};
+
+pub const NoteMutation = enum { none, appended, pending_flush_recovered };
+pub const FlushState = enum {
+    not_needed,
+    synchronized,
+    unrecorded,
+    preexisting_quarantine,
+    failed,
+    indeterminate,
+};
+pub const ShutdownState = enum { no_tasks, complete, partial, failed };
+
+pub const TransitionSettlement = struct {
+    note: NoteMutation,
+    flush: FlushState,
+    shutdown: ShutdownState,
+    prior_quarantine: bool,
+
+    pub fn permitsReplacement(self: TransitionSettlement) bool {
+        switch (self.shutdown) {
+            .no_tasks, .complete => {},
+            .partial, .failed => return false,
+        }
+        if (self.prior_quarantine) {
+            return self.flush == .not_needed or self.flush == .preexisting_quarantine;
+        }
+        return self.flush == .not_needed or self.flush == .synchronized or self.flush == .unrecorded;
+    }
 };
 
 /// Explicit process snapshots and per-tool policy used to build one runtime.
@@ -171,6 +202,14 @@ pub const Owner = struct {
         return self.registry;
     }
 
+    /// Releases conversation-local Bash spill outputs after task settlement.
+    /// Reentry from task-note callbacks is rejected before any mutation.
+    pub fn resetConversation(self: *Owner) BindingError!void {
+        if (self.task_notes) |state| if (state.active) return error.Reentrant;
+        if (self.registry) |registry| std.debug.assert(registry.shut_down);
+        self.bash.resetConversation();
+    }
+
     /// Returns a stable erased pre-request hook and permanently binds its seam
     /// identity. Repeating the same seam is allowed; replacing it, including
     /// with/from null, is rejected because prior mutation may still need flush.
@@ -216,6 +255,98 @@ pub const Owner = struct {
 
         if (work_error) |err| return err;
         if (shutdown_error) |err| return err;
+    }
+
+    /// Settles task-note mutation for a conversation replacement and always
+    /// attempts task shutdown. `prior_quarantine` is the authority state at
+    /// command entry, before the caller's initial reconciliation.
+    pub fn finishForTransition(
+        self: *Owner,
+        session: *Session,
+        durability: *SessionDurability.Owner,
+        prior_quarantine: bool,
+    ) TransitionSettlement {
+        var settlement: TransitionSettlement = .{
+            .note = .none,
+            .flush = .not_needed,
+            .shutdown = .no_tasks,
+            .prior_quarantine = prior_quarantine,
+        };
+
+        if (self.task_notes) |state| {
+            if (state.active) {
+                settlement.flush = .failed;
+            } else if (state.session) |bound| {
+                if (bound != session) {
+                    settlement.flush = .failed;
+                } else {
+                    self.settleTransitionNotes(state, session, durability, prior_quarantine, &settlement);
+                }
+            } else {
+                state.session = session;
+                self.settleTransitionNotes(state, session, durability, prior_quarantine, &settlement);
+            }
+        } else if (!prior_quarantine and durabilityIsQuarantined(durability, session)) {
+            settlement.flush = .indeterminate;
+        }
+
+        settlement.shutdown = self.shutdownForTransition();
+        return settlement;
+    }
+
+    fn settleTransitionNotes(
+        self: *Owner,
+        state: *TaskNotesState,
+        session: *Session,
+        durability: *SessionDurability.Owner,
+        prior_quarantine: bool,
+        settlement: *TransitionSettlement,
+    ) void {
+        state.active = true;
+        defer state.active = false;
+
+        if (state.pending_flush) {
+            settlement.note = .pending_flush_recovered;
+            if (!settleTransitionFlush(state, session, durability, prior_quarantine, settlement)) return;
+        }
+        if (state.pending_note) |*pending| {
+            session.addTaskNote(pending.text) catch {
+                settlement.flush = .failed;
+                return;
+            };
+            pending.deinit(self.allocator);
+            state.pending_note = null;
+            state.pending_flush = true;
+            settlement.note = .appended;
+            if (!settleTransitionFlush(state, session, durability, prior_quarantine, settlement)) return;
+        }
+
+        state.pending_note = state.registry.exitNote() catch {
+            settlement.flush = .failed;
+            return;
+        };
+        if (state.pending_note) |*note| {
+            session.addTaskNote(note.text) catch {
+                settlement.flush = .failed;
+                return;
+            };
+            note.deinit(self.allocator);
+            state.pending_note = null;
+            state.pending_flush = true;
+            settlement.note = .appended;
+            _ = settleTransitionFlush(state, session, durability, prior_quarantine, settlement);
+            return;
+        }
+
+        if (!prior_quarantine and durabilityIsQuarantined(durability, session)) {
+            settlement.flush = .indeterminate;
+        }
+    }
+
+    fn shutdownForTransition(self: *Owner) ShutdownState {
+        if (self.registry == null) return .no_tasks;
+        self.shutdown() catch |err| return if (err == error.Reentrant) .failed else .partial;
+        return .complete;
     }
 
     fn finishNotes(self: *Owner, session: *Session) FinishError!void {
@@ -393,6 +524,40 @@ fn flushFinish(seam: ?Loop.SeamHook, session: *const Session) FinishError!void {
     };
 }
 
+fn settleTransitionFlush(
+    state: *TaskNotesState,
+    session: *Session,
+    durability: *SessionDurability.Owner,
+    prior_quarantine: bool,
+    settlement: *TransitionSettlement,
+) bool {
+    if (prior_quarantine) {
+        state.pending_flush = false;
+        settlement.flush = .preexisting_quarantine;
+        return true;
+    }
+
+    flushFinish(state.seam, session) catch |err| {
+        settlement.flush = if (err == error.HookIndeterminate) .indeterminate else .failed;
+        return false;
+    };
+    state.pending_flush = false;
+    settlement.flush = switch (durability.state(session)) {
+        .synchronized => .synchronized,
+        .unrecorded => .unrecorded,
+        .pending_append => .failed,
+        .quarantined => .indeterminate,
+    };
+    return settlement.flush == .synchronized or settlement.flush == .unrecorded;
+}
+
+fn durabilityIsQuarantined(durability: *SessionDurability.Owner, session: *const Session) bool {
+    return switch (durability.state(session)) {
+        .quarantined => true,
+        else => false,
+    };
+}
+
 fn mapTaskHookError(err: tool.TaskRegistry.Error) Loop.HookError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -512,6 +677,27 @@ test "owner validates and atomically forwards full Bash selection updates" {
     );
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("<new-provider>|<>|<high>", result.output);
+}
+
+test "conversation reset delegates after shutdown and rejects task-note reentry" {
+    var owner = try init(testInputs(std.testing.allocator));
+    defer owner.deinit();
+    try owner.shutdown();
+    try owner.resetConversation();
+
+    var clock: TestClock = .{};
+    var poller: TestPoller = .{};
+    var inputs = testInputs(std.testing.allocator);
+    inputs.enable_tasks = true;
+    inputs.clock = tool.TaskRegistry.Clock.from(&clock);
+    inputs.poller = tool.TaskRegistry.Poller.from(&poller);
+    var task_owner = try init(inputs);
+    defer task_owner.deinit();
+    task_owner.task_notes.?.active = true;
+    try std.testing.expectError(error.Reentrant, task_owner.resetConversation());
+    task_owner.task_notes.?.active = false;
+    try task_owner.shutdown();
+    try task_owner.resetConversation();
 }
 
 test "owner forwards allocation-free Bash effort updates and rejects callback reentry" {
@@ -704,6 +890,169 @@ test "nested finish is typed reentry and does not invalidate the outer task call
     try std.testing.expectEqual(error.Reentrant, seam.nested_error.?);
     try std.testing.expectEqual(@as(usize, 1), session.items().len);
     try owner.shutdown();
+}
+
+test "transition replacement matrix is exhaustive" {
+    const notes = [_]NoteMutation{ .none, .appended, .pending_flush_recovered };
+    const flushes = [_]FlushState{
+        .not_needed,
+        .synchronized,
+        .unrecorded,
+        .preexisting_quarantine,
+        .failed,
+        .indeterminate,
+    };
+    const shutdowns = [_]ShutdownState{ .no_tasks, .complete, .partial, .failed };
+    for ([_]bool{ false, true }) |prior_quarantine| {
+        for (notes) |note| {
+            for (flushes) |flush| {
+                for (shutdowns) |shutdown| {
+                    const settlement: TransitionSettlement = .{
+                        .note = note,
+                        .flush = flush,
+                        .shutdown = shutdown,
+                        .prior_quarantine = prior_quarantine,
+                    };
+                    const shutdown_permits = shutdown == .no_tasks or shutdown == .complete;
+                    const flush_permits = if (prior_quarantine)
+                        flush == .not_needed or flush == .preexisting_quarantine
+                    else
+                        flush == .not_needed or flush == .synchronized or flush == .unrecorded;
+                    try std.testing.expectEqual(shutdown_permits and flush_permits, settlement.permitsReplacement());
+                }
+            }
+        }
+    }
+}
+
+test "transition settlement always shuts down and retries pending flush without duplicate note" {
+    const Seam = struct {
+        const Self = @This();
+        const Mode = enum { failed, indeterminate, success };
+        mode: Mode = .failed,
+        calls: usize = 0,
+
+        pub fn call(
+            self: *Self,
+            _: *const Session,
+            kind: Loop.SeamKind,
+            next_action: bool,
+        ) Loop.HookError!void {
+            if (kind != .task_note or next_action) return error.Failed;
+            self.calls += 1;
+            return switch (self.mode) {
+                .failed => error.Failed,
+                .indeterminate => error.Indeterminate,
+                .success => {},
+            };
+        }
+    };
+    var clock: TestClock = .{};
+    var poller: TestPoller = .{};
+    var inputs = testInputs(std.testing.allocator);
+    inputs.enable_tasks = true;
+    inputs.clock = tool.TaskRegistry.Clock.from(&clock);
+    inputs.poller = tool.TaskRegistry.Poller.from(&poller);
+    var owner = try init(inputs);
+    defer owner.deinit();
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var log: ?persistence.SessionFile.Log = null;
+    const durability = try SessionDurability.Owner.create(std.testing.allocator, &log, .{});
+    defer durability.deinit();
+    var seam: Seam = .{};
+    _ = try owner.taskNotesHook(Loop.SeamHook.from(&seam));
+    owner.task_notes.?.pending_note = .{
+        .text = try std.testing.allocator.dupe(u8, "[task t1 killed at exit]"),
+    };
+
+    const failed = owner.finishForTransition(&session, durability, false);
+    try std.testing.expectEqual(NoteMutation.appended, failed.note);
+    try std.testing.expectEqual(FlushState.failed, failed.flush);
+    try std.testing.expectEqual(ShutdownState.complete, failed.shutdown);
+    try std.testing.expect(!failed.permitsReplacement());
+    try std.testing.expect(owner.registry.?.shut_down);
+    try std.testing.expectEqual(@as(usize, 1), session.items().len);
+
+    seam.mode = .success;
+    const recovered = owner.finishForTransition(&session, durability, false);
+    try std.testing.expectEqual(NoteMutation.pending_flush_recovered, recovered.note);
+    try std.testing.expectEqual(FlushState.unrecorded, recovered.flush);
+    try std.testing.expectEqual(ShutdownState.complete, recovered.shutdown);
+    try std.testing.expect(recovered.permitsReplacement());
+    try std.testing.expectEqual(@as(usize, 1), session.items().len);
+    try std.testing.expectEqual(@as(usize, 2), seam.calls);
+
+    owner.task_notes.?.pending_note = .{
+        .text = try std.testing.allocator.dupe(u8, "[task t2 killed at exit]"),
+    };
+    seam.mode = .indeterminate;
+    const indeterminate = owner.finishForTransition(&session, durability, false);
+    try std.testing.expectEqual(NoteMutation.appended, indeterminate.note);
+    try std.testing.expectEqual(FlushState.indeterminate, indeterminate.flush);
+    try std.testing.expectEqual(ShutdownState.complete, indeterminate.shutdown);
+    try std.testing.expect(!indeterminate.permitsReplacement());
+    try std.testing.expectEqual(@as(usize, 2), session.items().len);
+}
+
+test "preexisting quarantine appends once without using the unusable seam" {
+    const Seam = struct {
+        const Self = @This();
+        calls: usize = 0,
+        pub fn call(self: *Self, _: *const Session, _: Loop.SeamKind, _: bool) Loop.HookError!void {
+            self.calls += 1;
+            return error.Indeterminate;
+        }
+    };
+    var clock: TestClock = .{};
+    var poller: TestPoller = .{};
+    var inputs = testInputs(std.testing.allocator);
+    inputs.enable_tasks = true;
+    inputs.clock = tool.TaskRegistry.Clock.from(&clock);
+    inputs.poller = tool.TaskRegistry.Poller.from(&poller);
+    var owner = try init(inputs);
+    defer owner.deinit();
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var log: ?persistence.SessionFile.Log = null;
+    const durability = try SessionDurability.Owner.create(std.testing.allocator, &log, .{});
+    defer durability.deinit();
+    var seam: Seam = .{};
+    _ = try owner.taskNotesHook(Loop.SeamHook.from(&seam));
+    owner.task_notes.?.pending_note = .{
+        .text = try std.testing.allocator.dupe(u8, "[task t1 killed at exit]"),
+    };
+
+    const settlement = owner.finishForTransition(&session, durability, true);
+    try std.testing.expectEqual(NoteMutation.appended, settlement.note);
+    try std.testing.expectEqual(FlushState.preexisting_quarantine, settlement.flush);
+    try std.testing.expectEqual(ShutdownState.complete, settlement.shutdown);
+    try std.testing.expect(settlement.permitsReplacement());
+    try std.testing.expectEqual(@as(usize, 0), seam.calls);
+    try std.testing.expectEqual(@as(usize, 1), session.items().len);
+}
+
+test "transition settlement classifies reentrant work and shutdown failure" {
+    var clock: TestClock = .{};
+    var poller: TestPoller = .{};
+    var inputs = testInputs(std.testing.allocator);
+    inputs.enable_tasks = true;
+    inputs.clock = tool.TaskRegistry.Clock.from(&clock);
+    inputs.poller = tool.TaskRegistry.Poller.from(&poller);
+    var owner = try init(inputs);
+    defer owner.deinit();
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var log: ?persistence.SessionFile.Log = null;
+    const durability = try SessionDurability.Owner.create(std.testing.allocator, &log, .{});
+    defer durability.deinit();
+    owner.registry.?.callback_active = true;
+    defer owner.registry.?.callback_active = false;
+
+    const settlement = owner.finishForTransition(&session, durability, false);
+    try std.testing.expectEqual(FlushState.failed, settlement.flush);
+    try std.testing.expectEqual(ShutdownState.failed, settlement.shutdown);
+    try std.testing.expect(!settlement.permitsReplacement());
 }
 
 test "terminal indeterminate flush wins and retry does not duplicate the note" {
