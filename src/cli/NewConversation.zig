@@ -307,6 +307,13 @@ const TestConfigSource = struct {
         self.selection.publishRun(prepared);
     }
 
+    pub fn publishRunRetired(
+        self: *TestConfigSource,
+        prepared: *config.Selection.PreparedRun,
+    ) config.Selection.RetiredOverlay {
+        return self.selection.publishRunRetired(prepared);
+    }
+
     pub fn lookupPreset(self: *const TestConfigSource, name: []const u8) config.Preset.BorrowedLookup {
         for (self.plans) |*plan| if (std.mem.eql(u8, plan.name, name)) return .{ .plan = plan };
         for (self.invalid) |*invalid| if (std.mem.eql(u8, invalid.name, name)) return .{ .invalid = invalid };
@@ -325,6 +332,21 @@ const TestConfigSource = struct {
         prepared: *config.Selection.PreparedPreset,
     ) config.Selection.RetiredOverlay {
         return self.selection.publishPreset(prepared);
+    }
+
+    pub fn prepareRestore(
+        self: *const TestConfigSource,
+        metadata: config.Selection.RestoreMetadata,
+        lookup: ?*const config.Preset.Lookup,
+    ) !config.Selection.PreparedRestore {
+        return self.selection.prepareRestoreRun(metadata, lookup);
+    }
+
+    pub fn publishRestore(
+        self: *TestConfigSource,
+        prepared: *config.Selection.PreparedRestore,
+    ) config.Selection.RetiredOverlay {
+        return self.selection.publishRestoreConversation(prepared);
     }
 };
 

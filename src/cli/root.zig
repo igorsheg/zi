@@ -15,6 +15,7 @@ pub const StartupConfig = @import("StartupConfig.zig");
 pub const LocalStartup = @import("LocalStartup.zig");
 pub const ModelOrder = @import("ModelOrder.zig");
 pub const NewConversation = @import("NewConversation.zig");
+pub const ResumeConversation = @import("ResumeConversation.zig");
 pub const RunSelection = @import("RunSelection.zig");
 pub const RunLogSeam = @import("RunLogSeam.zig");
 pub const Stats = @import("Stats.zig");
@@ -226,6 +227,7 @@ test {
     _ = LocalStartup;
     _ = ModelOrder;
     _ = NewConversation;
+    _ = ResumeConversation;
     _ = RunSelection;
     _ = RunLogSeam;
     _ = Stats;

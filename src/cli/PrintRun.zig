@@ -32,6 +32,7 @@ const SessionPicker = @import("SessionPicker.zig");
 const SessionStartup = @import("SessionStartup.zig");
 const ConversationRuntime = @import("ConversationRuntime.zig");
 const NewConversation = @import("NewConversation.zig");
+const ResumeConversation = @import("ResumeConversation.zig");
 const StartupConfig = @import("StartupConfig.zig");
 const LocalStartup = @import("LocalStartup.zig");
 const OneShot = @import("OneShot.zig");
@@ -523,6 +524,13 @@ pub fn run(
         },
     });
     defer conversation.deinit();
+    const startup_privacy_failed = restored != null and
+        !conversation.durability().tightenResumedAuthority();
+    if (startup_privacy_failed) {
+        try stderr.writeAll("zi: warning: cannot append to session '");
+        try DiagnosticText.write(stderr, conversation.activePath() orelse "");
+        try stderr.writeAll("'; this run won't be recorded\n");
+    }
     if (conversation.startupWarning()) |warning| switch (warning) {
         .resume_append_unavailable => |path| {
             try stderr.writeAll("zi: warning: cannot append to session '");
@@ -810,6 +818,19 @@ pub fn run(
         .reset_sink = NewConversation.ResetSink.from(&conversation_reset),
     };
     const new_conversation_runner = NewConversation.Runner.from(&new_conversation_service);
+    var resume_reset: ResumeReset = .{ .base = &conversation_reset };
+    var resume_conversation_service: ResumeConversation.Service = .{
+        .allocator = allocator,
+        .io = io,
+        .conversation = conversation,
+        .selection = &live,
+        .tools = &tools,
+        .usage = &usage,
+        .run_log = run_log_seam,
+        .reset_sink = NewConversation.ResetSink.from(&resume_reset),
+        .cutoff_epoch_seconds = resume_cutoff,
+    };
+    const resume_conversation_runner = ResumeConversation.Runner.from(&resume_conversation_service);
     var catalog_hook: CatalogHook = .{
         .catalog_runtime = &catalog_runtime,
         .stats = &stats,
@@ -929,6 +950,7 @@ pub fn run(
                 commands.setRunSelection(&live);
                 commands.setRunLogSeam(run_log_seam);
                 commands.setNewConversation(new_conversation_runner);
+                commands.setResumeConversation(resume_conversation_runner);
                 commands.setIo(io);
                 var cooked_inputs = interactive_inputs;
                 cooked_inputs.command_gateway = commands.gateway();
@@ -955,6 +977,8 @@ pub fn run(
                 run_log_seam,
                 conversation,
                 new_conversation_runner,
+                resume_conversation_runner,
+                &resume_conversation_service,
                 theme,
                 display_columns,
                 markdown_enabled,
@@ -1179,6 +1203,79 @@ const RawMarkdownWidth = struct {
     }
 };
 
+const RawSessionPicker = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdin: std.Io.File,
+    stdout: std.Io.File,
+    writer: *std.Io.Writer,
+    now_epoch_seconds: i64,
+    display_columns: terminal_module.DisplayColumns.Policy,
+    theme: render.Theme,
+    frame: *render.Frame,
+
+    pub fn run(self: *RawSessionPicker, request: SessionPicker.Request) !SessionPicker.Outcome {
+        const outcome = try SessionPicker.run(.{
+            .allocator = self.allocator,
+            .io = self.io,
+            .stdin = self.stdin,
+            .stdout = self.stdout,
+            .writer = self.writer,
+            .entries = request.entries,
+            .now_epoch_seconds = self.now_epoch_seconds,
+            .exclude_path = request.exclude_path,
+            .write_empty = false,
+            .display_columns = self.display_columns,
+            .style = .{
+                .accent_open = self.theme.accent.open,
+                .accent_close = self.theme.accent.close,
+                .ok_open = self.theme.ok.open,
+                .ok_close = self.theme.ok.close,
+            },
+        });
+        self.frame.syncExternal(1);
+        return outcome;
+    }
+};
+
+const RawResumeReplay = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    writer: *std.Io.Writer,
+    theme: render.Theme,
+    width: *const RawMarkdownWidth,
+    show_reasoning: bool,
+    markdown_enabled: bool,
+    markdown_renderer: *render.MarkdownStreamRenderer,
+    plain_renderer: *render.PlainInteractiveRenderer,
+    frame: *render.Frame,
+
+    pub fn replay(
+        self: *RawResumeReplay,
+        session: *const agent.Session.Session,
+        tools: []const tool.Tool.Tool,
+        heading: []const u8,
+    ) !void {
+        const inputs: render.History.Inputs = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .writer = self.writer,
+            .theme = self.theme,
+            .columns = self.width.resolve(),
+            .show_reasoning = self.show_reasoning,
+            .items = session.items(),
+            .tools = tools,
+            .heading = heading,
+        };
+        if (self.markdown_enabled) {
+            try render.History.replayBrief(self.markdown_renderer, inputs);
+        } else {
+            try render.History.replayBrief(self.plain_renderer, inputs);
+        }
+        self.frame.syncExternal(1);
+    }
+};
+
 const RawPresentation = struct {
     frame: *render.Frame,
     theme: render.Theme,
@@ -1268,6 +1365,8 @@ fn runRawInteractive(
     run_log_seam: *RunLogSeam.Owner,
     conversation: *ConversationRuntime.Owner,
     new_conversation: NewConversation.Runner,
+    resume_conversation: ResumeConversation.Runner,
+    resume_service: *ResumeConversation.Service,
     theme: render.Theme,
     display_columns: terminal_module.DisplayColumns.Policy,
     markdown_enabled: bool,
@@ -1389,6 +1488,7 @@ fn runRawInteractive(
     commands.setRunSelection(live);
     commands.setRunLogSeam(run_log_seam);
     commands.setNewConversation(new_conversation);
+    commands.setResumeConversation(resume_conversation);
     var selection_picker: SelectionPicker.TerminalRunner = .{
         .allocator = allocator,
         .io = io,
@@ -1422,6 +1522,35 @@ fn runRawInteractive(
     plain_renderer.setWidthSource(.from(&markdown_width));
     plain_renderer.setShowReasoning(show_reasoning);
     defer plain_renderer.deinit();
+    var resume_picker: RawSessionPicker = .{
+        .allocator = allocator,
+        .io = io,
+        .stdin = stdin_file,
+        .stdout = stdout_file,
+        .writer = inputs_value.stdout,
+        .now_epoch_seconds = ProcessAdapters.wallEpochSeconds(io),
+        .display_columns = display_columns,
+        .theme = theme,
+        .frame = &frame,
+    };
+    var resume_replay: RawResumeReplay = .{
+        .allocator = allocator,
+        .io = io,
+        .writer = inputs_value.stdout,
+        .theme = theme,
+        .width = &markdown_width,
+        .show_reasoning = show_reasoning,
+        .markdown_enabled = markdown_enabled,
+        .markdown_renderer = &markdown_renderer,
+        .plain_renderer = &plain_renderer,
+        .frame = &frame,
+    };
+    resume_service.picker = SessionPicker.Runner.from(&resume_picker);
+    resume_service.replay_sink = ResumeConversation.ReplaySink.from(&resume_replay);
+    defer {
+        resume_service.picker = null;
+        resume_service.replay_sink = null;
+    }
     if (resumed) {
         const history_inputs: render.History.Inputs = .{
             .allocator = allocator,
@@ -1432,6 +1561,7 @@ fn runRawInteractive(
             .show_reasoning = show_reasoning,
             .items = conversation.session().items(),
             .tools = inputs_value.tools,
+            .heading = "resumed",
         };
         if (markdown_enabled) {
             try render.History.replayBrief(&markdown_renderer, history_inputs);
@@ -1968,6 +2098,16 @@ const ConversationReset = struct {
         self.marker.pending = false;
         self.tools.resetConversation() catch unreachable;
         self.session_info.resumed = false;
+    }
+};
+
+const ResumeReset = struct {
+    base: *ConversationReset,
+
+    pub fn reset(self: *ResumeReset) void {
+        self.base.marker.pending = false;
+        self.base.tools.resetConversation() catch unreachable;
+        self.base.session_info.resumed = true;
     }
 };
 

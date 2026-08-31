@@ -191,6 +191,13 @@ pub const Owner = struct {
         self.state.selection.publishRun(prepared);
     }
 
+    pub fn publishRunRetired(
+        self: *Owner,
+        prepared: *config.Selection.PreparedRun,
+    ) config.Selection.RetiredOverlay {
+        return self.state.selection.publishRunRetired(prepared);
+    }
+
     /// Returns a bounded borrowed view into the cached preset enumeration.
     /// The result is valid until Owner mutation or deinit and must not be deinitialized.
     pub fn lookupPreset(self: *const Owner, name: []const u8) config.Preset.BorrowedLookup {
@@ -209,6 +216,21 @@ pub const Owner = struct {
         prepared: *config.Selection.PreparedPreset,
     ) config.Selection.RetiredOverlay {
         return self.state.selection.publishPreset(prepared);
+    }
+
+    pub fn prepareRestore(
+        self: *const Owner,
+        metadata: config.Selection.RestoreMetadata,
+        lookup: ?*const config.Preset.Lookup,
+    ) config.Selection.Error!config.Selection.PreparedRestore {
+        return self.state.selection.prepareRestoreRun(metadata, lookup);
+    }
+
+    pub fn publishRestore(
+        self: *Owner,
+        prepared: *config.Selection.PreparedRestore,
+    ) config.Selection.RetiredOverlay {
+        return self.state.selection.publishRestoreConversation(prepared);
     }
 
     pub fn presetPlans(self: *const Owner) []const config.Preset.Plan {

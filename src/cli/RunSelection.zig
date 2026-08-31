@@ -32,6 +32,51 @@ pub const RequestedSelection = struct {
     effort_selected: bool = false,
 };
 
+pub const Intent = enum { user_persistent, session_restore };
+
+pub const RestoreRequest = struct {
+    meta: *const persistence.SessionFile.Meta,
+    selection: persistence.SessionFile.Selection,
+};
+
+pub const Request = union(enum) {
+    run: RequestedSelection,
+    preset: []const u8,
+    restore: RestoreRequest,
+};
+
+/// Product-facing reason a recorded selection could not replace the current one.
+/// Provider construction and prompt/tool mechanism errors stay behind these classes.
+pub const RestoreFailure = enum {
+    no_recorded_provider,
+    unknown_provider,
+    runtime_unavailable,
+    model_unavailable,
+    preparation_failed,
+};
+
+pub const PrepareError = error{
+    OutOfMemory,
+    Reentrant,
+    InvalidIntent,
+    PresetMissing,
+    PresetInvalid,
+    RestoreUnknownProvider,
+    RestoreRuntimeUnavailable,
+    RestoreModelUnavailable,
+    RestorePreparationFailed,
+};
+
+pub fn restoreFailure(err: PrepareError) ?RestoreFailure {
+    return switch (err) {
+        error.RestoreUnknownProvider => .unknown_provider,
+        error.RestoreRuntimeUnavailable => .runtime_unavailable,
+        error.RestoreModelUnavailable => .model_unavailable,
+        error.RestorePreparationFailed => .preparation_failed,
+        else => null,
+    };
+}
+
 pub const Built = struct {
     runtime: ProviderRuntime.Owned,
     prompt: ?PromptAssembly.OwnedPrompt,
@@ -152,6 +197,10 @@ pub const ConfigSource = struct {
     context: *anyopaque,
     prepare_fn: *const fn (*anyopaque, config.Selection.RunChange) anyerror!config.Selection.PreparedRun,
     publish_fn: *const fn (*anyopaque, *config.Selection.PreparedRun) void,
+    publish_run_retired_fn: *const fn (
+        *anyopaque,
+        *config.Selection.PreparedRun,
+    ) config.Selection.RetiredOverlay,
     lookup_preset_fn: *const fn (*anyopaque, []const u8) config.Preset.BorrowedLookup,
     prepare_preset_fn: *const fn (
         *anyopaque,
@@ -160,6 +209,15 @@ pub const ConfigSource = struct {
     publish_preset_fn: *const fn (
         *anyopaque,
         *config.Selection.PreparedPreset,
+    ) config.Selection.RetiredOverlay,
+    prepare_restore_fn: *const fn (
+        *anyopaque,
+        config.Selection.RestoreMetadata,
+        ?*const config.Preset.Lookup,
+    ) anyerror!config.Selection.PreparedRestore,
+    publish_restore_fn: *const fn (
+        *anyopaque,
+        *config.Selection.PreparedRestore,
     ) config.Selection.RetiredOverlay,
 
     pub fn prepare(self: ConfigSource, change: config.Selection.RunChange) !config.Selection.PreparedRun {
@@ -189,6 +247,21 @@ pub const ConfigSource = struct {
         return self.publish_preset_fn(self.context, prepared);
     }
 
+    pub fn prepareRestore(
+        self: ConfigSource,
+        metadata: config.Selection.RestoreMetadata,
+        lookup: ?*const config.Preset.Lookup,
+    ) !config.Selection.PreparedRestore {
+        return self.prepare_restore_fn(self.context, metadata, lookup);
+    }
+
+    pub fn publishRestore(
+        self: ConfigSource,
+        prepared: *config.Selection.PreparedRestore,
+    ) config.Selection.RetiredOverlay {
+        return self.publish_restore_fn(self.context, prepared);
+    }
+
     pub fn from(implementation: anytype) ConfigSource {
         const Pointer = @TypeOf(implementation);
         const pointer_info = @typeInfo(Pointer);
@@ -208,6 +281,14 @@ pub const ConfigSource = struct {
             fn publish(context: *anyopaque, prepared: *config.Selection.PreparedRun) void {
                 const self: *Implementation = @ptrCast(@alignCast(context));
                 self.publishRun(prepared);
+            }
+
+            fn publishRunRetired(
+                context: *anyopaque,
+                prepared: *config.Selection.PreparedRun,
+            ) config.Selection.RetiredOverlay {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.publishRunRetired(prepared);
             }
 
             fn lookupPreset(context: *anyopaque, name: []const u8) config.Preset.BorrowedLookup {
@@ -230,14 +311,34 @@ pub const ConfigSource = struct {
                 const self: *Implementation = @ptrCast(@alignCast(context));
                 return self.publishPreset(prepared);
             }
+
+            fn prepareRestore(
+                context: *anyopaque,
+                metadata: config.Selection.RestoreMetadata,
+                lookup: ?*const config.Preset.Lookup,
+            ) anyerror!config.Selection.PreparedRestore {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.prepareRestore(metadata, lookup);
+            }
+
+            fn publishRestore(
+                context: *anyopaque,
+                prepared: *config.Selection.PreparedRestore,
+            ) config.Selection.RetiredOverlay {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.publishRestore(prepared);
+            }
         };
         return .{
             .context = implementation,
             .prepare_fn = Adapter.prepare,
             .publish_fn = Adapter.publish,
+            .publish_run_retired_fn = Adapter.publishRunRetired,
             .lookup_preset_fn = Adapter.lookupPreset,
             .prepare_preset_fn = Adapter.preparePreset,
             .publish_preset_fn = Adapter.publishPreset,
+            .prepare_restore_fn = Adapter.prepareRestore,
+            .publish_restore_fn = Adapter.publishRestore,
         };
     }
 };
@@ -253,6 +354,8 @@ pub const ToolSelection = struct {
         return self.validate_fn(self.context, selection);
     }
 
+    /// Synchronous, allocation-free, non-failing, non-retaining, and
+    /// non-reentrant. The implementation may copy the scalar selection.
     pub fn publish(self: ToolSelection, selection: tool.Bash.RunSelection) void {
         self.publish_fn(self.context, selection);
     }
@@ -290,6 +393,8 @@ pub const Views = struct {
     context: *anyopaque,
     publish_fn: *const fn (*anyopaque, Derived) void,
 
+    /// Synchronous, allocation-free, non-failing, and non-reentrant. Slices
+    /// and pointers may be retained only into the newly published stable Owner.
     pub fn publish(self: Views, derived: Derived) void {
         self.publish_fn(self.context, derived);
     }
@@ -328,6 +433,93 @@ pub const Candidate = struct {
             self.session.deinit();
             self.built.deinit(self.allocator);
             self.config_run.deinit(self.allocator);
+        }
+        self.* = undefined;
+    }
+};
+
+pub const ConfigOverlay = union(enum) {
+    run: config.Selection.PreparedRun,
+    preset: config.Selection.PreparedPreset,
+    restore: config.Selection.PreparedRestore,
+
+    fn store(self: *const ConfigOverlay) config.Store {
+        return switch (self.*) {
+            .run => |*value| value.store(),
+            .preset => |*value| value.store(),
+            .restore => |*value| value.store(),
+        };
+    }
+
+    fn deinit(self: *ConfigOverlay, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .run => |*value| value.deinit(allocator),
+            .preset => |*value| value.deinit(),
+            .restore => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+
+    fn publish(self: *ConfigOverlay, source: ConfigSource) config.Selection.RetiredOverlay {
+        const retired = switch (self.*) {
+            .run => |*value| source.publish_run_retired_fn(source.context, value),
+            .preset => |*value| source.publishPreset(value),
+            .restore => |*value| source.publishRestore(value),
+        };
+        self.* = undefined;
+        return retired;
+    }
+};
+
+/// Detached provider/config/tool state. It never contains a prepared session
+/// or durability value tied to a live conversation address.
+pub const DetachedCandidate = struct {
+    owner: *Owner,
+    generation: u64,
+    allocator: std.mem.Allocator,
+    config_overlay: ConfigOverlay,
+    built: Built,
+    requested: RequestedSelection,
+    session_selection: agent.Session.Selection,
+    log_selection: persistence.SessionFile.Selection,
+    tool_selection: tool.Bash.RunSelection,
+    intent: Intent,
+    restore_outcome: ?config.Selection.RestoreOutcome,
+    owned_model_label: []u8,
+    owned_preset: ?[]u8,
+    reported_metadata: ?ai.ModelMeta.Metadata,
+    model_provenance: ModelProvenance,
+    active: bool = true,
+
+    pub fn deinit(self: *DetachedCandidate) void {
+        if (self.active) {
+            if (self.owned_preset) |value| self.allocator.free(value);
+            self.allocator.free(self.owned_model_label);
+            self.built.deinit(self.allocator);
+            self.config_overlay.deinit(self.allocator);
+        }
+        self.* = undefined;
+    }
+};
+
+/// Values displaced by detached publication. Cleanup must occur after the
+/// caller leaves its coordinated publication section.
+pub const RetiredRuntime = struct {
+    allocator: std.mem.Allocator,
+    config_overlay: config.Selection.RetiredOverlay,
+    runtime: ProviderRuntime.Owned,
+    prompt: ?PromptAssembly.OwnedPrompt,
+    candidate_model_label: []u8,
+    candidate_preset: ?[]u8,
+    active: bool = true,
+
+    pub fn deinit(self: *RetiredRuntime) void {
+        if (self.active) {
+            if (self.candidate_preset) |value| self.allocator.free(value);
+            self.allocator.free(self.candidate_model_label);
+            if (self.prompt) |*value| value.deinit(self.allocator);
+            self.runtime.deinit();
+            self.config_overlay.deinit();
         }
         self.* = undefined;
     }
@@ -636,6 +828,144 @@ pub const Owner = struct {
         };
     }
 
+    pub fn prepareDetached(
+        self: *Owner,
+        request: Request,
+        intent: Intent,
+    ) PrepareError!DetachedCandidate {
+        self.assertStable();
+        if (self.committing or self.catalog_lookup_active) return error.Reentrant;
+        if ((intent == .session_restore) != (request == .restore)) return error.InvalidIntent;
+
+        var overlay: ConfigOverlay = switch (request) {
+            .run => |requested| .{ .run = self.config_source.prepare(.{
+                .provider = requested.provider,
+                .model = requested.model,
+                .effort = requested.effort orelse config.Store.default_sentinel,
+                .exit_preset = true,
+            }) catch |err| return mapPreparationError(intent, err) },
+            .preset => |name| blk: {
+                const plan = switch (self.config_source.lookupPreset(name)) {
+                    .missing => return error.PresetMissing,
+                    .invalid => return error.PresetInvalid,
+                    .plan => |value| value,
+                };
+                break :blk .{ .preset = self.config_source.preparePreset(plan) catch |err|
+                    return mapPreparationError(intent, err) };
+            },
+            .restore => |restore| blk: {
+                const recorded_preset = restore.selection.preset;
+                var lookup_value: config.Preset.Lookup = if (recorded_preset) |name|
+                    borrowedLookup(self.config_source.lookupPreset(name))
+                else
+                    .missing;
+                const lookup = if (recorded_preset) |name| if (name.len != 0) &lookup_value else null else null;
+                break :blk .{ .restore = self.config_source.prepareRestore(.{
+                    .provider = restore.selection.provider,
+                    .model = restore.selection.model,
+                    .effort = restore.selection.effort,
+                    .preset = recorded_preset,
+                }, lookup) catch |err| return mapPreparationError(intent, err) };
+            },
+        };
+        errdefer overlay.deinit(self.allocator);
+
+        const requested_input: RequestedSelection = switch (request) {
+            .run => |value| value,
+            .preset => .{ .effort = null },
+            .restore => .{ .effort = null, .reported_metadata = .{ .replace = null } },
+        };
+        const reported_metadata = switch (requested_input.reported_metadata) {
+            .preserve => self.reported_metadata,
+            .replace => |value| value,
+        };
+        var built = self.builder.build(overlay.store(), reported_metadata) catch |err|
+            return mapPreparationError(intent, err);
+        errdefer built.deinit(self.allocator);
+
+        const provider_changed = !std.mem.eql(
+            u8,
+            built.runtime.metadata.provider_id,
+            self.runtime.metadata.provider_id,
+        );
+        const recorded_label = switch (request) {
+            .run => |value| value.model_label,
+            .preset => null,
+            .restore => |value| value.selection.model_label,
+        };
+        const model_label = self.allocator.dupe(u8, recorded_label orelse built.runtime.model) catch
+            return error.OutOfMemory;
+        errdefer self.allocator.free(model_label);
+        const preset_bytes: ?[]const u8 = switch (request) {
+            .preset => |name| name,
+            .restore => |value| switch (overlay) {
+                .restore => |prepared| if (prepared.outcome == .restored)
+                    value.selection.preset
+                else
+                    null,
+                else => unreachable,
+            },
+            .run => null,
+        };
+        const owned_preset = if (preset_bytes) |value|
+            self.allocator.dupe(u8, value) catch return error.OutOfMemory
+        else
+            null;
+        errdefer if (owned_preset) |value| self.allocator.free(value);
+
+        const session_selection: agent.Session.Selection = .{
+            .provider_id = built.runtime.metadata.provider_id,
+            .model = built.runtime.model,
+            .model_label = model_label,
+            .effort = built.runtime.effort,
+            .preset = owned_preset,
+        };
+        const log_selection: persistence.SessionFile.Selection = .{
+            .provider = session_selection.provider_id,
+            .model = session_selection.model,
+            .model_label = session_selection.model_label,
+            .effort = session_selection.effort,
+            .preset = session_selection.preset,
+        };
+        const tool_selection: tool.Bash.RunSelection = .{
+            .provider = built.runtime.metadata.provider_id,
+            .model = built.runtime.model,
+            .effort = built.runtime.effort,
+        };
+        self.tools.validate(tool_selection) catch |err| return mapPreparationError(intent, err);
+        return .{
+            .owner = self,
+            .generation = self.generation,
+            .allocator = self.allocator,
+            .config_overlay = overlay,
+            .built = built,
+            .requested = .{
+                .provider = built.runtime.metadata.provider_id,
+                .model = built.runtime.model,
+                .model_label = model_label,
+                .effort = built.runtime.effort,
+                .reported_metadata = .{ .replace = reported_metadata },
+                .model_provenance = requested_input.model_provenance,
+                .effort_selected = requested_input.effort_selected,
+            },
+            .session_selection = session_selection,
+            .log_selection = log_selection,
+            .tool_selection = tool_selection,
+            .intent = intent,
+            .restore_outcome = switch (overlay) {
+                .restore => |value| value.outcome,
+                else => null,
+            },
+            .owned_model_label = model_label,
+            .owned_preset = owned_preset,
+            .reported_metadata = reported_metadata,
+            .model_provenance = switch (requested_input.model_provenance) {
+                .inherited => if (provider_changed) .inherited else self.model_provenance,
+                .concrete, .discovered, .explicit => requested_input.model_provenance,
+            },
+        };
+    }
+
     pub fn prepare(self: *Owner, requested: RequestedSelection) !Candidate {
         self.assertStable();
         if (self.committing or self.catalog_lookup_active) return error.Reentrant;
@@ -929,6 +1259,71 @@ pub const Owner = struct {
     }
 };
 
+pub fn validateDetached(self: *Owner, candidate: *const DetachedCandidate) error{StaleCandidate}!void {
+    self.assertStable();
+    if (!candidate.active or candidate.owner != self or candidate.generation != self.generation) {
+        return error.StaleCandidate;
+    }
+}
+
+/// Publishes only detached selection state. ConversationRuntime must validate
+/// its coordinated lease before calling this function. No writer or cleanup
+/// runs here.
+pub fn publishDetached(self: *Owner, candidate: *DetachedCandidate) RetiredRuntime {
+    self.assertStable();
+    validateDetached(self, candidate) catch unreachable;
+    std.debug.assert(self.committing);
+    std.debug.assert(!self.catalog_lookup_active);
+
+    const old_config = candidate.config_overlay.publish(self.config_source);
+    const old_runtime = self.runtime;
+    const old_prompt = self.prompt;
+    self.runtime = candidate.built.runtime;
+    self.prompt = candidate.built.prompt;
+    self.image_input = candidate.built.image_input;
+    self.context_limit = candidate.built.context_limit;
+    self.sort_models = candidate.built.sort_models;
+    candidate.built.active = false;
+    self.tools.publish(candidate.tool_selection);
+    self.reported_metadata = candidate.reported_metadata;
+    self.model_provenance = candidate.model_provenance;
+    self.generation +%= 1;
+    if (self.views) |views| views.publish(self.derived());
+    candidate.active = false;
+    return .{
+        .allocator = self.allocator,
+        .config_overlay = old_config,
+        .runtime = old_runtime,
+        .prompt = old_prompt,
+        .candidate_model_label = candidate.owned_model_label,
+        .candidate_preset = candidate.owned_preset,
+    };
+}
+
+fn borrowedLookup(value: config.Preset.BorrowedLookup) config.Preset.Lookup {
+    return switch (value) {
+        .missing => .missing,
+        .invalid => |invalid| .{ .invalid = invalid.* },
+        .plan => |plan| .{ .plan = plan.* },
+    };
+}
+
+fn mapPreparationError(_: Intent, err: anyerror) PrepareError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnknownProvider, error.MissingProvider => error.RestoreUnknownProvider,
+        error.InvalidModelId, error.MissingModel => error.RestoreModelUnavailable,
+        error.ProviderUnavailable,
+        error.AdapterUnavailable,
+        error.UnsupportedWire,
+        error.MissingCredential,
+        error.InvalidAuth,
+        error.MissingSessionCacheKey,
+        => error.RestoreRuntimeUnavailable,
+        else => error.RestorePreparationFailed,
+    };
+}
+
 fn resolveSortModels(
     allocator: std.mem.Allocator,
     store: config.Store,
@@ -990,12 +1385,14 @@ const TestBuilder = struct {
     definition: *const config.ProviderDefinitions.Definition,
     transport: *TestTransport,
     metadata: *const ai.ModelMeta.Metadata,
+    failure: ?anyerror = null,
 
     pub fn build(
         self: *TestBuilder,
         store: config.Store,
         reported_metadata: ?ai.ModelMeta.Metadata,
     ) !Built {
+        if (self.failure) |err| return err;
         var runtime = try ProviderRuntime.init(.{
             .allocator = self.allocator,
             .store = store,
@@ -1028,8 +1425,10 @@ const TestTools = struct {
     effort: [ai.Effort.maximum_value_bytes]u8 = undefined,
     effort_len: usize = 0,
     publications: usize = 0,
+    fail_validation: bool = false,
 
-    pub fn validateRunSelection(_: *TestTools, selection: tool.Bash.RunSelection) !void {
+    pub fn validateRunSelection(self: *TestTools, selection: tool.Bash.RunSelection) !void {
+        if (self.fail_validation) return error.ToolPreparationFailed;
         try tool.Bash.validateRunSelection(selection);
     }
 
@@ -1126,6 +1525,7 @@ const TestConfigSource = struct {
     selection: *config.Selection,
     plans: []const config.Preset.Plan = &.{},
     invalid: []const config.Preset.Invalid = &.{},
+    lookup_override: ?config.Preset.BorrowedLookup = null,
     invalidate_preset_name_on_publish: bool = false,
 
     pub fn prepareRun(
@@ -1139,7 +1539,15 @@ const TestConfigSource = struct {
         self.selection.publishRun(prepared);
     }
 
+    pub fn publishRunRetired(
+        self: *TestConfigSource,
+        prepared: *config.Selection.PreparedRun,
+    ) config.Selection.RetiredOverlay {
+        return self.selection.publishRunRetired(prepared);
+    }
+
     pub fn lookupPreset(self: *const TestConfigSource, name: []const u8) config.Preset.BorrowedLookup {
+        if (self.lookup_override) |value| return value;
         for (self.plans) |*plan| if (std.mem.eql(u8, plan.name, name)) return .{ .plan = plan };
         for (self.invalid) |*invalid| if (std.mem.eql(u8, invalid.name, name)) return .{ .invalid = invalid };
         return .missing;
@@ -1159,6 +1567,21 @@ const TestConfigSource = struct {
         const retired = self.selection.publishPreset(prepared);
         if (self.invalidate_preset_name_on_publish) @memset(@constCast(self.plans[0].name), 'x');
         return retired;
+    }
+
+    pub fn prepareRestore(
+        self: *const TestConfigSource,
+        metadata: config.Selection.RestoreMetadata,
+        lookup: ?*const config.Preset.Lookup,
+    ) !config.Selection.PreparedRestore {
+        return self.selection.prepareRestoreRun(metadata, lookup);
+    }
+
+    pub fn publishRestore(
+        self: *TestConfigSource,
+        prepared: *config.Selection.PreparedRestore,
+    ) config.Selection.RetiredOverlay {
+        return self.selection.publishRestoreConversation(prepared);
     }
 };
 
@@ -1711,4 +2134,242 @@ test "commit publishes first and maps persistence outcomes without rollback" {
     try std.testing.expect(writer.valid);
     try std.testing.expectEqualStrings("high", rig.live.current().effort.?);
     try std.testing.expectEqual(@as(usize, 3), writer.calls);
+}
+
+const CountingStateWriter = struct {
+    calls: usize = 0,
+
+    fn write(
+        context: *anyopaque,
+        _: config.StateWriter.Selection,
+    ) error{OutOfMemory}!config.StateWriter.Outcome {
+        const self: *CountingStateWriter = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        return .written;
+    }
+
+    fn writer(self: *CountingStateWriter) config.StateWriter.Writer {
+        return .{ .context = self, .write_fn = write };
+    }
+};
+
+fn restoreMeta(preset: ?[]u8) persistence.SessionFile.Meta {
+    return .{ .selection = .{ .preset = preset } };
+}
+
+fn restoreSelection() persistence.SessionFile.Selection {
+    return restoreSelectionWithPreset(null);
+}
+
+fn restoreSelectionWithPreset(preset: ?[]const u8) persistence.SessionFile.Selection {
+    return .{
+        .provider = "selection-test",
+        .model = "recorded-model",
+        .model_label = "Recorded model",
+        .effort = "high",
+        .preset = preset,
+    };
+}
+
+test "detached restore classifies full and every core-only preset outcome" {
+    var rig = try TestRig.init(std.testing.allocator);
+    defer rig.deinit();
+    rig.stabilize();
+    const plan: config.Preset.Plan = .{
+        .name = @constCast("review"),
+        .provider = @constCast("selection-test"),
+        .model = .{ .value = @constCast("preset-model") },
+        .effort = .{ .value = @constCast("high") },
+        .system_prompt = .{},
+        .system_prompt_append = .{},
+        .tint = .{},
+        .description = .{},
+    };
+    const invalid: config.Preset.Invalid = .{
+        .name = @constCast("broken"),
+        .field = null,
+        .reason = .missing_provider,
+    };
+
+    var full_meta = restoreMeta(@constCast("review"));
+    rig.config_source.lookup_override = .{ .plan = &plan };
+    var full = try rig.live.prepareDetached(.{ .restore = .{
+        .meta = &full_meta,
+        .selection = restoreSelectionWithPreset("review"),
+    } }, .session_restore);
+    defer full.deinit();
+    try std.testing.expectEqual(config.Selection.RestoreOutcome.restored, full.restore_outcome.?);
+    try std.testing.expectEqualStrings("preset-model", full.session_selection.model.?);
+    try std.testing.expectEqualStrings("review", full.session_selection.preset.?);
+
+    const cases = [_]struct {
+        preset: ?[]u8,
+        lookup: ?config.Preset.BorrowedLookup,
+        outcome: config.Selection.RestoreOutcome,
+    }{
+        .{ .preset = null, .lookup = null, .outcome = .no_preset },
+        .{ .preset = @constCast("missing"), .lookup = .missing, .outcome = .missing_preset },
+        .{ .preset = @constCast("broken"), .lookup = .{ .invalid = &invalid }, .outcome = .invalid_preset },
+        .{ .preset = @constCast("other"), .lookup = .{ .plan = &plan }, .outcome = .mismatched_preset },
+    };
+    for (cases) |case| {
+        var meta = restoreMeta(@constCast("stale-header-preset"));
+        rig.config_source.lookup_override = case.lookup;
+        var candidate = try rig.live.prepareDetached(.{ .restore = .{
+            .meta = &meta,
+            .selection = restoreSelectionWithPreset(case.preset),
+        } }, .session_restore);
+        defer candidate.deinit();
+        try std.testing.expectEqual(case.outcome, candidate.restore_outcome.?);
+        try std.testing.expectEqualStrings("selection-test", candidate.session_selection.provider_id.?);
+        try std.testing.expectEqualStrings("recorded-model", candidate.session_selection.model.?);
+        try std.testing.expectEqualStrings("high", candidate.session_selection.effort.?);
+        try std.testing.expect(candidate.session_selection.preset == null);
+    }
+}
+
+test "restore preparation maps provider runtime model prompt and tool failures without mutation" {
+    var rig = try TestRig.init(std.testing.allocator);
+    defer rig.deinit();
+    rig.stabilize();
+    var meta = restoreMeta(null);
+    const request: Request = .{ .restore = .{ .meta = &meta, .selection = restoreSelection() } };
+    const cases = [_]struct { err: anyerror, failure: RestoreFailure }{
+        .{ .err = error.UnknownProvider, .failure = .unknown_provider },
+        .{ .err = error.AdapterUnavailable, .failure = .runtime_unavailable },
+        .{ .err = error.MissingModel, .failure = .model_unavailable },
+        .{ .err = error.PromptPreparationFailed, .failure = .preparation_failed },
+    };
+    for (cases) |case| {
+        rig.builder.failure = case.err;
+        const result = rig.live.prepareDetached(request, .session_restore);
+        if (result) |candidate_value| {
+            var candidate = candidate_value;
+            candidate.deinit();
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expectEqual(case.failure, restoreFailure(err).?);
+        }
+        try std.testing.expectEqual(@as(u64, 0), rig.live.generation);
+        try std.testing.expectEqualStrings("old-model", rig.live.snapshot().model);
+    }
+    rig.builder.failure = null;
+    rig.tools.fail_validation = true;
+    const result = rig.live.prepareDetached(request, .session_restore);
+    if (result) |candidate_value| {
+        var candidate = candidate_value;
+        candidate.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(RestoreFailure.preparation_failed, restoreFailure(err).?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), rig.tools.publications);
+}
+
+test "detached restore publication skips StateWriter and retires cleanup ownership" {
+    var observer: PublicationObserver = .{ .backing = std.testing.allocator };
+    var rig = try TestRig.init(observer.allocator());
+    defer rig.deinit();
+    rig.stabilize();
+    var writer: CountingStateWriter = .{};
+    rig.live.state_writer = writer.writer();
+    var meta = restoreMeta(null);
+    var candidate = try rig.live.prepareDetached(.{ .restore = .{
+        .meta = &meta,
+        .selection = restoreSelection(),
+    } }, .session_restore);
+    defer if (candidate.active) candidate.deinit();
+    const frees_before = observer.frees;
+    try validateDetached(&rig.live, &candidate);
+    rig.live.committing = true;
+    var retired = publishDetached(&rig.live, &candidate);
+    rig.live.committing = false;
+    try std.testing.expectEqual(frees_before, observer.frees);
+    try std.testing.expectEqual(@as(usize, 0), writer.calls);
+    try std.testing.expectEqual(@as(usize, 1), rig.tools.publications);
+    try std.testing.expectEqualStrings("recorded-model", rig.live.snapshot().model);
+    try std.testing.expectEqualStrings("recorded-model", rig.views.model.?);
+    try std.testing.expectEqualStrings(rig.live.snapshot().system_prompt, rig.views.prompt.?);
+    retired.deinit();
+    try std.testing.expect(observer.frees > frees_before);
+    try std.testing.expectEqualStrings("recorded-model", rig.views.model.?);
+}
+
+test "detached run and preset overlays retire every publication owner" {
+    var rig = try TestRig.init(std.testing.allocator);
+    defer rig.deinit();
+    rig.stabilize();
+
+    var run = try rig.live.prepareDetached(.{ .run = .{
+        .model = "run-model",
+        .model_label = "Run model",
+        .effort = "high",
+    } }, .user_persistent);
+    rig.live.committing = true;
+    var retired_run = publishDetached(&rig.live, &run);
+    rig.live.committing = false;
+    retired_run.deinit();
+    try std.testing.expectEqualStrings("run-model", rig.live.snapshot().model);
+
+    const plan: config.Preset.Plan = .{
+        .name = @constCast("review"),
+        .provider = @constCast("selection-test"),
+        .model = .{ .value = @constCast("preset-model") },
+        .effort = .{ .value = @constCast("low") },
+        .system_prompt = .{},
+        .system_prompt_append = .{},
+        .tint = .{},
+        .description = .{},
+    };
+    rig.config_source.plans = &.{plan};
+    var preset = try rig.live.prepareDetached(.{ .preset = "review" }, .user_persistent);
+    rig.live.committing = true;
+    var retired_preset = publishDetached(&rig.live, &preset);
+    rig.live.committing = false;
+    retired_preset.deinit();
+    try std.testing.expectEqualStrings("preset-model", rig.live.snapshot().model);
+    try std.testing.expectEqual(@as(usize, 2), rig.tools.publications);
+}
+
+test "stale detached generation rejects before publication" {
+    var rig = try TestRig.init(std.testing.allocator);
+    defer rig.deinit();
+    rig.stabilize();
+    var meta = restoreMeta(null);
+    var candidate = try rig.live.prepareDetached(.{ .restore = .{
+        .meta = &meta,
+        .selection = restoreSelection(),
+    } }, .session_restore);
+    defer candidate.deinit();
+    rig.live.generation +%= 1;
+    try std.testing.expectError(error.StaleCandidate, validateDetached(&rig.live, &candidate));
+    try std.testing.expectEqualStrings("old-model", rig.live.snapshot().model);
+    try std.testing.expectEqual(@as(usize, 0), rig.tools.publications);
+}
+
+fn exerciseDetachedRestoreAllocationFailures(allocator: std.mem.Allocator) !void {
+    var rig = try TestRig.init(allocator);
+    defer rig.deinit();
+    rig.stabilize();
+    var meta = restoreMeta(null);
+    var candidate = rig.live.prepareDetached(.{ .restore = .{
+        .meta = &meta,
+        .selection = restoreSelection(),
+    } }, .session_restore) catch |err| {
+        try std.testing.expectEqualStrings("old-model", rig.live.snapshot().model);
+        try std.testing.expectEqual(@as(u64, 0), rig.live.generation);
+        try std.testing.expectEqual(@as(usize, 0), rig.tools.publications);
+        return err;
+    };
+    candidate.deinit();
+    try std.testing.expectEqualStrings("old-model", rig.live.snapshot().model);
+    try std.testing.expectEqual(@as(u64, 0), rig.live.generation);
+}
+
+test "detached cancellation and OOM leave live selection unchanged" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseDetachedRestoreAllocationFailures,
+        .{},
+    );
 }

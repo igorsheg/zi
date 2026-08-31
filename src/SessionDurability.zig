@@ -447,6 +447,23 @@ pub const Owner = struct {
         return retired;
     }
 
+    /// Runs after coordinated resume publication. On failure, closes the
+    /// selected log and leaves a genuine unrecorded authority so turns continue.
+    pub fn tightenResumedAuthority(self: *Owner) bool {
+        switch (self.authority) {
+            .unrecorded => return true,
+            .quarantined => return false,
+            .active => |*log| log.tightenPrivate() catch {
+                var dropped = log.*;
+                self.authority = .unrecorded;
+                self.generation +%= 1;
+                dropped.deinit();
+                return false;
+            },
+        }
+        return true;
+    }
+
     /// Quarantine keeps the logger and its lifetime lock owned until adoption
     /// or shutdown. The first reason is retained.
     pub fn quarantine(self: *Owner, reason: QuarantineReason) void {
@@ -846,6 +863,10 @@ fn failSync(_: std.Io, _: std.Io.File) error{IoFailure}!void {
     return error.IoFailure;
 }
 
+fn failPermissions(_: std.Io, _: std.Io.File) error{IoFailure}!void {
+    return error.IoFailure;
+}
+
 const FreeObserver = struct {
     backing: std.mem.Allocator,
     allocations: usize = 0,
@@ -1040,6 +1061,44 @@ test "memory behind high water quarantines without appending" {
     const outcome = owner.reconcile(&session);
     try std.testing.expectEqual(QuarantineReason.high_water_diverged, outcome.quarantined);
     try std.testing.expectEqual(@as(u64, 1), owner.generationValue());
+}
+
+test "failed resumed privacy verification drops authority after commit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fmt.allocPrint(allocator, "{s}/resume.jsonl", .{root});
+    defer allocator.free(path);
+    const fixture =
+        "{\"type\":\"session\",\"version\":1}\n" ++
+        "{\"kind\":\"user\",\"text\":\"kept\"}\n";
+    const file = try std.Io.Dir.createFile(.cwd(), io, path, .{});
+    try file.writeStreamingAll(io, fixture);
+    file.close(io);
+
+    var resumed = try persistence.SessionFile.loadLockedForResume(allocator, io, path, .{});
+    defer resumed.loaded.deinit();
+    var log: ?persistence.SessionFile.Log = resumed.log;
+    const owner = try Owner.create(allocator, &log, .{});
+    defer owner.deinit();
+    var session = try agent.Session.Session.init(allocator, .{});
+    defer session.deinit();
+    const item: ai.Item.Item = .{ .user_message = .{ .text = @constCast("kept") } };
+    try session.appendCopy(&item);
+    owner.activeLog().set_permissions_fn = failPermissions;
+
+    try std.testing.expect(!owner.tightenResumedAuthority());
+    try std.testing.expectEqual(State.unrecorded, owner.state(&session));
+    try std.testing.expect(owner.activePath() == null);
+    try owner.seamHook().call(&session, .completion, false);
+
+    const reopened = try std.Io.Dir.openFile(.cwd(), io, path, .{ .mode = .read_only });
+    defer reopened.close(io);
+    try std.testing.expect(try reopened.tryLock(io, .exclusive));
+    reopened.unlock(io);
 }
 
 test "adoption replaces quarantine and retires the held authority" {

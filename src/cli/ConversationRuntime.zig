@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent = @import("../agent/root.zig");
+const config = @import("../config/root.zig");
 const persistence = @import("../persistence/root.zig");
 const SessionDurability = @import("../SessionDurability.zig");
 const ToolRuntime = @import("../ToolRuntime.zig");
@@ -172,6 +173,26 @@ pub const BindError = agent.Session.Error || error{
 };
 pub const BeginPublishError = error{ Reentrant, StaleCandidate };
 
+pub const ResumeSelection = union(enum) {
+    restored,
+    core_restored: config.Selection.RestoreOutcome,
+    kept_current: RunSelection.RestoreFailure,
+};
+
+pub const ResumeRecording = enum {
+    appending,
+    unrecorded_explicit,
+    unrecorded_provider_policy,
+    unrecorded_unavailable,
+};
+
+pub const ResumeResult = struct {
+    selection: ResumeSelection,
+    recording: ResumeRecording,
+};
+
+pub const PrepareResumeError = agent.Session.Error || error{ Reentrant, StaleCandidate };
+
 pub const Owner = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -257,6 +278,22 @@ pub const Owner = struct {
 
     pub fn policy(self: *const Owner) SessionStartup.RecordingPolicy {
         return self.recording_policy;
+    }
+
+    pub fn stateRoot(self: *const Owner) ?[]const u8 {
+        return self.fresh.state_root;
+    }
+
+    pub fn cwd(self: *const Owner) []const u8 {
+        return self.fresh.cwd;
+    }
+
+    pub fn sessionLimits(self: *const Owner) agent.Session.Limits {
+        return self.fresh.session_limits;
+    }
+
+    pub fn fileLimits(self: *const Owner) persistence.SessionFile.Limits {
+        return self.fresh.file_limits;
     }
 
     pub fn startupMeta(self: *const Owner) ?*const persistence.SessionFile.Meta {
@@ -374,6 +411,94 @@ pub const Owner = struct {
         };
         replacement_log = null;
         return result;
+    }
+
+    /// Consumes detached resume values on success. No live-owner preparation
+    /// is created until bindResume runs after task settlement.
+    // ziglint-ignore: Z015
+    pub fn prepareResume(
+        self: *Owner,
+        selection: *RunSelection.Owner,
+        entry: EntryState,
+        replacement: *agent.Session.Session,
+        replacement_log: *?persistence.SessionFile.Log,
+        identity: *SessionStartup.Identity,
+        meta: *?persistence.SessionFile.Meta,
+        recovery: ?persistence.SessionFile.Recovery,
+        index_recovery: ?persistence.SessionIndex.Recovery,
+        detached: *?RunSelection.DetachedCandidate,
+        result: ResumeResult,
+    ) PrepareResumeError!ResumeCandidate {
+        if (self.phase != .idle or self.issued_authorization_nonce != null) return error.Reentrant;
+        const prepared_guard = self.currentGuard(selection);
+        if (entry.guard.conversation != prepared_guard.conversation or
+            entry.guard.session_history != prepared_guard.session_history or
+            entry.guard.session_selection != prepared_guard.session_selection or
+            entry.guard.run_selection != prepared_guard.run_selection)
+        {
+            return error.StaleCandidate;
+        }
+        if (detached.*) |*value| try RunSelection.validateDetached(selection, value);
+        try replacement.reconfigureLimits(self.fresh.session_limits);
+        const candidate: ResumeCandidate = .{
+            .owner = self,
+            .selection = selection,
+            .entry = entry,
+            .replacement = replacement.*,
+            .replacement_log = replacement_log.*,
+            .identity = identity.*,
+            .meta = meta.*,
+            .recovery = recovery,
+            .index_recovery = index_recovery,
+            .detached = detached.*,
+            .result = result,
+        };
+        replacement.* = undefined;
+        replacement_log.* = null;
+        identity.* = undefined;
+        meta.* = null;
+        detached.* = null;
+        return candidate;
+    }
+
+    // ziglint-ignore: Z015
+    pub fn bindResume(
+        self: *Owner,
+        selection: *RunSelection.Owner,
+        candidate: *ResumeCandidate,
+        final_guard: Guard,
+        settlement: ToolRuntime.TransitionSettlement,
+    ) BindError!void {
+        if (!candidate.active or candidate.owner != self or candidate.selection != selection or candidate.bound) {
+            return error.StaleCandidate;
+        }
+        if (candidate.detached) |*value| RunSelection.validateDetached(selection, value) catch
+            return error.StaleCandidate;
+        try self.validateAuthorization(
+            selection,
+            candidate,
+            candidate.entry,
+            final_guard,
+            .@"resume",
+            settlement,
+        );
+        var prepared_session = try self.session_value.prepareReplacement(&candidate.replacement);
+        errdefer prepared_session.deinit();
+        var prepared_adoption = self.durability_value.prepareAdoption(&candidate.replacement_log) catch
+            return error.StaleCandidate;
+        errdefer prepared_adoption.deinit();
+        candidate.prepared_session = prepared_session;
+        candidate.prepared_adoption = prepared_adoption;
+        candidate.bound = true;
+        try self.bindAuthorization(
+            selection,
+            candidate,
+            &candidate.authorization,
+            candidate.entry,
+            final_guard,
+            .@"resume",
+            settlement,
+        );
     }
 
     /// Acknowledges exactly the one preset publication anticipated by a
@@ -610,6 +735,37 @@ pub const NewCandidate = struct {
     }
 };
 
+pub const ResumeCandidate = struct {
+    owner: *Owner,
+    selection: *RunSelection.Owner,
+    entry: EntryState,
+    replacement: agent.Session.Session,
+    replacement_log: ?persistence.SessionFile.Log,
+    identity: SessionStartup.Identity,
+    meta: ?persistence.SessionFile.Meta,
+    recovery: ?persistence.SessionFile.Recovery,
+    index_recovery: ?persistence.SessionIndex.Recovery,
+    detached: ?RunSelection.DetachedCandidate,
+    result: ResumeResult,
+    prepared_session: ?agent.Session.PreparedReplacement = null,
+    prepared_adoption: ?SessionDurability.PreparedAdoption = null,
+    authorization: ?PublicationAuthorization = null,
+    bound: bool = false,
+    active: bool = true,
+
+    pub fn deinit(self: *ResumeCandidate) void {
+        if (self.active) {
+            if (self.authorization) |*value| self.owner.cancelAuthorization(value);
+            if (self.prepared_adoption) |*value| value.deinit() else if (self.replacement_log) |*value| value.deinit();
+            if (self.prepared_session) |*value| value.deinit() else if (!self.bound) self.replacement.deinit();
+            self.identity.deinit(self.owner.allocator);
+            if (self.meta) |*value| value.deinit(self.owner.allocator);
+            if (self.detached) |*value| value.deinit();
+        }
+        self.* = undefined;
+    }
+};
+
 pub const Retired = struct {
     allocator: std.mem.Allocator,
     session: agent.Session.Retired,
@@ -632,6 +788,66 @@ pub const Retired = struct {
         self.* = undefined;
     }
 };
+
+pub const ResumeRetired = struct {
+    conversation: Retired,
+    runtime: ?RunSelection.RetiredRuntime,
+    result: ResumeResult,
+    active: bool = true,
+
+    pub fn deinit(self: *ResumeRetired) void {
+        if (self.active) {
+            self.conversation.deinit();
+            if (self.runtime) |*value| value.deinit();
+        }
+        self.* = undefined;
+    }
+};
+
+pub fn publishResume(lease: *PublishLease, candidate: *ResumeCandidate) ResumeRetired {
+    std.debug.assert(lease.active);
+    const authorization = lease.authorization;
+    const owner = authorization.owner;
+    std.debug.assert(owner.phase == .publishing);
+    std.debug.assert(authorization.transition == .@"resume");
+    std.debug.assert(authorization.candidate_address == @as(*anyopaque, @ptrCast(candidate)));
+    std.debug.assert(authorization.nonce == owner.consumed_authorization_nonce);
+    std.debug.assert(candidate.active);
+    std.debug.assert(candidate.bound);
+    std.debug.assert(guardEqual(authorization.final_guard, owner.currentGuard(authorization.selection)));
+
+    const retired_runtime = if (candidate.detached) |*value|
+        RunSelection.publishDetached(authorization.selection, value)
+    else
+        null;
+    const retired_session = owner.session_value.publishReplacement(&candidate.prepared_session.?);
+    const retired_authority = owner.durability_value.publishAdoption(&candidate.prepared_adoption.?);
+    const retired: Retired = .{
+        .allocator = owner.allocator,
+        .session = retired_session,
+        .authority = retired_authority,
+        .identity = owner.identity,
+        .meta = owner.startup_meta,
+        .recovery = owner.startup_recovery,
+        .index_recovery = owner.startup_index_recovery,
+        .warning = owner.startup_warning,
+    };
+    owner.identity = candidate.identity;
+    owner.startup_meta = candidate.meta;
+    owner.startup_recovery = candidate.recovery;
+    owner.startup_index_recovery = candidate.index_recovery;
+    owner.startup_warning = null;
+    owner.generation_value +%= 1;
+    authorization.selection.committing = false;
+    owner.phase = .idle;
+    candidate.active = false;
+    lease.active = false;
+    return .{
+        .conversation = retired,
+        .runtime = retired_runtime,
+        .result = candidate.result,
+    };
+}
 
 pub fn publishNew(lease: *PublishLease, candidate: *NewCandidate) Retired {
     std.debug.assert(lease.active);
@@ -722,9 +938,12 @@ test {
     _ = Owner.create;
     _ = Owner.prepareNew;
     _ = Owner.bindNew;
+    _ = Owner.prepareResume;
+    _ = Owner.bindResume;
     _ = Owner.bindAuthorization;
     _ = Owner.beginPublish;
     _ = publishNew;
+    _ = publishResume;
 }
 
 test "recording policy permits mock only when explicitly enabled" {
@@ -896,6 +1115,79 @@ test "plain new publishes once, preserves addresses, and keeps unrecorded contin
     try std.testing.expect(owner.durability().state(owner.session()) == .unrecorded);
     try std.testing.expectEqual(@as(u64, 1), owner.generation());
     try std.testing.expectEqualStrings("old history", retired.session.session.items()[1].user_message.text);
+}
+
+test "unrecorded resume publishes history and active path at stable owner addresses" {
+    const allocator = std.testing.allocator;
+    var startup: SessionStartup.Candidate = .{
+        .allocator = allocator,
+        .session = try agent.Session.Session.init(allocator, .{ .provider_id = "p", .model = "m" }),
+        .log = null,
+        .identity = .{ .origin = .fresh },
+        .meta = null,
+        .recovery = null,
+        .index_recovery = null,
+        .warning = null,
+    };
+    defer if (startup.active) startup.deinit();
+    const owner = try Owner.create(allocator, &startup, .{
+        .io = std.testing.io,
+        .recording_policy = .disabled,
+        .fresh = .{
+            .state_root = null,
+            .cwd = "/work",
+            .writer_version = "test",
+            .timestamp_provider = .{ .next_fn = fixedTimestamp },
+            .uuid_provider = .{ .next_fn = fixedUuid },
+        },
+    });
+    defer owner.deinit();
+    var selection = testSelection();
+    const session_address = owner.session();
+    const durability_address = owner.durability();
+    const entry = owner.captureEntryState(&selection);
+    var replacement = try agent.Session.Session.init(allocator, .{ .provider_id = "p", .model = "m" });
+    try replacement.addUser("restored history");
+    var replacement_log: ?persistence.SessionFile.Log = null;
+    var identity: SessionStartup.Identity = .{
+        .active_path = try allocator.dupe(u8, "/state/selected.jsonl"),
+        .id = try allocator.dupe(u8, "selected"),
+        .origin = .resumed,
+    };
+    var meta: ?persistence.SessionFile.Meta = null;
+    var detached: ?RunSelection.DetachedCandidate = null;
+    var candidate = try owner.prepareResume(
+        &selection,
+        entry,
+        &replacement,
+        &replacement_log,
+        &identity,
+        &meta,
+        .{},
+        .{},
+        &detached,
+        .{
+            .selection = .{ .kept_current = .runtime_unavailable },
+            .recording = .unrecorded_explicit,
+        },
+    );
+    defer if (candidate.active) candidate.deinit();
+    try owner.bindResume(
+        &selection,
+        &candidate,
+        owner.captureEntryState(&selection).guard,
+        testSettlement(),
+    );
+    var lease = try owner.beginPublish(&candidate.authorization.?);
+    var retired = publishResume(&lease, &candidate);
+    defer retired.deinit();
+
+    try std.testing.expectEqual(session_address, owner.session());
+    try std.testing.expectEqual(durability_address, owner.durability());
+    try std.testing.expectEqualStrings("/state/selected.jsonl", owner.activePath().?);
+    try std.testing.expectEqualStrings("restored history", owner.session().items()[1].user_message.text);
+    try std.testing.expect(owner.durability().state(owner.session()) == .unrecorded);
+    try std.testing.expect(retired.result.selection == .kept_current);
 }
 
 test "active new keeps the old log resumable and prepares the next log lazily" {

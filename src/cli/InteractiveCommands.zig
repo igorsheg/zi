@@ -5,6 +5,7 @@ const text = @import("../text/root.zig");
 const DiagnosticText = @import("DiagnosticText.zig");
 const Interactive = @import("Interactive.zig");
 const NewConversation = @import("NewConversation.zig");
+const ResumeConversation = @import("ResumeConversation.zig");
 const ProviderConfig = @import("../ProviderConfig.zig");
 const RunSelection = @import("RunSelection.zig");
 const RunLogSeam = @import("RunLogSeam.zig");
@@ -65,6 +66,11 @@ const specs = [_]Slash.Spec{
         .handler_fn = runNew,
     },
     .{
+        .name = "resume",
+        .summary = "resume a previous conversation",
+        .handler_fn = runResume,
+    },
+    .{
         .name = "provider",
         .summary = "switch provider, then model and effort",
         .display = .managed,
@@ -109,6 +115,7 @@ pub const Owner = struct {
     listing_tick: ?ai.Provider.Tick = null,
     selection_picker: ?SelectionPicker.Runner = null,
     new_conversation: ?NewConversation.Runner = null,
+    resume_conversation: ?ResumeConversation.Runner = null,
     persistence_warning_written: bool = false,
 
     pub fn init(
@@ -161,6 +168,10 @@ pub const Owner = struct {
 
     pub fn setNewConversation(self: *Owner, runner: NewConversation.Runner) void {
         self.new_conversation = runner;
+    }
+
+    pub fn setResumeConversation(self: *Owner, runner: ResumeConversation.Runner) void {
+        self.resume_conversation = runner;
     }
 
     pub fn gateway(self: *Owner) Interactive.CommandGateway {
@@ -465,6 +476,84 @@ fn runNew(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
     }
 }
 
+fn runResume(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
+    const self: *Owner = @ptrCast(@alignCast(context));
+    if (self.frame == null) {
+        try self.writeNote("/resume requires an interactive terminal");
+        return .handled;
+    }
+    const runner = self.resume_conversation orelse return .handled;
+    switch (runner.run()) {
+        .changed => |changed| {
+            try writeResumeWarnings(self, changed);
+            runner.replay();
+            return .history_changed;
+        },
+        .unchanged => |reason| {
+            switch (reason) {
+                .no_candidates => try self.writeNote("no past conversations in this directory"),
+                .canceled => {},
+                .could_not_read => try self.writeError("could not read session"),
+                .reconcile_retryable => try self.writeError(
+                    "couldn't finish recording the current conversation; try /resume again",
+                ),
+                .reconcile_quarantined => try self.writeError(
+                    "the current conversation became unrecordable; it was not resumed",
+                ),
+                .preparation => try self.writeError("could not read session"),
+            }
+            return .handled;
+        },
+        .partial => |reason| {
+            switch (reason) {
+                .settlement => |settlement| switch (settlement.shutdown) {
+                    .partial, .failed => try self.writeError(
+                        "couldn't stop every background task; the current conversation was not replaced",
+                    ),
+                    .no_tasks, .complete => try self.writeError(
+                        "couldn't finish the current conversation safely; it was not replaced",
+                    ),
+                },
+                .binding, .publication => try self.writeError(
+                    "the conversation changed while /resume was committing; the current history remains active",
+                ),
+            }
+            return .handled;
+        },
+    }
+}
+
+fn writeResumeWarnings(self: *Owner, changed: ResumeConversation.Changed) !void {
+    switch (changed.result.selection) {
+        .restored => {},
+        .core_restored => |outcome| try self.writeDiagnosticNote(switch (outcome) {
+            .no_preset => "the session had no recorded preset; restored provider, model, and effort",
+            .missing_preset => "the recorded preset is missing; restored provider, model, and effort",
+            .invalid_preset => "the recorded preset is invalid; restored provider, model, and effort",
+            .mismatched_preset => "the recorded preset no longer matches; restored provider, model, and effort",
+            .restored => unreachable,
+        }),
+        .kept_current => try self.writeDiagnosticNote(
+            "couldn't restore the recorded selection; staying on the current provider, model, and effort",
+        ),
+    }
+    switch (changed.result.recording) {
+        .appending => {},
+        .unrecorded_explicit => try self.writeDiagnosticNote(
+            "session recording is disabled; resumed history will not be recorded",
+        ),
+        .unrecorded_provider_policy => try self.writeDiagnosticNote(
+            "the restored provider disables automatic session recording; resumed history will not be recorded",
+        ),
+        .unrecorded_unavailable => try self.writeDiagnosticNote(
+            "could not append to the selected session; resumed history will not be recorded",
+        ),
+    }
+    if (changed.old_branch_incomplete) try self.writeDiagnosticNote(
+        "the previous conversation was already unrecordable; its final state may be incomplete",
+    );
+}
+
 fn runProvider(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
     const self: *Owner = @ptrCast(@alignCast(context));
     const live = self.run_selection orelse return .handled;
@@ -512,7 +601,7 @@ fn runProvider(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome
         }
     }
     if (std.mem.eql(u8, selected_provider.id, before.provider)) {
-        return runModel(context, .{ .spec = &specs[2], .argument = null });
+        return runModel(context, .{ .spec = &specs[3], .argument = null });
     }
 
     var prospective = live.prepareProviderListing(selected_provider.id) catch {
@@ -1009,6 +1098,23 @@ fn executeTestCommand(owner: *Owner, line: []const u8) !Interactive.CommandOutco
     };
 }
 
+const FakeResumeRunner = struct {
+    outcome: ResumeConversation.Outcome,
+    calls: usize = 0,
+    replay_calls: usize = 0,
+    replay_writer: ?*std.Io.Writer = null,
+
+    pub fn run(self: *FakeResumeRunner) ResumeConversation.Outcome {
+        self.calls += 1;
+        return self.outcome;
+    }
+
+    pub fn replay(self: *FakeResumeRunner) void {
+        self.replay_calls += 1;
+        if (self.replay_writer) |writer| writer.writeAll("replay\n") catch unreachable;
+    }
+};
+
 const FakeNewRunner = struct {
     outcome: NewConversation.Outcome,
     calls: usize = 0,
@@ -1020,6 +1126,51 @@ const FakeNewRunner = struct {
         return self.outcome;
     }
 };
+
+test "resume rejects arguments and cooked mode never invokes its runner" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+    var runner: FakeResumeRunner = .{ .outcome = .{ .unchanged = .canceled } };
+    owner.setResumeConversation(ResumeConversation.Runner.from(&runner));
+
+    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/resume extra"));
+    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/resume"));
+    try std.testing.expectEqual(@as(usize, 0), runner.calls);
+    try std.testing.expectEqualStrings(
+        "/resume takes no arguments.\n/resume requires an interactive terminal\n",
+        output.written(),
+    );
+}
+
+test "resume writes selection and recording warnings before advisory replay" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var frame = render.Frame.init(&output.writer);
+    var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+    owner.setFrame(&frame);
+    var runner: FakeResumeRunner = .{
+        .outcome = .{ .changed = .{
+            .result = .{
+                .selection = .{ .core_restored = .missing_preset },
+                .recording = .unrecorded_unavailable,
+            },
+            .old_branch_incomplete = false,
+        } },
+        .replay_writer = &output.writer,
+    };
+    owner.setResumeConversation(ResumeConversation.Runner.from(&runner));
+
+    try std.testing.expectEqual(.history_changed, try executeTestCommand(&owner, "/resume"));
+    try std.testing.expectEqual(@as(usize, 1), runner.calls);
+    try std.testing.expectEqual(@as(usize, 1), runner.replay_calls);
+    try std.testing.expectEqualStrings(
+        "\nthe recorded preset is missing; restored provider, model, and effort\n" ++
+            "could not append to the selected session; resumed history will not be recorded\n" ++
+            "replay\n",
+        output.written(),
+    );
+}
 
 test "new and clear forward optional presets and map only changed history" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -1097,6 +1248,7 @@ test "help lists only implemented commands and supported shortcuts" {
         "commands\n" ++
             "  /new         start a fresh conversation (optional: preset)\n" ++
             "  /clear       alias for /new\n" ++
+            "  /resume      resume a previous conversation\n" ++
             "  /provider    switch provider, then model and effort\n" ++
             "  /model       switch model, then effort\n" ++
             "  /effort      set reasoning effort\n" ++

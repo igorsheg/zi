@@ -168,6 +168,18 @@ pub const Session = struct {
     image_base64_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Error!Session {
+        var decoded_items: std.ArrayList(Item) = .empty;
+        return initAdoptingItems(allocator, options, &decoded_items);
+    }
+
+    /// Validates then moves a decoded list into a new session without copying.
+    /// The list and every nested allocation must belong to `allocator`. On
+    /// failure the caller retains full ownership. Success empties `items`.
+    pub fn initAdoptingItems(
+        allocator: std.mem.Allocator,
+        options: Options,
+        decoded_items: *std.ArrayList(Item),
+    ) Error!Session {
         const selection: Selection = .{
             .provider_id = options.provider_id,
             .model = options.model,
@@ -176,8 +188,23 @@ pub const Session = struct {
             .preset = options.preset,
         };
         try validateSelection(selection, options.limits);
+        if (decoded_items.items.len > options.limits.items) return error.TooManyItems;
+
+        var retained_bytes: usize = 0;
+        for (decoded_items.items) |item| {
+            try validateItemLimits(item, options.limits);
+            retained_bytes +|= ai.Item.retainedBytes(item);
+        }
+        const image_count = ai.Item.imageCount(decoded_items.items);
+        const image_base64_bytes = ai.Item.imageBase64Bytes(decoded_items.items);
+        if (retained_bytes > options.limits.retained_bytes) return error.RetainedDataTooLarge;
+        if (image_count > options.limits.images) return error.TooManyImages;
+        if (image_base64_bytes > options.limits.image_base64_bytes) return error.ImageDataTooLarge;
+
         var owned = try OwnedSelection.init(allocator, selection);
         errdefer owned.deinit(allocator);
+        const record = decoded_items.*;
+        decoded_items.* = .empty;
         return .{
             .allocator = allocator,
             .limits = options.limits,
@@ -186,6 +213,10 @@ pub const Session = struct {
             .model_label = owned.model_label,
             .effort = owned.effort,
             .preset = owned.preset,
+            .record = record,
+            .retained_bytes = retained_bytes,
+            .image_count = image_count,
+            .image_base64_bytes = image_base64_bytes,
         };
     }
 
@@ -1052,6 +1083,70 @@ fn completedTextTurn(allocator: std.mem.Allocator, text: []const u8) !Turn {
     try turn.consume(.{ .text_delta = text });
     try turn.consume(.{ .done = .{} });
     return turn;
+}
+
+test "adopting initialization transfers list backing and nested ownership" {
+    const allocator = std.testing.allocator;
+    var decoded: std.ArrayList(Item) = .empty;
+    try decoded.append(allocator, .{ .assistant_message = .{
+        .text = try allocator.dupe(u8, "owned"),
+    } });
+    const backing_pointer = decoded.items.ptr;
+    const text_pointer = decoded.items[0].assistant_message.text.ptr;
+
+    var session = try Session.initAdoptingItems(allocator, .{}, &decoded);
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), decoded.items.len);
+    try std.testing.expectEqual(@as(usize, 0), decoded.capacity);
+    try std.testing.expectEqual(backing_pointer, session.record.items.ptr);
+    try std.testing.expectEqual(text_pointer, session.items()[0].assistant_message.text.ptr);
+}
+
+test "adopting initialization failure preserves complete caller ownership" {
+    const allocator = std.testing.allocator;
+    var decoded: std.ArrayList(Item) = .empty;
+    defer {
+        for (decoded.items) |*item| item.deinit(allocator);
+        decoded.deinit(allocator);
+    }
+    try decoded.append(allocator, .{ .assistant_message = .{
+        .text = try allocator.dupe(u8, "four"),
+    } });
+    const backing_pointer = decoded.items.ptr;
+    const text_pointer = decoded.items[0].assistant_message.text.ptr;
+
+    try std.testing.expectError(error.RetainedDataTooLarge, Session.initAdoptingItems(
+        allocator,
+        .{ .limits = .{ .retained_bytes = 3 } },
+        &decoded,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), decoded.items.len);
+    try std.testing.expectEqual(backing_pointer, decoded.items.ptr);
+    try std.testing.expectEqual(text_pointer, decoded.items[0].assistant_message.text.ptr);
+}
+
+test "adopting initialization OOM preserves decoded items" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var decoded: std.ArrayList(Item) = .empty;
+    defer {
+        for (decoded.items) |*item| item.deinit(allocator);
+        decoded.deinit(allocator);
+    }
+    try decoded.append(allocator, .{ .assistant_message = .{
+        .text = try allocator.dupe(u8, "owned"),
+    } });
+    const backing_pointer = decoded.items.ptr;
+    failing.fail_index = failing.alloc_index;
+
+    try std.testing.expectError(error.OutOfMemory, Session.initAdoptingItems(
+        allocator,
+        .{ .provider_id = "provider" },
+        &decoded,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), decoded.items.len);
+    try std.testing.expectEqual(backing_pointer, decoded.items.ptr);
 }
 
 test "reconfigure selection owns replacement without changing items" {

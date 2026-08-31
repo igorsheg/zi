@@ -11,6 +11,37 @@ pub const Outcome = union(enum) {
     empty,
 };
 
+pub const Request = struct {
+    entries: []const persistence.SessionIndex.Entry,
+    exclude_path: ?[]const u8 = null,
+};
+
+/// Synchronous picker. Entries and paths are borrowed only for the call.
+pub const Runner = struct {
+    context: *anyopaque,
+    run_fn: *const fn (*anyopaque, Request) anyerror!Outcome,
+
+    pub fn run(self: Runner, request: Request) !Outcome {
+        return self.run_fn(self.context, request);
+    }
+
+    pub fn from(implementation: anytype) Runner {
+        const Pointer = @TypeOf(implementation);
+        const info = @typeInfo(Pointer);
+        if (info != .pointer or info.pointer.size != .one or info.pointer.is_const) {
+            @compileError("SessionPicker.Runner.from expects a mutable single-item pointer");
+        }
+        const Implementation = info.pointer.child;
+        const Adapter = struct {
+            fn runFn(context: *anyopaque, request: Request) anyerror!Outcome {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.run(request);
+            }
+        };
+        return .{ .context = implementation, .run_fn = Adapter.runFn };
+    }
+};
+
 pub const Inputs = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -20,19 +51,18 @@ pub const Inputs = struct {
     entries: []const persistence.SessionIndex.Entry,
     now_epoch_seconds: i64,
     exclude_path: ?[]const u8 = null,
+    write_empty: bool = true,
     display_columns: terminal.DisplayColumns.Policy = .auto,
     style: terminal.Picker.Style = .{},
 };
 
 pub fn run(inputs: Inputs) terminal.Picker.Error!Outcome { // ziglint-ignore: Z015
-    var visible_count: usize = 0;
-    for (inputs.entries) |entry| {
-        if (inputs.exclude_path) |excluded| if (std.mem.eql(u8, entry.path, excluded)) continue;
-        visible_count += 1;
-    }
+    const visible_count = collectVisibleIndexes(inputs.entries, inputs.exclude_path, &.{});
     if (visible_count == 0) {
-        try inputs.writer.writeAll("no past conversations in this directory\n");
-        try inputs.writer.flush();
+        if (inputs.write_empty) {
+            try inputs.writer.writeAll("no past conversations in this directory\n");
+            try inputs.writer.flush();
+        }
         return .empty;
     }
     const picker_count = @min(visible_count, maximum_sessions);
@@ -41,10 +71,10 @@ pub fn run(inputs: Inputs) terminal.Picker.Error!Outcome { // ziglint-ignore: Z0
     const temporary = arena.allocator();
     const items = temporary.alloc(terminal.Picker.Item, picker_count) catch return error.OutOfMemory;
     const entry_indexes = temporary.alloc(usize, picker_count) catch return error.OutOfMemory;
-    var item_index: usize = 0;
-    for (inputs.entries, 0..) |entry, entry_index| {
-        if (inputs.exclude_path) |excluded| if (std.mem.eql(u8, entry.path, excluded)) continue;
-        if (item_index == picker_count) break;
+    const mapped_count = collectVisibleIndexes(inputs.entries, inputs.exclude_path, entry_indexes);
+    std.debug.assert(mapped_count == visible_count);
+    for (entry_indexes, 0..) |entry_index, item_index| {
+        const entry = inputs.entries[entry_index];
         var label = persistence.SessionLabel.read(
             temporary,
             inputs.io,
@@ -61,10 +91,7 @@ pub fn run(inputs: Inputs) terminal.Picker.Error!Outcome { // ziglint-ignore: Z0
             .detail = detail,
             .description = description,
         };
-        entry_indexes[item_index] = entry_index;
-        item_index += 1;
     }
-    std.debug.assert(item_index == picker_count);
     const title = if (picker_count < visible_count)
         std.fmt.allocPrint(
             temporary,
@@ -92,6 +119,20 @@ pub fn run(inputs: Inputs) terminal.Picker.Error!Outcome { // ziglint-ignore: Z0
         .{ .selected = entry_indexes[selected_index] }
     else
         .canceled;
+}
+
+fn collectVisibleIndexes(
+    entries: []const persistence.SessionIndex.Entry,
+    exclude_path: ?[]const u8,
+    output: []usize,
+) usize {
+    var visible_count: usize = 0;
+    for (entries, 0..) |entry, entry_index| {
+        if (exclude_path) |excluded| if (std.mem.eql(u8, entry.path, excluded)) continue;
+        if (visible_count < output.len) output[visible_count] = entry_index;
+        visible_count += 1;
+    }
+    return visible_count;
 }
 
 fn formatRelativeTime(
@@ -218,4 +259,27 @@ test "provenance permits preset-only and absent values" {
     try std.testing.expectEqualStrings("[review]", value);
     var empty: persistence.SessionLabel.Label = .{};
     try std.testing.expect((try formatProvenance(std.testing.allocator, &empty)) == null);
+}
+
+test "active exclusion preserves original indexes and caps newest picker rows" {
+    var entries: [maximum_sessions + 2]persistence.SessionIndex.Entry = undefined;
+    for (&entries) |*entry| {
+        entry.* = .{
+            .name = @constCast("session.jsonl"),
+            .path = @constCast("visible"),
+            .id = null,
+            .mtime_nanoseconds = 0,
+            .meta = .{},
+        };
+    }
+    entries[1].path = @constCast("active");
+    var indexes: [maximum_sessions]usize = undefined;
+
+    try std.testing.expectEqual(
+        @as(usize, maximum_sessions + 1),
+        collectVisibleIndexes(&entries, "active", &indexes),
+    );
+    try std.testing.expectEqual(@as(usize, 0), indexes[0]);
+    try std.testing.expectEqual(@as(usize, 2), indexes[1]);
+    try std.testing.expectEqual(@as(usize, maximum_sessions), indexes[maximum_sessions - 1]);
 }

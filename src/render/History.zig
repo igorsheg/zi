@@ -7,6 +7,8 @@ const Theme = @import("Theme.zig");
 
 const interrupt_marker = "[interrupted]";
 
+pub const maximum_heading_bytes: usize = 256;
+
 pub const Inputs = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -16,11 +18,13 @@ pub const Inputs = struct {
     show_reasoning: bool,
     items: []const ai.Item.Item,
     tools: []const tool.Tool.Tool,
+    heading: []const u8,
 };
 
 /// Replays only the final visible user turn. `renderer` is one of the raw-TTY
 /// stream renderers and remains owned by the caller.
 pub fn replayBrief(renderer: anytype, inputs: Inputs) !void {
+    if (inputs.heading.len > maximum_heading_bytes) return error.HeadingTooLong;
     var anchor: ?usize = null;
     var earlier_count: usize = 0;
     var index = inputs.items.len;
@@ -34,7 +38,8 @@ pub fn replayBrief(renderer: anytype, inputs: Inputs) !void {
         }
     }
 
-    try inputs.writer.writeAll("\n\x1b[2m── resumed");
+    try inputs.writer.writeAll("\n\x1b[2m── ");
+    try inputs.writer.writeAll(inputs.heading);
     if (earlier_count != 0) {
         try inputs.writer.print(
             " · {d} earlier message{s}",
@@ -193,6 +198,7 @@ test "brief replay selects the final user turn and shows configured reasoning" {
         .show_reasoning = true,
         .items = &items,
         .tools = &.{},
+        .heading = "resumed",
     });
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "1 earlier message") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "current") != null);

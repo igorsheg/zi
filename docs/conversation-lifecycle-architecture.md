@@ -117,7 +117,10 @@ when resume determines its effective selection.
 `/new` follows hax logger continuity: an owned logger becomes a fresh lazy logger; an
 unrecorded run remains unrecorded. `/resume` may acquire a locked log while preparing a
 stable snapshot, but publishes it only when explicit policy permits recording and the
-effective provider is eligible. Otherwise it adopts the verified history as unrecorded.
+effective provider is eligible. The locked log carries a scalar device/inode/stat token
+through publication; startup and live resume revalidate that token before tightening the
+file to mode `0600`. Drift or hardening failure closes the log and leaves a genuine
+unrecorded authority. Other policy fallbacks also adopt the verified history as unrecorded.
 Provider switching alone does not retroactively create or discard the current
 conversation log.
 

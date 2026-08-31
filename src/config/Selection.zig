@@ -355,6 +355,25 @@ pub fn prepareRestoreConversation(
     metadata: RestoreMetadata,
     lookup: ?*const Preset.Lookup,
 ) Error!PreparedRestore {
+    return self.prepareRestoreOverlay(metadata, lookup, false);
+}
+
+/// Prepares a runtime resume stance. Recorded selection fields replace current
+/// run-tier selection overrides while unrelated run settings remain.
+pub fn prepareRestoreRun(
+    self: *const Selection,
+    metadata: RestoreMetadata,
+    lookup: ?*const Preset.Lookup,
+) Error!PreparedRestore {
+    return self.prepareRestoreOverlay(metadata, lookup, true);
+}
+
+fn prepareRestoreOverlay(
+    self: *const Selection,
+    metadata: RestoreMetadata,
+    lookup: ?*const Preset.Lookup,
+    clear_run_selection: bool,
+) Error!PreparedRestore {
     var changes: [13]Change = undefined;
     var count: usize = 0;
     if (metadata.provider) |provider| {
@@ -398,9 +417,21 @@ pub fn prepareRestoreConversation(
         .base_options = self.base,
     };
     errdefer prepared.deinit();
-    prepared.run_document = try self.cloneOptionalDocument(&self.run);
+    if (clear_run_selection) {
+        prepared.run_document = try self.changedDocument(.run, &.{
+            .{ .key = "provider", .value = null },
+            .{ .key = "model", .value = null },
+            .{ .key = "effort", .value = null },
+            .{ .key = "preset", .value = null },
+            .{ .key = "system_prompt", .value = null },
+            .{ .key = "system_prompt_append", .value = null },
+        });
+        prepared.run_tint = null;
+    } else {
+        prepared.run_document = try self.cloneOptionalDocument(&self.run);
+        prepared.run_tint = try self.copyOptional(self.run_preset_tint);
+    }
     prepared.conversation_document = try self.changedDocument(.conversation, changes[0..count]);
-    prepared.run_tint = try self.copyOptional(self.run_preset_tint);
     prepared.conversation_tint = if (plan) |value| try self.copyOptional(value.tint.value) else null;
     return prepared;
 }
@@ -507,18 +538,33 @@ pub fn prepareRun(self: *const Selection, change: RunChange) Error!PreparedRun {
     };
 }
 
-/// Consumes prepared and publishes without allocation.
-pub fn publishRun(self: *Selection, prepared: *PreparedRun) void {
-    self.publishDocument(.run, prepared.document);
+/// Consumes prepared, installs it without allocation or cleanup, and returns
+/// every displaced owned value for destruction after publication.
+pub fn publishRunRetired(self: *Selection, prepared: *PreparedRun) RetiredOverlay {
+    const retired: RetiredOverlay = .{
+        .allocator = self.allocator,
+        .run_document = self.run,
+        .conversation_document = if (prepared.conversation != null) self.conversation else null,
+        .run_tint = self.run_preset_tint,
+        .conversation_tint = if (prepared.exits_preset) self.conversation_preset_tint else null,
+    };
+    self.run = prepared.document;
     prepared.document = undefined;
     if (prepared.conversation) |document| {
-        self.publishDocument(.conversation, document);
+        self.conversation = document;
         prepared.conversation = null;
     }
-    self.publishTint(.run, prepared.tint);
+    self.run_preset_tint = prepared.tint;
     prepared.tint = null;
-    if (prepared.exits_preset) self.freeSecret(&self.conversation_preset_tint);
+    if (prepared.exits_preset) self.conversation_preset_tint = null;
     prepared.* = undefined;
+    return retired;
+}
+
+/// Direct wrapper for ordinary selection commits.
+pub fn publishRun(self: *Selection, prepared: *PreparedRun) void {
+    var retired = self.publishRunRetired(prepared);
+    retired.deinit();
 }
 
 const Change = struct { key: []const u8, value: ?[]const u8 };

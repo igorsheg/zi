@@ -2,8 +2,9 @@
 
 Status: approved
 
-Implementation progress: Slice 1 is complete in commit `9f5e07fb`. Slice 2 is wired
-end to end, including `/new [PRESET]`, `/clear`, task settlement, reset, and fresh-banner presentation.
+Implementation progress: Slice 1 is complete in commit `9f5e07fb`; Slice 2 is
+complete in commit `23dc6532`. Slice 3 is wired end to end, including live `/resume`,
+stable locked loading, detached selection restore, coordinated publication, and brief replay.
 
 References:
 

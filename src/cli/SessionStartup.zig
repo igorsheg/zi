@@ -368,13 +368,13 @@ pub fn startCandidate(
     if (resolved) |selected| {
         var loaded: persistence.SessionFile.Loaded = undefined;
         if (options.no_session) {
-            loaded = try persistence.SessionFile.load(
+            loaded = try persistence.SessionFile.loadStableForResume(
                 options.allocator,
                 options.io,
                 selected.path(),
                 options.file_limits,
             );
-        } else if (persistence.SessionFile.loadForResume(
+        } else if (persistence.SessionFile.loadLockedForResume(
             options.allocator,
             options.io,
             selected.path(),
@@ -385,7 +385,7 @@ pub fn startCandidate(
             pending_log = atomic.log;
         } else |resume_err| {
             if (resume_err == error.OutOfMemory) return error.OutOfMemory;
-            loaded = try persistence.SessionFile.load(
+            loaded = try persistence.SessionFile.loadStableForResume(
                 options.allocator,
                 options.io,
                 selected.path(),
