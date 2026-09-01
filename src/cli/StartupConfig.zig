@@ -464,10 +464,6 @@ pub fn finish(
         for (owned_warnings) |*warning| warning.deinit(allocator);
         allocator.free(owned_warnings);
     }
-    // filterReportedInvalid allocates before it mutates, and cannot fail after
-    // publishing the replacement slice.
-    try filterReportedInvalid(allocator, &state.presets, owned_warnings);
-
     state.selection.deinit();
     for (state.warnings) |*warning| warning.deinit(allocator);
     allocator.free(state.warnings);
@@ -847,39 +843,6 @@ fn makeDiagnostic(
         .actual = owned_actual,
         .append_session_hint = append_session_hint,
     };
-}
-
-fn filterReportedInvalid(
-    allocator: std.mem.Allocator,
-    presets: *config.Preset.Enumeration,
-    warnings: []const Warning,
-) Error!void {
-    var keep_count: usize = 0;
-    for (presets.invalid) |invalid| if (!invalidReported(invalid.name, warnings)) {
-        keep_count += 1;
-    };
-    if (keep_count == presets.invalid.len) return;
-    const kept = try allocator.alloc(config.Preset.Invalid, keep_count);
-    var index: usize = 0;
-    for (presets.invalid) |*invalid| {
-        if (invalidReported(invalid.name, warnings)) {
-            invalid.deinit(allocator);
-        } else {
-            kept[index] = invalid.*;
-            invalid.* = undefined;
-            index += 1;
-        }
-    }
-    allocator.free(presets.invalid);
-    presets.invalid = kept;
-}
-
-fn invalidReported(name: []const u8, warnings: []const Warning) bool {
-    for (warnings) |warning| switch (warning.kind) {
-        .recorded_preset_invalid, .implicit_preset_invalid => if (std.mem.eql(u8, name, warning.subject)) return true,
-        else => {},
-    };
-    return false;
 }
 
 fn wipeFree(allocator: std.mem.Allocator, bytes: []u8) void {
@@ -1270,10 +1233,10 @@ test "prompt config root is derived from config path dirname" {
     inputs.selection.preset = "work";
     var owner = try initOwner(inputs);
     defer owner.deinit();
-    try expectSetting(&owner, "system_prompt", "from-config-dir", .run);
+    try expectSetting(&owner, "system_prompt", "@prompt.txt", .run);
 }
 
-test "reported implicit invalid preset is not enumerated twice" {
+test "reported implicit invalid preset remains addressable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeTiers(&tmp,
@@ -1294,7 +1257,12 @@ test "reported implicit invalid preset is not enumerated twice" {
     try std.testing.expectEqual(WarningKind.implicit_preset_invalid, owner.warnings()[0].kind);
     try std.testing.expectEqual(config.Preset.InvalidReason.invalid_tint, owner.warnings()[0].preset_reason.?);
     try std.testing.expectEqualStrings("tint", owner.warnings()[0].field.?);
-    try std.testing.expectEqual(@as(usize, 0), owner.invalidPresets().len);
+    try std.testing.expectEqual(@as(usize, 1), owner.invalidPresets().len);
+    try std.testing.expectEqualStrings("bad", owner.invalidPresets()[0].name);
+    try std.testing.expectEqual(
+        config.Preset.InvalidReason.invalid_tint,
+        owner.lookupPreset("bad").invalid.reason,
+    );
 }
 
 fn exerciseDiagnosticAllocationFailures(

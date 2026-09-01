@@ -68,6 +68,11 @@ pub fn resolve(inputs: Inputs) Error!Theme {
     return preset(name, tint);
 }
 
+/// Returns the same resolved theme with another validated tint.
+pub fn withTint(self: Theme, configured_tint: []const u8) Error!Theme {
+    return preset(self.name, try parseTint(configured_tint));
+}
+
 /// Applies hax's process-startup recovery while preserving strict `resolve`
 /// for callers which validate configuration transactionally.
 pub fn resolveWithFallback(inputs: Inputs) FallbackResolution {

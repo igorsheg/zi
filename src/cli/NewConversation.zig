@@ -106,7 +106,10 @@ pub const Service = struct {
         var prepared_preset: ?RunSelection.PresetCandidate = null;
         defer if (prepared_preset) |*value| if (value.active) value.deinit();
         if (preset) |name| {
-            prepared_preset = self.selection.preparePresetForTransition(name, prior_quarantine) catch |err| {
+            prepared_preset = self.selection.preparePreset(
+                name,
+                if (prior_quarantine) .quarantined_transition else .coordinated,
+            ) catch |err| {
                 return .{ .unchanged = .{ .preset = switch (err) {
                     error.PresetMissing => .missing,
                     error.PresetInvalid => .invalid,
@@ -132,7 +135,7 @@ pub const Service = struct {
         defer if (transition_selection) |*value| if (value.active) value.deinit();
         if (prepared_preset) |*value| {
             var retired_preset: RunSelection.RetiredPreset = undefined;
-            preset_persistence = self.selection.commitPresetForTransition(value, &retired_preset);
+            preset_persistence = self.selection.commitPreset(value, &retired_preset);
             self.conversation.acknowledgeExpectedPresetPublication(
                 self.selection,
                 &candidate,
@@ -318,6 +321,14 @@ const TestConfigSource = struct {
         for (self.plans) |*plan| if (std.mem.eql(u8, plan.name, name)) return .{ .plan = plan };
         for (self.invalid) |*invalid| if (std.mem.eql(u8, invalid.name, name)) return .{ .invalid = invalid };
         return .missing;
+    }
+
+    pub fn presetPlans(self: *const TestConfigSource) []const config.Preset.Plan {
+        return self.plans;
+    }
+
+    pub fn tint(self: *const TestConfigSource) ?[]const u8 {
+        return self.selection.presetTint();
     }
 
     pub fn preparePreset(

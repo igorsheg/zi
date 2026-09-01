@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
+const config = @import("../config/root.zig");
 const render = @import("../render/root.zig");
 const text = @import("../text/root.zig");
 const DiagnosticText = @import("DiagnosticText.zig");
@@ -98,6 +99,13 @@ const specs = [_]Slash.Spec{
         .handler_fn = runEffort,
     },
     .{
+        .name = "preset",
+        .summary = "switch to a config-defined preset (optional: name)",
+        .arguments = .optional,
+        .display = .managed,
+        .handler_fn = runPreset,
+    },
+    .{
         .name = "compact",
         .summary = "summarize history to free up context (optional: focus instructions)",
         .arguments = .optional,
@@ -120,6 +128,7 @@ comptime {
 pub const Owner = struct {
     writer: *std.Io.Writer,
     theme: render.Theme,
+    preset_base_theme: render.Theme,
     styled: bool,
     columns: usize,
     width_source: ?WidthSource = null,
@@ -135,6 +144,7 @@ pub const Owner = struct {
     undo_conversation: ?UndoConversation.Runner = null,
     compact_conversation: ?CompactConversation.Runner = null,
     persistence_warning_written: bool = false,
+    preset_persistence_warning_written: bool = false,
 
     pub fn init(
         writer: *std.Io.Writer,
@@ -145,9 +155,18 @@ pub const Owner = struct {
         return .{
             .writer = writer,
             .theme = theme,
+            .preset_base_theme = theme,
             .styled = styled,
             .columns = @max(columns, 1),
         };
+    }
+
+    pub fn setTheme(self: *Owner, theme: render.Theme) void {
+        self.theme = theme;
+    }
+
+    pub fn setPresetBaseTheme(self: *Owner, theme: render.Theme) void {
+        self.preset_base_theme = theme;
     }
 
     pub fn setWidthSource(self: *Owner, source: WidthSource) void {
@@ -282,15 +301,18 @@ pub const Owner = struct {
     }
 
     fn renderNewBanner(self: *Owner, current: RunSelection.CurrentSelection) !void {
-        const frame = self.frame orelse return;
-        try render.Banner.render(self.writer, self.theme, self.columnsNow(), .{
+        const identity: render.Banner.Identity = .{
             .preset = current.preset,
             .provider = current.provider_label,
             .model_label = current.model_label,
             .model = current.model,
             .effort = current.effort,
-        });
-        frame.syncExternal(1);
+        };
+        if (self.styled)
+            try render.Banner.render(self.writer, self.theme, self.columnsNow(), identity)
+        else
+            try render.Banner.renderPlain(self.writer, self.theme, self.columnsNow(), identity);
+        if (self.frame) |frame| frame.syncExternal(1);
     }
 
     fn renderHelp(self: *Owner) !void {
@@ -481,21 +503,21 @@ pub const Owner = struct {
 fn runNew(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
     const self: *Owner = @ptrCast(@alignCast(context));
     const runner = self.new_conversation orelse return .handled;
+    if (call.argument) |name| if (self.run_selection) |live| {
+        if (!try presetReferenceValid(self, live, name, null)) return .handled;
+    };
     const outcome = runner.run(call.argument);
     switch (outcome) {
         .changed => |result| {
             if (result.preset_persistence) |persistence_result| {
-                try writePersistenceWarning(self, persistence_result);
+                try writePresetPersistenceWarning(self, persistence_result);
             }
             if (result.old_branch_incomplete) {
                 try self.writeDiagnosticNote(
                     "the previous conversation was already unrecordable; its final state may be incomplete",
                 );
             }
-            if (self.frame != null) {
-                const live = self.run_selection orelse return .history_changed;
-                try self.renderNewBanner(live.current());
-            }
+            if (self.run_selection) |live| try self.renderNewBanner(live.current());
             return .history_changed;
         },
         .unchanged => |reason| {
@@ -504,7 +526,7 @@ fn runNew(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
         },
         .partial => |partial| {
             if (partial.preset_persistence) |persistence_result| {
-                try writePersistenceWarning(self, persistence_result);
+                try writePresetPersistenceWarning(self, persistence_result);
             }
             try writeNewPartial(self, call.argument, partial);
             return .handled;
@@ -990,6 +1012,178 @@ fn runEffort(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
 
     try writeSelectionNotice(self, live.current());
     return .handled;
+}
+
+fn runPreset(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
+    const self: *Owner = @ptrCast(@alignCast(context));
+    const live = self.run_selection orelse return .handled;
+    const before = live.current();
+    var provider_choices: ?ProviderConfig.ProviderChoices = null;
+    defer if (provider_choices) |*choices| choices.deinit();
+
+    const name = if (call.argument) |argument|
+        argument
+    else name: {
+        const plans = live.presetPlans();
+        if (plans.len == 0) {
+            try self.writeNote("no presets defined in config.json — use /preset-save to save the current selection");
+            return .handled;
+        }
+        const picker = self.selection_picker orelse return .handled;
+        provider_choices = live.providerChoices() catch {
+            try self.writeError("couldn't prepare the preset list — keeping the current selection");
+            return .handled;
+        };
+        const choice = SelectionPicker.preset(
+            live.allocator,
+            picker,
+            plans,
+            provider_choices.?.values,
+            before.preset,
+            self.preset_base_theme,
+        ) catch {
+            try self.writeError("couldn't prepare the preset list — keeping the current selection");
+            return .handled;
+        };
+        const selected = switch (choice) {
+            .canceled => return .handled,
+            .selected => |index| index,
+        };
+        if (live.current().generation != before.generation) return .handled;
+        break :name plans[selected].name;
+    };
+
+    const known_choices = if (provider_choices) |choices| choices.values else null;
+    if (!try presetReferenceValid(self, live, name, known_choices)) return .handled;
+
+    var candidate = live.preparePreset(name, .coordinated) catch |err| {
+        switch (err) {
+            error.PresetMissing => try writeNamedPresetError(self, "unknown preset '", name, "'"),
+            error.PresetInvalid => try writeNamedPresetError(self, "invalid preset '", name, "'"),
+            else => try writeNamedPresetError(self, "couldn't apply preset '", name, "' — keeping the current selection"),
+        }
+        return .handled;
+    };
+    defer if (candidate.active) candidate.deinit();
+    var retired: RunSelection.RetiredPreset = undefined;
+    const persistence = live.commitPreset(&candidate, &retired);
+    retired.deinit();
+    if (self.run_log_seam) |seam| seam.rebuildTranscript(.selection, live.session);
+
+    const current = live.current();
+    if (live.session.items().len == 0) {
+        try self.renderNewBanner(current);
+    } else {
+        try writePresetNotice(self, current);
+    }
+    try writePresetPersistenceWarning(self, persistence);
+    return .handled;
+}
+
+fn presetReferenceValid(
+    self: *Owner,
+    live: *RunSelection.Owner,
+    name: []const u8,
+    known_choices: ?[]const ProviderConfig.ProviderChoice,
+) !bool {
+    const plan = switch (live.lookupPreset(name)) {
+        .missing => {
+            try writeNamedPresetError(self, "unknown preset '", name, "'");
+            return false;
+        },
+        .invalid => |invalid| {
+            try writeInvalidPreset(self, invalid);
+            return false;
+        },
+        .plan => |value| value,
+    };
+    if (ai.ProviderRegistry.find(plan.provider) != null) return true;
+    if (known_choices) |choices| {
+        if (providerChoiceContains(choices, plan.provider)) return true;
+    } else {
+        var choices = live.providerChoices() catch {
+            try self.writeError("couldn't prepare the preset — keeping the current selection");
+            return false;
+        };
+        defer choices.deinit();
+        if (providerChoiceContains(choices.values, plan.provider)) return true;
+    }
+    try writeUnknownPresetProvider(self, plan.name, plan.provider);
+    return false;
+}
+
+fn providerChoiceContains(choices: []const ProviderConfig.ProviderChoice, provider: []const u8) bool {
+    for (choices) |choice| if (std.mem.eql(u8, choice.id, provider)) return true;
+    return false;
+}
+
+fn writeInvalidPreset(self: *Owner, invalid: *const config.Preset.Invalid) !void {
+    if (self.styled) try self.writer.writeAll(self.theme.error_style.open);
+    try self.writer.writeAll("invalid preset '");
+    try DiagnosticText.write(self.writer, invalid.name);
+    try self.writer.writeAll("'");
+    if (invalid.field) |field| {
+        try self.writer.writeAll(" field '");
+        try DiagnosticText.write(self.writer, field);
+        try self.writer.writeAll("'");
+    }
+    try self.writer.writeAll(": ");
+    try self.writer.writeAll(invalidPresetReason(invalid.reason));
+    if (self.styled) try self.writer.writeAll(self.theme.error_style.close);
+    try self.writer.writeByte('\n');
+    if (self.frame) |frame| frame.syncExternal(1);
+}
+
+fn invalidPresetReason(reason: config.Preset.InvalidReason) []const u8 {
+    return switch (reason) {
+        .invalid_name => "invalid name",
+        .not_object => "definition is not an object",
+        .unknown_field => "unknown field",
+        .non_scalar => "field must be a scalar",
+        .missing_provider => "provider is required",
+        .invalid_tint => "invalid tint",
+        .prompt_unresolved => "prompt path could not be resolved",
+        .prompt_read => "prompt file could not be read",
+        .prompt_unreadable => "prompt file is unreadable",
+        .prompt_non_regular => "prompt path is not a regular file",
+        .prompt_too_large => "prompt file is too large",
+        .prompt_invalid_path => "prompt path is invalid",
+    };
+}
+
+fn writeUnknownPresetProvider(self: *Owner, preset: []const u8, provider: []const u8) !void {
+    if (self.styled) try self.writer.writeAll(self.theme.error_style.open);
+    try self.writer.writeAll("preset '");
+    try DiagnosticText.write(self.writer, preset);
+    try self.writer.writeAll("': unknown provider '");
+    try DiagnosticText.write(self.writer, provider);
+    try self.writer.writeAll("'");
+    if (self.styled) try self.writer.writeAll(self.theme.error_style.close);
+    try self.writer.writeByte('\n');
+    if (self.frame) |frame| frame.syncExternal(1);
+}
+
+fn writePresetNotice(self: *Owner, current: RunSelection.CurrentSelection) !void {
+    if (self.styled) try self.writer.writeAll(self.theme.chrome_dim.open);
+    try self.writer.writeAll("switched to [");
+    try DiagnosticText.write(self.writer, current.preset orelse "");
+    try self.writer.writeAll("] ");
+    try DiagnosticText.write(self.writer, current.provider_label);
+    try self.writer.writeAll(" · ");
+    try DiagnosticText.write(self.writer, current.model_label orelse current.model);
+    if (current.effort) |effort_value| {
+        try self.writer.writeAll(" · ");
+        try DiagnosticText.write(self.writer, effort_value);
+    }
+    if (self.styled) try self.writer.writeAll(self.theme.chrome_dim.close);
+    try self.writer.writeByte('\n');
+    if (self.frame) |frame| frame.syncExternal(1);
+}
+
+fn writePresetPersistenceWarning(self: *Owner, result: RunSelection.CommitResult) !void {
+    if (result != .run_only or self.preset_persistence_warning_written) return;
+    self.preset_persistence_warning_written = true;
+    try self.writeDiagnosticNote("couldn't save to state.json — this preset applies to this run only");
 }
 
 fn writeNewUnchanged(
@@ -1479,7 +1673,7 @@ test "new preset diagnostics escape names and report committed partial state" {
     } };
     try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/new review"));
     try std.testing.expectEqualStrings(
-        "couldn't save to state.json — this choice applies to this run only\n" ++
+        "couldn't save to state.json — this preset applies to this run only\n" ++
             "preset 'review' was applied, but the current conversation was not cleared\n" ++
             "the preset is active, but recording its metadata is still pending; " ++
             "retry /new before exiting\n",
@@ -1528,6 +1722,7 @@ test "help lists only implemented commands and supported shortcuts" {
             "  /provider    switch provider, then model and effort\n" ++
             "  /model       switch model, then effort\n" ++
             "  /effort      set reasoning effort\n" ++
+            "  /preset      switch to a config-defined preset (optional: name)\n" ++
             "  /compact     summarize history to free up context (optional: focus\n" ++
             "               instructions)\n" ++
             "  /help        show this help\n" ++
@@ -1609,7 +1804,7 @@ test "singleton provenance distinguishes reconciled discoveries" {
     );
 }
 
-test "run-only persistence warning uses hax text once per process owner" {
+test "selection and preset persistence warnings have independent once-only scopes" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var owner = Owner.init(&output.writer, try testTheme(), false, 80);
@@ -1617,8 +1812,11 @@ test "run-only persistence warning uses hax text once per process owner" {
     try writePersistenceWarning(&owner, .written);
     try writePersistenceWarning(&owner, .run_only);
     try writePersistenceWarning(&owner, .run_only);
+    try writePresetPersistenceWarning(&owner, .run_only);
+    try writePresetPersistenceWarning(&owner, .run_only);
     try std.testing.expectEqualStrings(
-        "couldn't save to state.json — this choice applies to this run only\n",
+        "couldn't save to state.json — this choice applies to this run only\n" ++
+            "couldn't save to state.json — this preset applies to this run only\n",
         output.written(),
     );
 }

@@ -27,14 +27,30 @@ pub const Error = error{ WriteFailed, IdentityTooLong };
 /// No allocation is performed. Dynamic segments are bounded to
 /// `max_segment_bytes` sanitized bytes on the stack.
 pub fn render(writer: *std.Io.Writer, theme: Theme, columns: usize, identity: Identity) Error!void {
-    errdefer {
+    return renderInternal(writer, theme, columns, identity, true);
+}
+
+/// Renders the same bounded banner without terminal control sequences.
+pub fn renderPlain(writer: *std.Io.Writer, theme: Theme, columns: usize, identity: Identity) Error!void {
+    return renderInternal(writer, theme, columns, identity, false);
+}
+
+fn renderInternal(
+    writer: *std.Io.Writer,
+    theme: Theme,
+    columns: usize,
+    identity: Identity,
+    styled: bool,
+) Error!void {
+    errdefer if (styled) {
         writer.writeAll("\x1b[0m") catch {};
         writer.flush() catch {};
-    }
+    };
     var renderer: Renderer = .{
         .writer = writer,
         .theme = theme,
         .columns = @max(columns, minimum_columns),
+        .styled = styled,
     };
 
     try renderer.openRow();
@@ -94,6 +110,7 @@ const Renderer = struct {
     col: usize = first_indent,
     fresh: bool = true,
     style: ?Theme.Style = null,
+    styled: bool = true,
 
     fn openRow(self: *Renderer) std.Io.Writer.Error!void {
         try self.writeGutter(first_indent);
@@ -115,13 +132,14 @@ const Renderer = struct {
     }
 
     fn writeGutter(self: *Renderer, indent: usize) std.Io.Writer.Error!void {
-        try self.writer.writeAll(self.theme.chrome.open);
+        if (self.styled) try self.writer.writeAll(self.theme.chrome.open);
         try self.writer.writeAll("▌");
-        try self.writer.writeAll(self.theme.chrome.close);
+        if (self.styled) try self.writer.writeAll(self.theme.chrome.close);
         try self.writer.splatByteAll(' ', indent - 1);
     }
 
     fn setStyle(self: *Renderer, next: ?Theme.Style) std.Io.Writer.Error!void {
+        if (!self.styled) return;
         if (stylesEqual(self.style, next)) return;
         if (self.style) |current| try self.writer.writeAll(current.close);
         if (next) |new| try self.writer.writeAll(new.open);
@@ -247,6 +265,22 @@ test "visible banner at 100 40 and 20 columns" {
             "▌   \x1b[2mesc pause\x1b[22m\n" ++
             "▌   \x1b[2mesc esc abort\x1b[22m\n",
         narrow,
+    );
+}
+
+test "plain banner emits no terminal controls" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try renderPlain(&output.writer, offTheme(), 80, .{
+        .preset = "review",
+        .provider = "mock",
+        .model = "mock-model",
+    });
+    try std.testing.expect(std.mem.indexOfScalar(u8, output.written(), 0x1b) == null);
+    try std.testing.expectEqualStrings(
+        "▌ zi [review] › mock · mock-model\n" ++
+            "▌ ctrl-d quit · esc pause · esc esc abort\n",
+        output.written(),
     );
 }
 

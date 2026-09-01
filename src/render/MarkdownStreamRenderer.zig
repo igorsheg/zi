@@ -75,6 +75,7 @@ stream_wrote_text: bool = false,
 wrote_assistant_text: bool = false,
 trailing_newlines: usize = 0,
 answer_started: bool = false,
+turn_active: bool = false,
 
 /// Initializes a reusable renderer without allocating. Call `deinit` after the
 /// last turn so retained Markdown lookahead and wrap storage are released.
@@ -112,6 +113,12 @@ pub fn setShowReasoning(self: *MarkdownStreamRenderer, visible: bool) void {
     self.show_reasoning = visible;
 }
 
+/// Replaces value-only styling between provider turns.
+pub fn setTheme(self: *MarkdownStreamRenderer, theme: Theme) void {
+    std.debug.assert(!self.turn_active);
+    self.theme = theme;
+}
+
 fn resolveWidth(self: *const MarkdownStreamRenderer) usize {
     return if (self.width_source) |source| source.resolve() else self.wrap_width;
 }
@@ -141,7 +148,7 @@ pub fn begin(self: *MarkdownStreamRenderer) !agent.Loop.Observer {
         spinner.show();
     }
     if (self.markdown) |*markdown| {
-        markdown.reset(self.wrap_width);
+        markdown.reset(self.theme, self.wrap_width);
     } else {
         self.markdown = Markdown.init(
             self.allocator,
@@ -150,6 +157,7 @@ pub fn begin(self: *MarkdownStreamRenderer) !agent.Loop.Observer {
             self.wrap_width,
         );
     }
+    self.turn_active = true;
     return agent.Loop.Observer.from(self);
 }
 
@@ -161,6 +169,7 @@ pub fn close(self: *MarkdownStreamRenderer, terminal: StreamRenderer.Terminal) !
     self.closeStream();
     self.tool_presentation.close();
     if (self.spinner) |spinner| spinner.hide();
+    self.turn_active = false;
 }
 
 pub fn check(self: *const MarkdownStreamRenderer) !void {
@@ -315,7 +324,7 @@ fn beginReasoning(self: *MarkdownStreamRenderer) void {
     self.safe_text = .{};
     self.safe_length = 0;
     self.wrap_width = self.resolveWidth();
-    self.markdown.?.reset(self.wrap_width);
+    self.markdown.?.reset(self.theme, self.wrap_width);
     self.markdown.?.setStyled(false) catch |err| {
         self.render_error = err;
         self.reasoning_active = false;
@@ -353,7 +362,7 @@ fn ensureStream(self: *MarkdownStreamRenderer) void {
     self.safe_length = 0;
     self.wrap_width = self.resolveWidth();
     if (self.markdown) |*markdown| {
-        markdown.reset(self.wrap_width);
+        markdown.reset(self.theme, self.wrap_width);
         markdown.setStyled(true) catch |err| {
             self.render_error = err;
         };

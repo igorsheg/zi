@@ -78,8 +78,9 @@ pub fn deinit(self: *Markdown) void {
 }
 
 /// Discards pending state for a new provider request while retaining capacity.
-pub fn reset(self: *Markdown, wrap_width: usize) void {
+pub fn reset(self: *Markdown, theme: Theme, wrap_width: usize) void {
     self.tail.clearRetainingCapacity();
+    self.theme = theme;
     self.prev_byte = 0;
     self.prev_text_byte = 0;
     self.pending_dash_space = false;
@@ -138,7 +139,7 @@ pub fn setStyled(self: *Markdown, styled: bool) Error!void {
     if (self.styled == styled) return;
     const wrap_width = self.wrap.width();
     try self.finish();
-    self.reset(wrap_width);
+    self.reset(self.theme, wrap_width);
     self.styled = styled;
 }
 
@@ -1122,15 +1123,16 @@ test "table collection layout and reflow match hax" {
 test "reset discards pending state and reuses owned capacity" {
     var capture: TestCapture = .{};
     defer capture.deinit();
+    const theme = try ansiTheme();
     var markdown = Markdown.init(
         std.testing.allocator,
         MarkdownOutput.Sink.from(&capture),
-        try ansiTheme(),
+        theme,
         0,
     );
     defer markdown.deinit();
     try markdown.feed("**pending");
-    markdown.reset(0);
+    markdown.reset(theme, 0);
     try markdown.feed("fresh");
     try markdown.finish();
     try std.testing.expectEqualStrings("\x1b[1mpendingfresh", capture.bytes.items);

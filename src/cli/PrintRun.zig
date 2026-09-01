@@ -655,13 +655,6 @@ pub fn run(
         if (std.mem.eql(u8, value, "(none)")) .none else .{ .custom = value }
     else
         .default;
-    const preset_plans = startup.presetPlans();
-    const prompt_presets = try allocator.alloc(agent.Context.Preset, preset_plans.len);
-    defer allocator.free(prompt_presets);
-    for (preset_plans, prompt_presets) |plan, *preset| preset.* = .{
-        .name = plan.name,
-        .description = plan.description.value orelse "",
-    };
     const prompt_template: PromptAssembly.Inputs = .{
         .raw = options.raw,
         .base = base_kind,
@@ -693,9 +686,14 @@ pub fn run(
             .home = path_inputs.home,
             .config_root = paths.config_root,
         },
-        .presets = prompt_presets,
+        .presets = &.{},
     };
-    var system_prompt = try PromptAssembly.build(allocator, io, prompt_template);
+    var system_prompt = try buildPromptWithPresets(
+        allocator,
+        io,
+        prompt_template,
+        startup.presetPlans(),
+    );
     defer if (system_prompt) |*value| value.deinit(allocator);
 
     var usage = try agent.UsageStats.UsageStats.init(allocator, agent.UsageStats.maximum_retained_attempts);
@@ -721,6 +719,7 @@ pub fn run(
         .streaming_transport = http_transport.streaming(),
         .json_transport = http_transport.json(),
         .prompt_template = prompt_template,
+        .preset_source = &startup,
         .prompt_access = secure_open.configCapability(),
         .config_root = config_root,
         .home = path_inputs.home,
@@ -866,14 +865,6 @@ pub fn run(
     compaction.effects = &catalog_hook;
     live.model_metadata_source = agent.ModelMetadataSource.ModelMetadataSource.from(&model_metadata_source);
     live.image_input_source = agent.ImageInputSource.ImageInputSource.from(&image_source);
-    var live_views: LiveViews = .{
-        .catalog_runtime = &catalog_runtime,
-        .stats = &stats,
-        .compaction = &compaction,
-    };
-    live.setViews(RunSelection.Views.from(&live_views));
-    run_log_seam.bindSelection(&live);
-    run_log_seam.rebuildTranscript(.open, conversation.session());
 
     var configured_theme = try config.Settings.getString(store, allocator, "theme");
     defer configured_theme.deinit(allocator);
@@ -892,6 +883,21 @@ pub fn run(
         .colorterm = environment.get("COLORTERM"),
         .colorfgbg = environment.get("COLORFGBG"),
     });
+    var below_run_tint = try store.readBelowRun(allocator, "tint");
+    defer below_run_tint.deinit(allocator);
+    const base_theme = theme.withTint(below_run_tint.value orelse "teal") catch fallback: {
+        break :fallback theme.withTint("teal") catch unreachable;
+    };
+
+    var live_views: LiveViews = .{
+        .catalog_runtime = &catalog_runtime,
+        .stats = &stats,
+        .compaction = &compaction,
+        .base_theme = base_theme,
+    };
+    live.setViews(RunSelection.Views.from(&live_views));
+    run_log_seam.bindSelection(&live);
+    run_log_seam.rebuildTranscript(.open, conversation.session());
 
     const run_result = switch (mode) {
         .print => |prompt| OneShot.run(allocator, io, .{
@@ -971,6 +977,7 @@ pub fn run(
                     false,
                     display_columns.resolve(terminal_module.Size.presentationColumns(stdout_terminal_file.handle)),
                 );
+                commands.setPresetBaseTheme(live_views.base_theme);
                 commands.setRunSelection(&live);
                 commands.setRunLogSeam(run_log_seam);
                 commands.setNewConversation(new_conversation_runner);
@@ -978,6 +985,8 @@ pub fn run(
                 commands.setUndoConversation(undo_conversation_runner);
                 commands.setCompactConversation(compact_conversation_runner);
                 commands.setIo(io);
+                live_views.commands = &commands;
+                defer live_views.commands = null;
                 var cooked_inputs = interactive_inputs;
                 cooked_inputs.command_gateway = commands.gateway();
                 break :interactive runInteractiveWithFinish(allocator, io, cooked_inputs, &terminal);
@@ -1009,6 +1018,7 @@ pub fn run(
                 &undo_conversation_service,
                 compact_conversation_runner,
                 &compact_conversation_service,
+                &live_views,
                 theme,
                 display_columns,
                 markdown_enabled,
@@ -1445,6 +1455,7 @@ fn runRawInteractive(
     undo_service: *UndoConversation.Service,
     compact_conversation: CompactConversation.Runner,
     compact_service: *CompactConversation.Service,
+    live_views: *LiveViews,
     theme: render.Theme,
     display_columns: terminal_module.DisplayColumns.Policy,
     markdown_enabled: bool,
@@ -1561,6 +1572,7 @@ fn runRawInteractive(
         true,
         markdown_width.resolve(),
     );
+    commands.setPresetBaseTheme(live_views.base_theme);
     commands.setWidthSource(.from(&markdown_width));
     commands.setFrame(&frame);
     commands.setRunSelection(live);
@@ -1617,6 +1629,12 @@ fn runRawInteractive(
     plain_renderer.setWidthSource(.from(&markdown_width));
     plain_renderer.setShowReasoning(show_reasoning);
     defer plain_renderer.deinit();
+    live_views.commands = &commands;
+    live_views.markdown = &markdown_renderer;
+    defer {
+        live_views.commands = null;
+        live_views.markdown = null;
+    }
     var resume_picker: RawSessionPicker = .{
         .allocator = allocator,
         .io = io,
@@ -1969,6 +1987,23 @@ const LiveProviderSource = struct {
     }
 };
 
+fn buildPromptWithPresets(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    template: PromptAssembly.Inputs,
+    plans: []const config.Preset.Plan,
+) !?PromptAssembly.OwnedPrompt {
+    const facts = try allocator.alloc(agent.Context.Preset, plans.len);
+    defer allocator.free(facts);
+    for (plans, facts) |plan, *fact| fact.* = .{
+        .name = plan.name,
+        .description = plan.description.value orelse "",
+    };
+    var inputs = template;
+    inputs.presets = facts;
+    return PromptAssembly.build(allocator, io, inputs);
+}
+
 const LiveBuilder = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1976,6 +2011,7 @@ const LiveBuilder = struct {
     streaming_transport: ai.Transport.Transport,
     json_transport: ai.JsonTransport.Transport,
     prompt_template: PromptAssembly.Inputs,
+    preset_source: *const StartupConfig.Owner,
     prompt_access: config.SecureOpen.Capability,
     config_root: ?[]const u8,
     home: ?[]const u8,
@@ -2035,7 +2071,12 @@ const LiveBuilder = struct {
             .default;
         prompt_inputs.append = if (resolved_append) |value| value.text else null;
         prompt_inputs.environment.model = runtime.model;
-        var prompt = try PromptAssembly.build(self.allocator, self.io, prompt_inputs);
+        var prompt = try buildPromptWithPresets(
+            self.allocator,
+            self.io,
+            prompt_inputs,
+            self.preset_source.presetPlans(),
+        );
         errdefer if (prompt) |*value| value.deinit(self.allocator);
         const sort_models = try resolveSortModels(self.allocator, store, runtime.keep_model_order);
         return .{
@@ -2067,6 +2108,9 @@ const LiveViews = struct {
     catalog_runtime: *CatalogRuntime,
     stats: *Stats.Renderer,
     compaction: *AutoCompact,
+    base_theme: render.Theme,
+    commands: ?*InteractiveCommands.Owner = null,
+    markdown: ?*render.MarkdownStreamRenderer = null,
 
     pub fn publishSelectionViews(self: *LiveViews, derived: RunSelection.Derived) void {
         const runtime = derived.runtime;
@@ -2081,6 +2125,12 @@ const LiveViews = struct {
         self.compaction.system_prompt = derived.system_prompt;
         self.compaction.effort = runtime.effort;
         self.compaction.context_limit = derived.context_limit;
+        const selected_theme = if (derived.preset_tint) |tint|
+            self.base_theme.withTint(tint) catch unreachable
+        else
+            self.base_theme;
+        if (self.commands) |commands| commands.setTheme(selected_theme);
+        if (self.markdown) |markdown| markdown.setTheme(selected_theme);
     }
 };
 

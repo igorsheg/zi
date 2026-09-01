@@ -202,6 +202,8 @@ pub const ConfigSource = struct {
         *config.Selection.PreparedRun,
     ) config.Selection.RetiredOverlay,
     lookup_preset_fn: *const fn (*anyopaque, []const u8) config.Preset.BorrowedLookup,
+    preset_plans_fn: *const fn (*anyopaque) []const config.Preset.Plan,
+    preset_tint_fn: *const fn (*anyopaque) ?[]const u8,
     prepare_preset_fn: *const fn (
         *anyopaque,
         *const config.Preset.Plan,
@@ -231,6 +233,14 @@ pub const ConfigSource = struct {
     /// Borrows cached preset enumeration storage owned by the implementation.
     pub fn lookupPreset(self: ConfigSource, name: []const u8) config.Preset.BorrowedLookup {
         return self.lookup_preset_fn(self.context, name);
+    }
+
+    pub fn presetPlans(self: ConfigSource) []const config.Preset.Plan {
+        return self.preset_plans_fn(self.context);
+    }
+
+    pub fn presetTint(self: ConfigSource) ?[]const u8 {
+        return self.preset_tint_fn(self.context);
     }
 
     pub fn preparePreset(
@@ -296,6 +306,16 @@ pub const ConfigSource = struct {
                 return self.lookupPreset(name);
             }
 
+            fn presetPlans(context: *anyopaque) []const config.Preset.Plan {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.presetPlans();
+            }
+
+            fn presetTint(context: *anyopaque) ?[]const u8 {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.tint();
+            }
+
             fn preparePreset(
                 context: *anyopaque,
                 plan: *const config.Preset.Plan,
@@ -335,6 +355,8 @@ pub const ConfigSource = struct {
             .publish_fn = Adapter.publish,
             .publish_run_retired_fn = Adapter.publishRunRetired,
             .lookup_preset_fn = Adapter.lookupPreset,
+            .preset_plans_fn = Adapter.presetPlans,
+            .preset_tint_fn = Adapter.presetTint,
             .prepare_preset_fn = Adapter.preparePreset,
             .publish_preset_fn = Adapter.publishPreset,
             .prepare_restore_fn = Adapter.prepareRestore,
@@ -387,6 +409,7 @@ pub const Derived = struct {
     system_prompt: []const u8,
     image_input: ai.Provider.ImageInput,
     context_limit: ?u64,
+    preset_tint: ?[]const u8,
 };
 
 pub const Views = struct {
@@ -527,6 +550,11 @@ pub const RetiredRuntime = struct {
 
 pub const PresetPreparationError = error{ PresetMissing, PresetInvalid };
 
+pub const PresetAuthority = enum {
+    coordinated,
+    quarantined_transition,
+};
+
 const PresetMetadataPreparation = union(enum) {
     coordinated: SessionDurability.PreparedSelection,
     quarantined_transition: SessionDurability.PreparedQuarantinedTransitionSelection,
@@ -553,7 +581,7 @@ pub const PresetCandidate = struct {
     reported_metadata: ?ai.ModelMeta.Metadata,
     model_provenance: ModelProvenance,
     preset_name: []u8,
-    session_only: bool,
+    owned_model_label: []u8,
     active: bool = true,
 
     pub fn deinit(self: *PresetCandidate) void {
@@ -561,6 +589,7 @@ pub const PresetCandidate = struct {
             self.metadata.deinit();
             self.built.deinit(self.allocator);
             self.config_preset.deinit();
+            self.allocator.free(self.owned_model_label);
             self.allocator.free(self.preset_name);
         }
         self.* = undefined;
@@ -597,6 +626,7 @@ pub const RetiredPreset = struct {
     prompt: ?PromptAssembly.OwnedPrompt,
     metadata: RetiredPresetMetadata,
     preset_name: []u8,
+    candidate_model_label: []u8,
     active: bool = true,
 
     pub fn deinit(self: *RetiredPreset) void {
@@ -605,6 +635,7 @@ pub const RetiredPreset = struct {
             if (self.prompt) |*value| value.deinit(self.allocator);
             self.runtime.deinit();
             self.config_overlay.deinit();
+            self.allocator.free(self.candidate_model_label);
             self.allocator.free(self.preset_name);
         }
         self.* = undefined;
@@ -701,6 +732,20 @@ pub const Owner = struct {
             .model_provenance = self.model_provenance,
             .model_discovered = self.runtime.model_discovered,
         };
+    }
+
+    /// Borrows the process-owned preset registry for one synchronous command.
+    pub fn lookupPreset(self: *const Owner, name: []const u8) config.Preset.BorrowedLookup {
+        self.assertStable();
+        std.debug.assert(!self.committing);
+        return self.config_source.lookupPreset(name);
+    }
+
+    /// Borrows valid process-owned preset plans for one synchronous picker.
+    pub fn presetPlans(self: *const Owner) []const config.Preset.Plan {
+        self.assertStable();
+        std.debug.assert(!self.committing);
+        return self.config_source.presetPlans();
     }
 
     pub fn providerChoices(self: *Owner) !ProviderConfig.ProviderChoices {
@@ -1036,13 +1081,12 @@ pub const Owner = struct {
         };
     }
 
-    /// Prepares `/new PRESET` against the cached prospective preset Store.
-    /// When authority was quarantined at command entry, only stable session
-    /// metadata is staged; ordinary selection preparation remains unchanged.
-    pub fn preparePresetForTransition(
+    /// Prepares one preset against the cached prospective Store. Quarantined
+    /// transitions stage only stable session metadata.
+    pub fn preparePreset(
         self: *Owner,
         name: []const u8,
-        authority_was_quarantined: bool,
+        authority: PresetAuthority,
     ) !PresetCandidate {
         self.assertStable();
         if (self.committing or self.catalog_lookup_active) return error.Reentrant;
@@ -1057,11 +1101,20 @@ pub const Owner = struct {
         errdefer config_preset.deinit();
         var built = try self.builder.build(config_preset.store(), self.reported_metadata);
         errdefer built.deinit(self.allocator);
+        const owned_model_label = if (std.mem.eql(
+            u8,
+            built.runtime.metadata.provider_id,
+            "llamacpp",
+        ))
+            try ai.LocalDiscovery.modelLabel(self.allocator, built.runtime.model)
+        else
+            try self.allocator.dupe(u8, built.runtime.model);
+        errdefer self.allocator.free(owned_model_label);
 
         const agent_selection: agent.Session.Selection = .{
             .provider_id = built.runtime.metadata.provider_id,
             .model = built.runtime.model,
-            .model_label = built.runtime.model,
+            .model_label = owned_model_label,
             .effort = built.runtime.effort,
             .preset = preset_name,
         };
@@ -1072,13 +1125,15 @@ pub const Owner = struct {
             .effort = agent_selection.effort,
             .preset = agent_selection.preset,
         };
-        var metadata: PresetMetadataPreparation = if (authority_was_quarantined)
-            .{ .quarantined_transition = try self.durability.prepareSelectionForQuarantinedTransition(
-                self.session,
-                log_selection,
-            ) }
-        else
-            .{ .coordinated = try self.durability.prepareSelection(self.session, log_selection) };
+        var metadata: PresetMetadataPreparation = switch (authority) {
+            .coordinated => .{ .coordinated = try self.durability.prepareSelection(self.session, log_selection) },
+            .quarantined_transition => .{
+                .quarantined_transition = try self.durability.prepareSelectionForQuarantinedTransition(
+                    self.session,
+                    log_selection,
+                ),
+            },
+        };
         errdefer metadata.deinit();
 
         const tool_selection: tool.Bash.RunSelection = .{
@@ -1105,13 +1160,13 @@ pub const Owner = struct {
             .reported_metadata = self.reported_metadata,
             .model_provenance = if (provider_changed) .inherited else self.model_provenance,
             .preset_name = preset_name,
-            .session_only = authority_was_quarantined,
+            .owned_model_label = owned_model_label,
         };
     }
 
     /// Publishes every live preset view without allocation, returns displaced
     /// ownership through `retired`, then attempts user-state persistence.
-    pub fn commitPresetForTransition(
+    pub fn commitPreset(
         self: *Owner,
         candidate: *PresetCandidate,
         retired: *RetiredPreset,
@@ -1158,6 +1213,7 @@ pub const Owner = struct {
             .prompt = old_prompt,
             .metadata = old_metadata,
             .preset_name = candidate.preset_name,
+            .candidate_model_label = candidate.owned_model_label,
         };
         self.committing = false;
 
@@ -1255,6 +1311,7 @@ pub const Owner = struct {
             .system_prompt = self.promptBytes(),
             .image_input = self.image_input,
             .context_limit = self.context_limit,
+            .preset_tint = self.config_source.presetTint(),
         };
     }
 };
@@ -1509,6 +1566,7 @@ const TestViews = struct {
     effort: ?[]const u8 = null,
     image_input: ai.Provider.ImageInput = .unknown,
     context_limit: ?u64 = null,
+    preset_tint: ?[]const u8 = null,
 
     pub fn publishSelectionViews(self: *TestViews, derived: Derived) void {
         self.publications += 1;
@@ -1518,6 +1576,7 @@ const TestViews = struct {
         self.effort = derived.runtime.effort;
         self.image_input = derived.image_input;
         self.context_limit = derived.context_limit;
+        self.preset_tint = derived.preset_tint;
     }
 };
 
@@ -1551,6 +1610,14 @@ const TestConfigSource = struct {
         for (self.plans) |*plan| if (std.mem.eql(u8, plan.name, name)) return .{ .plan = plan };
         for (self.invalid) |*invalid| if (std.mem.eql(u8, invalid.name, name)) return .{ .invalid = invalid };
         return .missing;
+    }
+
+    pub fn presetPlans(self: *const TestConfigSource) []const config.Preset.Plan {
+        return self.plans;
+    }
+
+    pub fn tint(self: *const TestConfigSource) ?[]const u8 {
+        return self.selection.presetTint();
     }
 
     pub fn preparePreset(
@@ -1771,7 +1838,7 @@ fn exercisePresetCandidateAllocationFailures(allocator: std.mem.Allocator) !void
         .description = .{},
     }};
     rig.config_source.plans = &plans;
-    var candidate = rig.live.preparePresetForTransition("review", false) catch |err| {
+    var candidate = rig.live.preparePreset("review", .coordinated) catch |err| {
         try std.testing.expectEqual(@as(u64, 0), rig.live.generation);
         try std.testing.expectEqualStrings("old-model", rig.live.snapshot().model);
         try std.testing.expectEqualStrings("work", rig.session.currentSelection().preset.?);
@@ -1798,25 +1865,30 @@ test "preset persistence owns its name across cache invalidation" {
     const plans = [_]config.Preset.Plan{.{
         .name = &preset_name,
         .provider = @constCast("selection-test"),
-        .model = .{ .value = @constCast("preset-model") },
+        .model = .{ .value = @constCast("/models/Foo.GGUF") },
         .effort = .{},
         .system_prompt = .{},
         .system_prompt_append = .{},
-        .tint = .{},
+        .tint = .{ .value = @constCast("rose") },
         .description = .{},
     }};
     rig.config_source.plans = &plans;
     rig.config_source.invalidate_preset_name_on_publish = true;
+    try std.testing.expectEqual(@as(usize, 1), rig.live.presetPlans().len);
+    try std.testing.expect(rig.live.lookupPreset("review") == .plan);
     var state_writer: CapturingStateWriter = .{};
     rig.live.state_writer = state_writer.writer();
-    var candidate = try rig.live.preparePresetForTransition("review", false);
+    var candidate = try rig.live.preparePreset("review", .coordinated);
     defer if (candidate.active) candidate.deinit();
 
     var retired: RetiredPreset = undefined;
-    try std.testing.expectEqual(.written, rig.live.commitPresetForTransition(&candidate, &retired));
+    try std.testing.expectEqual(.written, rig.live.commitPreset(&candidate, &retired));
     defer retired.deinit();
     try std.testing.expectEqualStrings("xxxxxx", &preset_name);
     try std.testing.expectEqualStrings("review", state_writer.preset[0..state_writer.preset_len]);
+    try std.testing.expectEqualStrings("rose", rig.views.preset_tint.?);
+    try std.testing.expectEqualStrings("/models/Foo.GGUF", rig.live.current().model_label.?);
+    try std.testing.expect(rig.live.lookupPreset("review") == .missing);
 }
 
 test "critical preset publication defers every displaced free" {
@@ -1835,12 +1907,12 @@ test "critical preset publication defers every displaced free" {
         .description = .{},
     }};
     rig.config_source.plans = &plans;
-    var candidate = try rig.live.preparePresetForTransition("review", false);
+    var candidate = try rig.live.preparePreset("review", .coordinated);
     defer if (candidate.active) candidate.deinit();
 
     const frees_before = observer.frees;
     var retired: RetiredPreset = undefined;
-    _ = rig.live.commitPresetForTransition(&candidate, &retired);
+    _ = rig.live.commitPreset(&candidate, &retired);
     try std.testing.expectEqual(frees_before, observer.frees);
     retired.deinit();
     try std.testing.expect(observer.frees > frees_before);

@@ -1,5 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
+const config = @import("../config/root.zig");
+const render = @import("../render/root.zig");
 const ProviderConfig = @import("../ProviderConfig.zig");
 const terminal = @import("../terminal/root.zig");
 const ModelOrder = @import("ModelOrder.zig");
@@ -15,6 +17,11 @@ pub const ModelOutcome = union(enum) {
 };
 
 pub const ProviderOutcome = union(enum) {
+    canceled,
+    selected: usize,
+};
+
+pub const PresetOutcome = union(enum) {
     canceled,
     selected: usize,
 };
@@ -141,6 +148,74 @@ fn lessProviderIndex(choices: []const ProviderConfig.ProviderChoice, left: usize
     const label_order = std.mem.order(u8, choices[left].label, choices[right].label);
     if (label_order != .eq) return label_order == .lt;
     return std.mem.lessThan(u8, choices[left].id, choices[right].id);
+}
+
+/// Builds bounded preset rows and returns an index into the cached plan slice.
+pub fn preset(
+    allocator: std.mem.Allocator,
+    runner: Runner,
+    plans: []const config.Preset.Plan,
+    providers: []const ProviderConfig.ProviderChoice,
+    current_preset: ?[]const u8,
+    base_theme: render.Theme,
+) !PresetOutcome {
+    if (plans.len == 0) return .canceled;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+
+    var configured: std.StringHashMapUnmanaged(void) = .empty;
+    for (providers) |provider_value| try configured.put(temporary, provider_value.id, {});
+
+    const order = try temporary.alloc(usize, plans.len);
+    for (order, 0..) |*destination, index| destination.* = index;
+    std.mem.sort(usize, order, plans, lessPresetIndex);
+
+    const rows = try temporary.alloc(terminal.Picker.Item, plans.len);
+    var initial_index: usize = 0;
+    for (order, rows, 0..) |source_index, *row, row_index| {
+        const plan = &plans[source_index];
+        const known = ai.ProviderRegistry.find(plan.provider) != null or configured.contains(plan.provider);
+        const current = if (current_preset) |name| std.mem.eql(u8, name, plan.name) else false;
+        const preview = if (plan.tint.value) |tint| base_theme.withTint(tint) catch unreachable else base_theme;
+        row.* = .{
+            .label = plan.name,
+            .description = plan.description.value,
+            .detail = if (known)
+                try presetDetail(temporary, plan)
+            else
+                try std.fmt.allocPrint(temporary, "unknown provider '{s}'", .{plan.provider}),
+            .dim = !known,
+            .current = current,
+            .label_color = if (preview.stance.open.len == 0) null else preview.stance.open,
+        };
+        if (current) initial_index = row_index;
+    }
+
+    const selected = try runner.run("select a preset", rows, initial_index) orelse return .canceled;
+    std.debug.assert(selected < order.len);
+    return .{ .selected = order[selected] };
+}
+
+fn lessPresetIndex(plans: []const config.Preset.Plan, left: usize, right: usize) bool {
+    return std.mem.lessThan(u8, plans[left].name, plans[right].name);
+}
+
+fn presetDetail(allocator: std.mem.Allocator, plan: *const config.Preset.Plan) ![]const u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    var has_segment = false;
+    try appendSeparator(&output.writer, &has_segment);
+    try output.writer.writeAll(plan.provider);
+    if (plan.model.value) |model_value| if (model_value.len != 0) {
+        try appendSeparator(&output.writer, &has_segment);
+        try output.writer.writeAll(model_value);
+    };
+    if (plan.effort.value) |effort_value| if (effort_value.len != 0) {
+        try appendSeparator(&output.writer, &has_segment);
+        try output.writer.writeAll(effort_value);
+    };
+    return output.toOwnedSlice();
 }
 
 /// Builds bounded, picker-lifetime rows. `metadata` is aligned with `models` and
@@ -520,4 +595,92 @@ test "provider picker sorts labels and keeps unavailable rows selectable" {
 
 test "provider picker releases every partial allocation" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseProviderRows, .{});
+}
+
+const PresetRowRunner = struct {
+    rose: []const u8,
+    valid: bool = false,
+
+    pub fn run(
+        self: *PresetRowRunner,
+        title: []const u8,
+        items: []const terminal.Picker.Item,
+        initial_index: usize,
+    ) !?usize {
+        self.valid = std.mem.eql(u8, title, "select a preset") and items.len == 3 and
+            std.mem.eql(u8, items[0].label, "alpha") and items[0].dim and
+            std.mem.eql(u8, items[0].detail.?, "unknown provider 'missing'") and
+            std.mem.eql(u8, items[1].label, "review") and items[1].current and
+            std.mem.eql(u8, items[1].description.?, "review code") and
+            std.mem.eql(u8, items[1].detail.?, "mock · mock-model · high") and
+            std.mem.eql(u8, items[1].label_color.?, self.rose) and
+            std.mem.eql(u8, items[2].label, "work") and !items[2].dim and
+            std.mem.eql(u8, items[2].detail.?, "custom") and initial_index == 1;
+        return 2;
+    }
+};
+
+fn exercisePresetRows(allocator: std.mem.Allocator) !void {
+    const plans = [_]config.Preset.Plan{
+        .{
+            .name = @constCast("work"),
+            .provider = @constCast("custom"),
+            .model = .{},
+            .effort = .{},
+            .system_prompt = .{},
+            .system_prompt_append = .{},
+            .tint = .{},
+            .description = .{},
+        },
+        .{
+            .name = @constCast("alpha"),
+            .provider = @constCast("missing"),
+            .model = .{},
+            .effort = .{},
+            .system_prompt = .{},
+            .system_prompt_append = .{},
+            .tint = .{},
+            .description = .{},
+        },
+        .{
+            .name = @constCast("review"),
+            .provider = @constCast("mock"),
+            .model = .{ .value = @constCast("mock-model") },
+            .effort = .{ .value = @constCast("high") },
+            .system_prompt = .{},
+            .system_prompt_append = .{},
+            .tint = .{ .value = @constCast("rose") },
+            .description = .{ .value = @constCast("review code") },
+        },
+    };
+    const providers = [_]ProviderConfig.ProviderChoice{.{
+        .id = "custom",
+        .label = "Custom",
+        .available = false,
+        .reason = "offline",
+    }};
+    const base_theme = try render.Theme.resolve(.{
+        .configured_theme = "dark",
+        .configured_tint = "teal",
+    });
+    const rose = (try base_theme.withTint("rose")).stance.open;
+    var runner: PresetRowRunner = .{ .rose = rose };
+    const selected = try preset(
+        allocator,
+        Runner.from(&runner),
+        &plans,
+        &providers,
+        "review",
+        base_theme,
+    );
+    try std.testing.expect(runner.valid);
+    try std.testing.expectEqual(@as(usize, 0), selected.selected);
+}
+
+test "preset picker renders hax rows and maps sorted indexes" {
+    try exercisePresetRows(std.testing.allocator);
+}
+
+test "preset picker releases every partial allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exercisePresetRows, .{});
 }

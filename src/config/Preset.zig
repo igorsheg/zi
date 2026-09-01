@@ -350,8 +350,7 @@ fn promptMember(
 ) ValidationFailure!PromptResult {
     const raw = object.getPtr(key) orelse return .{ .value = null };
     const scalar = (Document.scalarString(allocator, raw) catch return error.OutOfMemory).?;
-    defer wipeFree(allocator, scalar);
-    const resolved = PromptValue.resolve(
+    var resolved = PromptValue.resolve(
         allocator,
         io,
         roots.secure_open,
@@ -359,16 +358,20 @@ fn promptMember(
         roots.config_root,
         roots.home,
         roots.cwd,
-    ) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Unresolved => .{ .invalid = .prompt_unresolved },
-        error.Read => .{ .invalid = .prompt_read },
-        error.Unreadable => .{ .invalid = .prompt_unreadable },
-        error.NonRegular => .{ .invalid = .prompt_non_regular },
-        error.TooLarge => .{ .invalid = .prompt_too_large },
-        error.InvalidPath => .{ .invalid = .prompt_invalid_path },
+    ) catch |err| {
+        wipeFree(allocator, scalar);
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Unresolved => .{ .invalid = .prompt_unresolved },
+            error.Read => .{ .invalid = .prompt_read },
+            error.Unreadable => .{ .invalid = .prompt_unreadable },
+            error.NonRegular => .{ .invalid = .prompt_non_regular },
+            error.TooLarge => .{ .invalid = .prompt_too_large },
+            error.InvalidPath => .{ .invalid = .prompt_invalid_path },
+        };
     };
-    return .{ .value = resolved.text };
+    resolved.deinit(allocator);
+    return .{ .value = scalar };
 }
 
 fn selectNode(
@@ -685,7 +688,7 @@ test "allowed scalar coercions, explicit empty, tint, unknown and atomic validat
     try std.testing.expectEqual(InvalidReason.invalid_tint, bad_tint.invalid.reason);
 }
 
-test "prompt files expand during validation and control bytes remain data" {
+test "prompt files validate while plans retain raw references" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "prompt", .data = "a\\b\x00c\n" });
@@ -710,7 +713,7 @@ test "prompt files expand during validation and control bytes remain data" {
     defer ok.deinit(std.testing.allocator);
     const plan = try expectPlan(&ok);
     try std.testing.expectEqualStrings("p\x01", plan.provider);
-    try std.testing.expectEqualStrings("a\\b\xef\xbf\xbdc", plan.system_prompt.value.?);
+    try std.testing.expectEqualStrings("@prompt", plan.system_prompt.value.?);
     var cwd = try lookup(
         std.testing.allocator,
         std.testing.io,
@@ -719,7 +722,7 @@ test "prompt files expand during validation and control bytes remain data" {
         "cwd",
     );
     defer cwd.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("from cwd", (try expectPlan(&cwd)).system_prompt.value.?);
+    try std.testing.expectEqualStrings("@~cwd", (try expectPlan(&cwd)).system_prompt.value.?);
     var bad = try lookup(
         std.testing.allocator,
         std.testing.io,
@@ -805,4 +808,40 @@ fn exerciseAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "enumeration frees every allocation on OOM" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseAllocationFailures, .{});
+}
+
+fn exerciseReadablePromptAllocations(
+    allocator: std.mem.Allocator,
+    access: *TestSecureOpen,
+    base: []const u8,
+) !void {
+    var document = try Document.parse(
+        allocator,
+        "{\"presets\":{\"review\":{\"provider\":\"p\",\"system_prompt\":\"@prompt\"}}}",
+        .{},
+    );
+    defer document.deinit();
+    var result = try lookup(
+        allocator,
+        std.testing.io,
+        .{ .config = &document },
+        .{ .secure_open = .from(access), .config_root = base },
+        "review",
+    );
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("@prompt", result.plan.system_prompt.value.?);
+}
+
+test "readable prompt validation frees every allocation and retains its reference" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "prompt", .data = "instructions" });
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseReadablePromptAllocations,
+        .{ &access, base },
+    );
 }
