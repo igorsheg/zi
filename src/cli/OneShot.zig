@@ -386,7 +386,7 @@ fn ignoreCatalogError(err: CallbackError) void {
 
 fn callSeam(inputs: Inputs, kind: agent.Loop.SeamKind) Error!void {
     const seam = inputs.seam_hook orelse return;
-    seam.call(inputs.session, kind, false) catch |err| return switch (err) {
+    _ = seam.call(inputs.session, kind, false) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Failed => error.Failed,
         error.Indeterminate => error.Indeterminate,
@@ -521,7 +521,7 @@ test "golden one-shot orders durability, final output, tasks, catalog, and notes
             session: *const agent.Session.Session,
             kind: agent.Loop.SeamKind,
             _: bool,
-        ) agent.Loop.HookError!void {
+        ) agent.Loop.HookError!agent.Loop.SeamDisposition {
             const byte: ?u8 = switch (kind) {
                 .prompt => 'P',
                 .completion => 'L',
@@ -533,6 +533,7 @@ test "golden one-shot orders durability, final output, tasks, catalog, and notes
                 if (session.items()[0] != .turn_boundary) return error.Failed;
             }
             if (byte) |value| self.order.append(std.testing.allocator, value) catch return error.OutOfMemory;
+            return .synchronized;
         }
     };
     const Info = struct {
@@ -584,7 +585,7 @@ test "golden one-shot orders durability, final output, tasks, catalog, and notes
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.Failed,
             };
-            if (seam_hook) |seam| seam.call(session, .task_note, false) catch |err| return switch (err) {
+            if (seam_hook) |seam| _ = seam.call(session, .task_note, false) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Failed => error.Failed,
                 error.Indeterminate => error.Indeterminate,

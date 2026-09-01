@@ -3,6 +3,7 @@ const ai = @import("../ai/root.zig");
 const render = @import("../render/root.zig");
 const text = @import("../text/root.zig");
 const DiagnosticText = @import("DiagnosticText.zig");
+const CompactConversation = @import("CompactConversation.zig");
 const Interactive = @import("Interactive.zig");
 const NewConversation = @import("NewConversation.zig");
 const ResumeConversation = @import("ResumeConversation.zig");
@@ -97,6 +98,13 @@ const specs = [_]Slash.Spec{
         .handler_fn = runEffort,
     },
     .{
+        .name = "compact",
+        .summary = "summarize history to free up context (optional: focus instructions)",
+        .arguments = .optional,
+        .display = .managed,
+        .handler_fn = runCompact,
+    },
+    .{
         .name = "help",
         .summary = "show this help",
         .handler_fn = runHelp,
@@ -125,6 +133,7 @@ pub const Owner = struct {
     new_conversation: ?NewConversation.Runner = null,
     resume_conversation: ?ResumeConversation.Runner = null,
     undo_conversation: ?UndoConversation.Runner = null,
+    compact_conversation: ?CompactConversation.Runner = null,
     persistence_warning_written: bool = false,
 
     pub fn init(
@@ -185,6 +194,10 @@ pub const Owner = struct {
 
     pub fn setUndoConversation(self: *Owner, runner: UndoConversation.Runner) void {
         self.undo_conversation = runner;
+    }
+
+    pub fn setCompactConversation(self: *Owner, runner: CompactConversation.Runner) void {
+        self.compact_conversation = runner;
     }
 
     pub fn gateway(self: *Owner) Interactive.CommandGateway {
@@ -314,6 +327,16 @@ pub const Owner = struct {
     fn writeNote(self: *Owner, message: []const u8) !void {
         try self.writeStyle(self.theme.chrome_dim.open);
         try self.write(message);
+        try self.writeStyle(self.theme.chrome_dim.close);
+        try self.write("\n");
+    }
+
+    fn writeCompactNotice(self: *Owner, message: []const u8) !void {
+        try self.beginCommandOutput();
+        try self.writeStyle(self.theme.chrome_dim.open);
+        try self.write("── ");
+        try self.write(message);
+        try self.write(" ──");
         try self.writeStyle(self.theme.chrome_dim.close);
         try self.write("\n");
     }
@@ -1100,6 +1123,45 @@ fn effortUnavailableMessage(
     ) catch "the current provider doesn't expose reasoning-effort levels";
 }
 
+fn runCompact(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
+    const self: *Owner = @ptrCast(@alignCast(context));
+    const runner = self.compact_conversation orelse return .handled;
+    var result = runner.run(call.argument);
+    defer result.deinit();
+
+    switch (result.outcome) {
+        .no_provider => try self.writeCompactNotice(CompactConversation.no_provider),
+        .no_model => try self.writeCompactNotice(CompactConversation.no_model),
+        .empty => try self.writeCompactNotice(CompactConversation.nothing),
+        .compacted => try self.writeCompactNotice("conversation compacted"),
+        .cancelled => try self.writeCompactNotice("compaction cancelled"),
+        .no_summary => try self.writeCompactNotice("compaction produced no summary"),
+        .provider_failure => failure: {
+            var storage: [4096]u8 = undefined;
+            var writer = std.Io.Writer.fixed(&storage);
+            writer.writeAll("compaction failed: ") catch unreachable;
+            DiagnosticText.write(&writer, result.diagnostic orelse "stream failed") catch {
+                try self.writeCompactNotice("compaction failed: stream failed");
+                break :failure;
+            };
+            try self.writeCompactNotice(writer.buffered());
+        },
+    }
+    if (result.issue.usage_observer_failed) try self.writeError(
+        "compaction usage was recorded in history but could not be added to usage totals",
+    );
+    switch (result.issue.durability) {
+        .failed => try self.writeError("compaction history changed but could not be recorded"),
+        .indeterminate => try self.writeError("compaction history changed and recording is uncertain"),
+        .not_attempted, .synchronized, .unrecorded => {},
+    }
+    if (result.issue.activity_failed) {
+        try self.writeError("compaction finished but terminal activity cleanup failed");
+        return error.ActivityCleanupFailed;
+    }
+    return if (result.mutation == .seed_committed) .history_changed else .handled;
+}
+
 fn runHelp(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
     const self: *Owner = @ptrCast(@alignCast(context));
     try self.renderHelp();
@@ -1199,6 +1261,22 @@ const FakeNewRunner = struct {
         return self.outcome;
     }
 };
+
+const FakeCompactRunner = struct {
+    result: CompactConversation.Result,
+    calls: usize = 0,
+    focus: ?[]const u8 = null,
+
+    pub fn run(self: *FakeCompactRunner, focus: ?[]const u8) CompactConversation.Result {
+        self.calls += 1;
+        self.focus = focus;
+        return self.result;
+    }
+};
+
+fn compactResult(outcome: CompactConversation.Outcome) CompactConversation.Result {
+    return .{ .allocator = std.testing.allocator, .outcome = outcome };
+}
 
 test "resume rejects arguments and cooked mode never invokes its runner" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -1306,6 +1384,68 @@ test "undo reports disk failure before any advisory replay" {
     try std.testing.expectEqual(@as(usize, 0), runner.replay_calls);
 }
 
+test "compact forwards optional focus and renders one exact product outcome" {
+    const cases = [_]struct { CompactConversation.Outcome, []const u8 }{
+        .{ .no_provider, "── " ++ CompactConversation.no_provider ++ " ──\n" },
+        .{ .no_model, "── " ++ CompactConversation.no_model ++ " ──\n" },
+        .{ .empty, "── " ++ CompactConversation.nothing ++ " ──\n" },
+        .{ .compacted, "── conversation compacted ──\n" },
+        .{ .cancelled, "── compaction cancelled ──\n" },
+        .{ .provider_failure, "── compaction failed: stream failed ──\n" },
+        .{ .no_summary, "── compaction produced no summary ──\n" },
+    };
+    for (cases) |case| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        var owner = Owner.init(&output.writer, try testTheme(), false, 100);
+        var runner: FakeCompactRunner = .{ .result = compactResult(case[0]) };
+        owner.setCompactConversation(CompactConversation.Runner.from(&runner));
+
+        const expected_outcome: Interactive.CommandOutcome = if (case[0] == .compacted) blk: {
+            runner.result.mutation = .seed_committed;
+            break :blk .history_changed;
+        } else .handled;
+        try std.testing.expectEqual(expected_outcome, try executeTestCommand(&owner, "/compact keep paths"));
+        try std.testing.expectEqualStrings("keep paths", runner.focus.?);
+        try std.testing.expectEqualStrings(case[1], output.written());
+    }
+}
+
+test "compact bounds oversized escaped provider diagnostics" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 100);
+    var diagnostic: [5000]u8 = undefined;
+    @memset(&diagnostic, 0);
+    var runner: FakeCompactRunner = .{ .result = compactResult(.provider_failure) };
+    runner.result.diagnostic = &diagnostic;
+    owner.setCompactConversation(CompactConversation.Runner.from(&runner));
+
+    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/compact"));
+    try std.testing.expectEqualStrings(
+        "── compaction failed: stream failed ──\n",
+        output.written(),
+    );
+}
+
+test "compact keeps seed success while rendering observer and durability warnings" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 100);
+    var runner: FakeCompactRunner = .{ .result = compactResult(.compacted) };
+    runner.result.mutation = .seed_committed;
+    runner.result.issue = .{ .usage_observer_failed = true, .durability = .indeterminate };
+    owner.setCompactConversation(CompactConversation.Runner.from(&runner));
+
+    try std.testing.expectEqual(.history_changed, try executeTestCommand(&owner, "/compact"));
+    try std.testing.expectEqualStrings(
+        "── conversation compacted ──\n" ++
+            "compaction usage was recorded in history but could not be added to usage totals\n" ++
+            "compaction history changed and recording is uncertain\n",
+        output.written(),
+    );
+}
+
 test "new and clear forward optional presets and map only changed history" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -1388,6 +1528,8 @@ test "help lists only implemented commands and supported shortcuts" {
             "  /provider    switch provider, then model and effort\n" ++
             "  /model       switch model, then effort\n" ++
             "  /effort      set reasoning effort\n" ++
+            "  /compact     summarize history to free up context (optional: focus\n" ++
+            "               instructions)\n" ++
             "  /help        show this help\n" ++
             "\nshortcuts\n" ++
             "  enter        submit prompt\n" ++

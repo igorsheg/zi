@@ -440,7 +440,7 @@ const MemoryTranscriptOpen = struct {
             self.owner.quarantine_on_truncate = false;
             const conversation = self.owner.conversation.?;
             conversation.session().addUser("settlement mutation") catch return error.OutOfMemory;
-            conversation.durability().seamHook().call(
+            _ = conversation.durability().seamHook().call(
                 conversation.session(),
                 .completion,
                 false,
@@ -486,7 +486,7 @@ const TestIdentity = struct {
         if (self.quarantine_during_prepare) {
             const conversation = self.conversation.?;
             conversation.session().addUser("late settlement history") catch return error.Unavailable;
-            conversation.durability().seamHook().call(
+            _ = conversation.durability().seamHook().call(
                 conversation.session(),
                 .completion,
                 false,
@@ -834,7 +834,7 @@ test "post-preset settlement failure retains preset and old history" {
     const plans = [_]config.Preset.Plan{testPresetPlan()};
     rig.config_source.plans = &plans;
     try rig.conversation.session().addUser("old history");
-    try rig.conversation.durability().seamHook().call(rig.conversation.session(), .completion, false);
+    _ = try rig.conversation.durability().seamHook().call(rig.conversation.session(), .completion, false);
     const old_items = rig.conversation.session().items().len;
     rig.transcript_memory.quarantine_on_truncate = true;
     var service = rig.service();

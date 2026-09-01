@@ -30,6 +30,7 @@ const ProcessFacts = @import("ProcessFacts.zig");
 const CodexFiles = @import("CodexFiles.zig");
 const SessionPicker = @import("SessionPicker.zig");
 const SessionStartup = @import("SessionStartup.zig");
+const CompactConversation = @import("CompactConversation.zig");
 const ConversationRuntime = @import("ConversationRuntime.zig");
 const NewConversation = @import("NewConversation.zig");
 const ResumeConversation = @import("ResumeConversation.zig");
@@ -843,6 +844,17 @@ pub fn run(
         .reset_sink = UndoConversation.ResetSink.from(&undo_reset),
     };
     const undo_conversation_runner = UndoConversation.Runner.from(&undo_conversation_service);
+    var compact_reset: CompactReset = .{};
+    var compact_conversation_service: CompactConversation.Service = .{
+        .allocator = allocator,
+        .io = io,
+        .session = conversation.session(),
+        .selection = CompactConversation.SelectionSource.from(&live),
+        .usage = &usage,
+        .seam_hook = run_log_seam.manualCompactionSeamHook(),
+        .reset_sink = CompactConversation.ResetSink.from(&compact_reset),
+    };
+    const compact_conversation_runner = CompactConversation.Runner.from(&compact_conversation_service);
     var catalog_hook: CatalogHook = .{
         .catalog_runtime = &catalog_runtime,
         .stats = &stats,
@@ -964,6 +976,7 @@ pub fn run(
                 commands.setNewConversation(new_conversation_runner);
                 commands.setResumeConversation(resume_conversation_runner);
                 commands.setUndoConversation(undo_conversation_runner);
+                commands.setCompactConversation(compact_conversation_runner);
                 commands.setIo(io);
                 var cooked_inputs = interactive_inputs;
                 cooked_inputs.command_gateway = commands.gateway();
@@ -994,6 +1007,8 @@ pub fn run(
                 &resume_conversation_service,
                 undo_conversation_runner,
                 &undo_conversation_service,
+                compact_conversation_runner,
+                &compact_conversation_service,
                 theme,
                 display_columns,
                 markdown_enabled,
@@ -1064,6 +1079,50 @@ const CompactCancellation = struct {
 
     pub fn sample(self: *CompactCancellation) bool {
         return self.interrupt.sample() != .none;
+    }
+
+    pub fn resolve(self: *CompactCancellation) bool {
+        return self.interrupt.resolve() != .none;
+    }
+};
+
+const RawCompactActivity = struct {
+    spinner: *render.Spinner.Spinner,
+    interrupt: *terminal_module.GenerationInterrupt,
+    cancellation: CompactCancellation,
+    started: bool = false,
+
+    pub fn begin(self: *RawCompactActivity) !?agent.CompactRunner.Cancellation {
+        try self.spinner.setLabel("compacting", "compacting...");
+        self.spinner.show();
+        self.interrupt.clearAndArm() catch |err| {
+            self.spinner.hide();
+            self.spinner.setLabel("", "") catch |reset_error| {
+                _ = @errorName(reset_error);
+            };
+            try self.spinner.check();
+            return err;
+        };
+        self.started = true;
+        return agent.CompactRunner.Cancellation.from(&self.cancellation);
+    }
+
+    pub fn finish(self: *RawCompactActivity) !void {
+        var first_error: ?anyerror = null;
+        if (self.started) {
+            self.interrupt.disarm() catch |err| {
+                first_error = err;
+            };
+            self.started = false;
+        }
+        self.spinner.hide();
+        self.spinner.setLabel("", "") catch |err| if (first_error == null) {
+            first_error = err;
+        };
+        self.spinner.check() catch |err| if (first_error == null) {
+            first_error = err;
+        };
+        if (first_error) |err| return err;
     }
 };
 
@@ -1384,6 +1443,8 @@ fn runRawInteractive(
     resume_service: *ResumeConversation.Service,
     undo_conversation: UndoConversation.Runner,
     undo_service: *UndoConversation.Service,
+    compact_conversation: CompactConversation.Runner,
+    compact_service: *CompactConversation.Service,
     theme: render.Theme,
     display_columns: terminal_module.DisplayColumns.Policy,
     markdown_enabled: bool,
@@ -1507,6 +1568,7 @@ fn runRawInteractive(
     commands.setNewConversation(new_conversation);
     commands.setResumeConversation(resume_conversation);
     commands.setUndoConversation(undo_conversation);
+    commands.setCompactConversation(compact_conversation);
     var selection_picker: SelectionPicker.TerminalRunner = .{
         .allocator = allocator,
         .io = io,
@@ -1635,6 +1697,13 @@ fn runRawInteractive(
     var compact_cancellation: CompactCancellation = .{ .interrupt = &interrupt };
     compaction.cancellation = agent.CompactRunner.Cancellation.from(&compact_cancellation);
     defer compaction.cancellation = null;
+    var compact_activity: RawCompactActivity = .{
+        .spinner = spinner,
+        .interrupt = &interrupt,
+        .cancellation = .{ .interrupt = &interrupt },
+    };
+    compact_service.activity = CompactConversation.Activity.from(&compact_activity);
+    defer compact_service.activity = null;
 
     var inputs = inputs_value;
     inputs.prompt_input = Interactive.PromptInput.from(&raw_input);
@@ -2160,6 +2229,10 @@ const UndoReset = struct {
     }
 };
 
+const CompactReset = struct {
+    pub fn reset(_: *CompactReset) void {}
+};
+
 const SessionInfo = struct {
     conversation: *ConversationRuntime.Owner,
     runtime: *ProviderRuntime.Owned,
@@ -2253,6 +2326,10 @@ const CompactionMarker = struct {
         try self.stderr.writeByte('\n');
     }
 
+    pub fn call(self: *CompactionMarker) void {
+        self.pending = true;
+    }
+
     pub fn emitPending(self: *CompactionMarker) agent.Loop.HookError!void {
         if (!self.pending) return;
         self.write() catch return error.Failed;
@@ -2309,17 +2386,18 @@ const AutoCompact = struct {
             .cancellation = self.cancellation,
             .seam_hook = self.seam_hook,
             .usage_observer = agent.Loop.UsageObserver.from(self.usage),
+            .accepted_mutation_hook = agent.CompactRunner.AcceptedMutationHook.from(self.marker),
         }) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            error.HookIndeterminate => error.Indeterminate,
             else => error.Failed,
         };
         defer result.deinit(self.allocator);
+        if (result.mutation == .seed_committed) self.usage.invalidateContext();
+        if (result.issue.durability == .indeterminate) return error.Indeterminate;
+        if (result.issue.usage_observer_failed or result.issue.durability == .failed) return error.Failed;
+        if (result.mutation == .seed_committed) return .selection_changed;
         return switch (result.outcome) {
-            .compacted => compacted: {
-                self.marker.pending = true;
-                break :compacted .changed;
-            },
+            .compacted => unreachable,
             .cancelled => .paused,
             .no_summary, .provider_failure => if (effort_changed) .selection_changed else .unchanged,
         };
@@ -2803,11 +2881,11 @@ test "compaction marker clears only after a successful write" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var marker: CompactionMarker = .{
-        .pending = true,
         .stderr = &output.writer,
         .style = true,
     };
 
+    marker.call();
     try marker.emitPending();
     try std.testing.expectEqualStrings(
         "\x1b[2m[compacted context]\x1b[0m\n",

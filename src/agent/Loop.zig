@@ -197,18 +197,23 @@ pub const SeamKind = enum {
     task_note,
 };
 
+pub const SeamDisposition = enum {
+    synchronized,
+    unrecorded,
+};
+
 /// Synchronous durability callback. The session and all of its contents are
 /// borrowed only for the duration of `call`.
 pub const SeamHook = struct {
     context: *anyopaque,
-    call_fn: *const fn (*anyopaque, *const Session, SeamKind, bool) HookError!void,
+    call_fn: *const fn (*anyopaque, *const Session, SeamKind, bool) HookError!SeamDisposition,
 
     pub fn call(
         self: SeamHook,
         session: *const Session,
         kind: SeamKind,
         next_action: bool,
-    ) HookError!void {
+    ) HookError!SeamDisposition {
         return self.call_fn(self.context, session, kind, next_action);
     }
 
@@ -225,7 +230,7 @@ pub const SeamHook = struct {
                 session: *const Session,
                 kind: SeamKind,
                 next_action: bool,
-            ) HookError!void {
+            ) HookError!SeamDisposition {
                 const self: *Implementation = @ptrCast(@alignCast(context));
                 return self.call(session, kind, next_action);
             }
@@ -591,7 +596,7 @@ fn mapUsageObserverError(err: UsageObserverError) Error {
 
 fn callSeam(params: Params, kind: SeamKind, next_action: bool) Error!void {
     const hook = params.seam_hook orelse return;
-    hook.call(params.session, kind, next_action) catch |err| return mapHookError(err);
+    _ = hook.call(params.session, kind, next_action) catch |err| return mapHookError(err);
 }
 
 fn absorbItems(params: Params, items: []const Item) Error!SessionModule.AbsorbResult {
@@ -1724,11 +1729,12 @@ test "cancelled abort seams repaired assistant and banked usage exactly once" {
             session: *const Session,
             kind: SeamKind,
             next_action: bool,
-        ) HookError!void {
+        ) HookError!SeamDisposition {
             self.calls += 1;
             self.kind = kind;
             self.next_action = next_action;
             self.item_count = session.items().len;
+            return .synchronized;
         }
     };
 
@@ -1793,11 +1799,12 @@ test "cancelled empty pause seams banked usage exactly once" {
             session: *const Session,
             kind: SeamKind,
             next_action: bool,
-        ) HookError!void {
+        ) HookError!SeamDisposition {
             self.calls += 1;
             self.kind = kind;
             self.next_action = next_action;
             self.item_count = session.items().len;
+            return .synchronized;
         }
     };
 
@@ -1860,7 +1867,7 @@ test "terminal usage hook failure keeps precedence after one interruption seam" 
         const Self = @This();
         calls: usize = 0,
 
-        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!void {
+        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!SeamDisposition {
             self.calls += 1;
             if (kind != .interruption or next_action) return error.Indeterminate;
             return error.Failed;
@@ -1961,9 +1968,10 @@ test "post-tool abort mark allocation failure settles interruption once" {
     const Seam = struct {
         const Self = @This();
         calls: usize = 0,
-        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!void {
+        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!SeamDisposition {
             if (kind != .interruption or next_action) return error.Failed;
             self.calls += 1;
+            return .synchronized;
         }
     };
 
@@ -2032,9 +2040,10 @@ test "tool-cancellation abort mark allocation failure settles without replay" {
     const Seam = struct {
         const Self = @This();
         calls: usize = 0,
-        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!void {
+        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!SeamDisposition {
             if (kind != .interruption or next_action) return error.Failed;
             self.calls += 1;
+            return .synchronized;
         }
     };
 
@@ -2126,9 +2135,10 @@ fn exerciseLoopAllocations(allocator: std.mem.Allocator) !void {
     const Seam = struct {
         const Self = @This();
         calls: usize = 0,
-        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!void {
+        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!SeamDisposition {
             if (kind != .completion or next_action) return error.Failed;
             self.calls += 1;
+            return .synchronized;
         }
     };
 
@@ -2177,9 +2187,10 @@ fn exerciseProviderFailureAllocations(allocator: std.mem.Allocator) !void {
     const Seam = struct {
         const Self = @This();
         calls: usize = 0,
-        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!void {
+        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!SeamDisposition {
             if (kind != .provider_failure or next_action) return error.Failed;
             self.calls += 1;
+            return .synchronized;
         }
     };
 
@@ -2405,11 +2416,12 @@ test "post-stream abort durably seams repaired assistant and usage once" {
             session: *const Session,
             kind: SeamKind,
             next_action: bool,
-        ) HookError!void {
+        ) HookError!SeamDisposition {
             self.calls += 1;
             self.kind = kind;
             self.next_action = next_action;
             self.item_count = session.items().len;
+            return .synchronized;
         }
     };
 
@@ -2600,7 +2612,7 @@ test "lifecycle hooks order durable tool continuation and final completion" {
             session: *const Session,
             kind: SeamKind,
             next_action: bool,
-        ) HookError!void {
+        ) HookError!SeamDisposition {
             switch (kind) {
                 .tool_batch => {
                     if (session.items()[session.items().len - 1] != .turn_usage) return error.Failed;
@@ -2619,6 +2631,7 @@ test "lifecycle hooks order durable tool continuation and final completion" {
                 },
                 .prompt, .provider_failure, .interruption, .pause, .task_note => return error.Failed,
             }
+            return .synchronized;
         }
     };
     const Usage = struct {
@@ -2698,8 +2711,9 @@ test "failed tool seam prevents the next provider stream" {
             _: *const Session,
             kind: SeamKind,
             _: bool,
-        ) HookError!void {
+        ) HookError!SeamDisposition {
             if (kind == .tool_batch) return error.Failed;
+            return .synchronized;
         }
     };
 
@@ -2752,7 +2766,7 @@ test "usage observer sees admitted provider failure and preserves out of memory"
     const Seam = struct {
         const Self = @This();
         calls: usize = 0,
-        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!void {
+        pub fn call(self: *Self, _: *const Session, kind: SeamKind, next_action: bool) HookError!SeamDisposition {
             if (kind != .provider_failure or next_action) return error.Indeterminate;
             self.calls += 1;
             return error.Failed;
@@ -2893,8 +2907,9 @@ test "continuation selection results explicitly resync active effort" {
         const Self = @This();
         compactions: usize = 0,
 
-        pub fn call(self: *Self, _: *const Session, kind: SeamKind, _: bool) HookError!void {
+        pub fn call(self: *Self, _: *const Session, kind: SeamKind, _: bool) HookError!SeamDisposition {
             if (kind == .compaction) self.compactions += 1;
+            return .synchronized;
         }
     };
 
@@ -3108,10 +3123,10 @@ test "run lease rejects nested runs and provider or observer mutations" {
         session: *Session,
         mutation_busy: bool = false,
 
-        pub fn call(self: *Self, _: *const Session, _: SeamKind, _: bool) HookError!void {
+        pub fn call(self: *Self, _: *const Session, _: SeamKind, _: bool) HookError!SeamDisposition {
             self.session.addUser("forbidden") catch |err| {
                 self.mutation_busy = err == error.SessionBusy;
-                return;
+                return .synchronized;
             };
             return error.Failed;
         }
@@ -3186,8 +3201,9 @@ fn exerciseToolSettlementAllocations(allocator: std.mem.Allocator) !void {
         const Self = @This();
         calls: usize = 0,
 
-        pub fn call(self: *Self, _: *const Session, kind: SeamKind, _: bool) HookError!void {
+        pub fn call(self: *Self, _: *const Session, kind: SeamKind, _: bool) HookError!SeamDisposition {
             if (kind == .tool_batch) self.calls += 1;
+            return .synchronized;
         }
     };
 
@@ -3989,11 +4005,12 @@ test "image input failure settles refused and abort-skipped placeholders" {
         next_action: bool = true,
         item_count: usize = 0,
 
-        pub fn call(self: *Self, session: *const Session, kind: SeamKind, next_action: bool) HookError!void {
+        pub fn call(self: *Self, session: *const Session, kind: SeamKind, next_action: bool) HookError!SeamDisposition {
             self.calls += 1;
             self.kind = kind;
             self.next_action = next_action;
             self.item_count = session.items().len;
+            return .synchronized;
         }
     };
 

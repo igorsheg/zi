@@ -4,6 +4,7 @@ const version = "0.1.0-dev";
 
 pub const Args = @import("Args.zig");
 pub const CodexFiles = @import("CodexFiles.zig");
+pub const CompactConversation = @import("CompactConversation.zig");
 pub const ConversationRuntime = @import("ConversationRuntime.zig");
 pub const ProcessAdapters = @import("ProcessAdapters.zig");
 pub const ProcessFacts = @import("ProcessFacts.zig");
@@ -218,6 +219,7 @@ fn writeHelp(writer: *std.Io.Writer) !void {
 test {
     _ = Args;
     _ = CodexFiles;
+    _ = CompactConversation;
     _ = ConversationRuntime;
     _ = ProcessAdapters;
     _ = ProcessFacts;

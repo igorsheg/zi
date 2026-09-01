@@ -122,12 +122,33 @@ pub const Owner = struct {
         return agent.Loop.SeamHook.from(self);
     }
 
+    /// Manual compaction uses the same transcript and durability route without
+    /// touching the automatic compaction marker.
+    pub fn manualCompactionSeamHook(self: *Owner) agent.Loop.SeamHook {
+        self.assertStable();
+        return .{ .context = self, .call_fn = callManual };
+    }
+
+    fn callManual(
+        context: *anyopaque,
+        session: *const agent.Session.Session,
+        kind: agent.Loop.SeamKind,
+        next_action: bool,
+    ) agent.Loop.HookError!agent.Loop.SeamDisposition {
+        const self: *Owner = @ptrCast(@alignCast(context));
+        self.enter();
+        defer self.leave();
+        const selection = self.selection orelse @panic("RunLogSeam used before binding RunSelection");
+        const snapshot = selection.snapshot();
+        return self.callView(session, kind, next_action, snapshot.system_prompt, snapshot.tools, false);
+    }
+
     pub fn call(
         self: *Owner,
         session: *const agent.Session.Session,
         kind: agent.Loop.SeamKind,
         next_action: bool,
-    ) agent.Loop.HookError!void {
+    ) agent.Loop.HookError!agent.Loop.SeamDisposition {
         self.enter();
         defer self.leave();
         const selection = self.selection orelse @panic("RunLogSeam used before binding RunSelection");
@@ -138,6 +159,7 @@ pub const Owner = struct {
             next_action,
             snapshot.system_prompt,
             snapshot.tools,
+            true,
         );
     }
 
@@ -162,10 +184,12 @@ pub const Owner = struct {
         next_action: bool,
         system_prompt: []const u8,
         tools: []const tool.Tool.Tool,
-    ) agent.Loop.HookError!void {
+        emit_marker: bool,
+    ) agent.Loop.HookError!agent.Loop.SeamDisposition {
         self.appendTranscript(session, system_prompt, tools);
-        try self.durability.call(session, kind, next_action);
-        if (kind == .compaction) if (self.marker) |marker| try marker.emitPending();
+        const disposition = try self.durability.call(session, kind, next_action);
+        if (emit_marker and kind == .compaction) if (self.marker) |marker| try marker.emitPending();
+        return disposition;
     }
 
     fn rebuildView(
@@ -459,7 +483,10 @@ test "warning drains before mandatory durability and marker follows success" {
     defer session.deinit();
     try session.appendCopy(&.{ .assistant_message = .{ .text = mutable("answer") } });
 
-    try seam.callView(&session, .compaction, false, "system", &.{});
+    try std.testing.expectEqual(
+        agent.Loop.SeamDisposition.synchronized,
+        seam.callView(&session, .compaction, false, "system", &.{}, true),
+    );
     try std.testing.expectEqualStrings("WDM", events.bytes[0..events.len]);
     try std.testing.expectEqual(@as(usize, 1), warning_sink.calls);
     try std.testing.expect(warning_sink.sequence != 0);
@@ -494,7 +521,7 @@ test "durability failure retains pending marker" {
 
     try std.testing.expectError(
         error.Failed,
-        seam.callView(&session, .compaction, false, "system", &.{}),
+        seam.callView(&session, .compaction, false, "system", &.{}, true),
     );
     try std.testing.expect(marker.pending);
     try std.testing.expectEqual(@as(usize, 0), marker.calls);
@@ -514,14 +541,28 @@ test "disabled transcript and unrecorded durability are exact no-ops" {
     var no_log: ?persistence.SessionFile.Log = null;
     const durability = try SessionDurability.Owner.create(allocator, &no_log, .{});
     defer durability.deinit();
-    const seam = try Owner.create(allocator, transcript_owner, durability, .{});
+    var events: TestEvents = .{};
+    var marker: TestMarker = .{ .events = &events };
+    const seam = try Owner.create(allocator, transcript_owner, durability, .{
+        .marker = Marker.from(&marker),
+    });
     defer seam.deinit();
     var session = try agent.Session.Session.init(allocator, .{});
     defer session.deinit();
 
-    try seam.callView(&session, .completion, false, "system", &.{});
+    try std.testing.expectEqual(
+        agent.Loop.SeamDisposition.unrecorded,
+        seam.callView(&session, .completion, false, "system", &.{}, true),
+    );
     try std.testing.expect(transcript_owner.status() == .disabled);
     try std.testing.expectEqual(SessionDurability.State.unrecorded, durability.state(&session));
+
+    try std.testing.expectEqual(
+        agent.Loop.SeamDisposition.unrecorded,
+        seam.callView(&session, .compaction, false, "system", &.{}, false),
+    );
+    try std.testing.expect(marker.pending);
+    try std.testing.expectEqual(@as(usize, 0), marker.calls);
 }
 
 test "rebuild replaces the advisory transcript from current history" {

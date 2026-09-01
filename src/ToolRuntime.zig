@@ -512,12 +512,12 @@ fn sameSeam(a: ?Loop.SeamHook, b: ?Loop.SeamHook) bool {
 
 fn flushTaskNote(seam: ?Loop.SeamHook, session: *const Session) Loop.HookError!void {
     const hook = seam orelse return;
-    try hook.call(session, .task_note, true);
+    _ = try hook.call(session, .task_note, true);
 }
 
 fn flushFinish(seam: ?Loop.SeamHook, session: *const Session) FinishError!void {
     const hook = seam orelse return;
-    hook.call(session, .task_note, false) catch |err| return switch (err) {
+    _ = hook.call(session, .task_note, false) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Failed => error.HookFailed,
         error.Indeterminate => error.HookIndeterminate,
@@ -749,13 +749,14 @@ test "pre-request hook appends notes before durability and never duplicates afte
             session: *const Session,
             kind: Loop.SeamKind,
             next_action: bool,
-        ) Loop.HookError!void {
+        ) Loop.HookError!Loop.SeamDisposition {
             if (kind != .task_note or !next_action) return error.Failed;
             if (session.items().len != 1) return error.Failed;
             if (session.items()[0] != .user_message) return error.Failed;
             if (session.items()[0].user_message.origin != .task_note) return error.Failed;
             self.calls += 1;
             if (self.fail) return error.Failed;
+            return .synchronized;
         }
     };
     var clock: TestClock = .{};
@@ -821,7 +822,9 @@ test "task hook permanently binds seam and session identities" {
     const Seam = struct {
         const Self = @This();
         identity: u8,
-        pub fn call(_: *Self, _: *const Session, _: Loop.SeamKind, _: bool) Loop.HookError!void {}
+        pub fn call(_: *Self, _: *const Session, _: Loop.SeamKind, _: bool) Loop.HookError!Loop.SeamDisposition {
+            return .synchronized;
+        }
     };
     var clock: TestClock = .{};
     var poller: TestPoller = .{};
@@ -861,11 +864,11 @@ test "nested finish is typed reentry and does not invalidate the outer task call
             _: *const Session,
             kind: Loop.SeamKind,
             next_action: bool,
-        ) Loop.HookError!void {
+        ) Loop.HookError!Loop.SeamDisposition {
             if (kind != .task_note or !next_action) return error.Failed;
             self.owner.finish(self.session, self.erased) catch |err| {
                 self.nested_error = err;
-                return;
+                return .synchronized;
             };
             return error.Failed;
         }
@@ -937,13 +940,13 @@ test "transition settlement always shuts down and retries pending flush without 
             _: *const Session,
             kind: Loop.SeamKind,
             next_action: bool,
-        ) Loop.HookError!void {
+        ) Loop.HookError!Loop.SeamDisposition {
             if (kind != .task_note or next_action) return error.Failed;
             self.calls += 1;
             return switch (self.mode) {
                 .failed => error.Failed,
                 .indeterminate => error.Indeterminate,
-                .success => {},
+                .success => .synchronized,
             };
         }
     };
@@ -999,7 +1002,7 @@ test "preexisting quarantine appends once without using the unusable seam" {
     const Seam = struct {
         const Self = @This();
         calls: usize = 0,
-        pub fn call(self: *Self, _: *const Session, _: Loop.SeamKind, _: bool) Loop.HookError!void {
+        pub fn call(self: *Self, _: *const Session, _: Loop.SeamKind, _: bool) Loop.HookError!Loop.SeamDisposition {
             self.calls += 1;
             return error.Indeterminate;
         }
@@ -1066,11 +1069,12 @@ test "terminal indeterminate flush wins and retry does not duplicate the note" {
             session: *const Session,
             kind: Loop.SeamKind,
             next_action: bool,
-        ) Loop.HookError!void {
+        ) Loop.HookError!Loop.SeamDisposition {
             if (kind != .task_note or next_action) return error.Failed;
             if (session.items().len != 1) return error.Failed;
             self.calls += 1;
             if (self.fail) return error.Indeterminate;
+            return .synchronized;
         }
     };
     var clock: TestClock = .{};

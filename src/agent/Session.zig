@@ -199,6 +199,39 @@ pub const PreparedUsage = struct {
     }
 };
 
+/// Move-only compaction seed and exact usage footer prepared for one of two
+/// allocation-free publications.
+pub const PreparedCompactSeed = struct {
+    owner: *Session,
+    generation: u64,
+    seed_item: ai.Item.Item,
+    usage: PreparedUsage,
+    retained_bytes: usize,
+    image_count: usize,
+    image_base64_bytes: usize,
+    active: bool = true,
+
+    pub fn deinit(self: *PreparedCompactSeed) void {
+        if (self.active) {
+            self.seed_item.deinit(self.owner.allocator);
+            self.usage.deinit(self.owner.allocator);
+        }
+        self.* = undefined;
+    }
+};
+
+/// Owns a prepared seed discarded by usage-only publication.
+pub const RetiredCompactSeed = struct {
+    item: ai.Item.Item,
+    allocator: std.mem.Allocator,
+    active: bool = true,
+
+    pub fn deinit(self: *RetiredCompactSeed) void {
+        if (self.active) self.item.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
 /// Owns one bounded flat provider-independent conversation record.
 pub const Session = struct {
     const RunState = enum { idle, running, hook, compacting, compaction_mutation };
@@ -893,6 +926,87 @@ pub const Session = struct {
             .image_count = image_count,
             .image_base64_bytes = image_base64_bytes,
         };
+    }
+
+    /// Copies and owns a compaction seed, reserves its complete commit, and
+    /// consumes `usage` only on success.
+    pub fn prepareCompactSeed(
+        self: *Session,
+        text: []const u8,
+        usage: *PreparedUsage,
+    ) Error!PreparedCompactSeed {
+        try self.ensureMutable();
+        std.debug.assert(usage.active);
+        if (text.len > self.limits.user_text_bytes) return error.UserTextTooLarge;
+
+        const owned_text = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned_text);
+        const seed_item: Item = .{ .user_message = .{
+            .text = owned_text,
+            .origin = .compact_seed,
+        } };
+        const admission = try self.reserveAdmission(&.{
+            .turn_boundary,
+            seed_item,
+            usage.item,
+        });
+
+        const moved_usage = usage.*;
+        usage.active = false;
+        return .{
+            .owner = self,
+            .generation = self.history_generation,
+            .seed_item = seed_item,
+            .usage = moved_usage,
+            .retained_bytes = admission.retained_bytes,
+            .image_count = admission.image_count,
+            .image_base64_bytes = admission.image_base64_bytes,
+        };
+    }
+
+    /// Publishes boundary, seed, and exact usage without allocating or freeing.
+    pub fn publishCompactSeed(self: *Session, prepared: *PreparedCompactSeed) void {
+        self.assertCompactSeedPublishable(prepared);
+        self.record.appendAssumeCapacity(.turn_boundary);
+        self.record.appendAssumeCapacity(prepared.seed_item);
+        self.record.appendAssumeCapacity(prepared.usage.item);
+        self.commitAdmission(.{
+            .retained_bytes = prepared.retained_bytes,
+            .image_count = prepared.image_count,
+            .image_base64_bytes = prepared.image_base64_bytes,
+        });
+        prepared.usage.active = false;
+        prepared.active = false;
+    }
+
+    /// Publishes only the exact usage and returns the discarded seed for cleanup
+    /// after the allocation-free commit section.
+    pub fn publishCompactUsageOnly(
+        self: *Session,
+        prepared: *PreparedCompactSeed,
+    ) RetiredCompactSeed {
+        self.assertCompactSeedPublishable(prepared);
+        self.record.appendAssumeCapacity(prepared.usage.item);
+        self.commitAdmission(.{
+            .retained_bytes = prepared.usage.retained_bytes,
+            .image_count = prepared.usage.image_count,
+            .image_base64_bytes = prepared.usage.image_base64_bytes,
+        });
+        prepared.usage.active = false;
+        prepared.active = false;
+        return .{ .item = prepared.seed_item, .allocator = self.allocator };
+    }
+
+    fn assertCompactSeedPublishable(
+        self: *Session,
+        prepared: *const PreparedCompactSeed,
+    ) void {
+        std.debug.assert(prepared.active);
+        std.debug.assert(prepared.usage.active);
+        std.debug.assert(prepared.owner == self);
+        std.debug.assert(prepared.generation == self.history_generation);
+        std.debug.assert(self.run_state == .compaction_mutation or self.run_state == .idle or
+            self.run_state == .hook);
     }
 
     /// Commits a prepared footer without allocating.
@@ -2120,6 +2234,161 @@ test "typed cut rejects invalid and busy sessions and cancellation changes nothi
     try session.addBoundary();
     try std.testing.expect(stale.generation != session.historyGeneration());
     try std.testing.expectEqual(count + 1, session.items().len);
+}
+
+test "compact seed preparation failure leaves exact usage active" {
+    var session = try Session.init(std.testing.allocator, .{
+        .limits = .{ .user_text_bytes = 3 },
+    });
+    defer session.deinit();
+    var usage = try session.prepareCompactionUsage(.{ .elapsed_ms = 1 });
+    defer if (usage.active) usage.deinit(std.testing.allocator);
+    const generation = session.historyGeneration();
+
+    try std.testing.expectError(error.UserTextTooLarge, session.prepareCompactSeed("four", &usage));
+    try std.testing.expect(usage.active);
+    try std.testing.expectEqual(@as(usize, 0), session.items().len);
+    try std.testing.expectEqual(generation, session.historyGeneration());
+
+    session.commitPreparedUsage(&usage);
+    try std.testing.expectEqual(@as(usize, 1), session.items().len);
+    try std.testing.expect(session.items()[0] == .turn_usage);
+}
+
+test "accepted compact seed publishes boundary seed usage and accounting" {
+    var session = try Session.init(std.testing.allocator, .{
+        .provider_id = "provider",
+        .model = "model",
+    });
+    defer session.deinit();
+    try session.addUser("existing");
+    var usage = try session.prepareCompactionUsage(.{
+        .stream = .{ .input_tokens = 8, .output_tokens = 2 },
+        .elapsed_ms = 9,
+        .response = .{ .id = "response", .route = "route" },
+    });
+    defer if (usage.active) usage.deinit(std.testing.allocator);
+    const generation = session.historyGeneration();
+    const old_items = session.items().len;
+    var prepared = try session.prepareCompactSeed("summary", &usage);
+    defer prepared.deinit();
+
+    try std.testing.expect(!usage.active);
+    try std.testing.expectEqual(generation, session.historyGeneration());
+    try std.testing.expectEqual(old_items, session.items().len);
+    session.publishCompactSeed(&prepared);
+
+    try std.testing.expectEqual(old_items + 3, session.items().len);
+    try std.testing.expect(session.items()[old_items] == .turn_boundary);
+    try std.testing.expectEqualStrings(
+        "summary",
+        session.items()[old_items + 1].user_message.text,
+    );
+    try std.testing.expectEqual(
+        ai.Item.UserOrigin.compact_seed,
+        session.items()[old_items + 1].user_message.origin,
+    );
+    try std.testing.expect(session.items()[old_items + 2] == .turn_usage);
+    try std.testing.expectEqual(generation +% 1, session.historyGeneration());
+
+    var retained_bytes: usize = 0;
+    for (session.items()) |item| retained_bytes += ai.Item.retainedBytes(item);
+    try std.testing.expectEqual(retained_bytes, session.retained_bytes);
+    try std.testing.expectEqual(ai.Item.imageCount(session.items()), session.image_count);
+    try std.testing.expectEqual(
+        ai.Item.imageBase64Bytes(session.items()),
+        session.image_base64_bytes,
+    );
+}
+
+test "compact seed usage-only publication retires and deinitializes the seed" {
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var usage = try session.prepareCompactionUsage(.{ .elapsed_ms = 1 });
+    defer if (usage.active) usage.deinit(std.testing.allocator);
+    const generation = session.historyGeneration();
+    var prepared = try session.prepareCompactSeed("discarded", &usage);
+    defer prepared.deinit();
+
+    var retired = session.publishCompactUsageOnly(&prepared);
+    try std.testing.expect(retired.active);
+    try std.testing.expectEqualStrings("discarded", retired.item.user_message.text);
+    try std.testing.expectEqual(@as(usize, 1), session.items().len);
+    try std.testing.expect(session.items()[0] == .turn_usage);
+    try std.testing.expectEqual(generation +% 1, session.historyGeneration());
+    try std.testing.expectEqual(ai.Item.retainedBytes(session.items()[0]), session.retained_bytes);
+    retired.deinit();
+}
+
+test "compact seed captures owner and becomes stale after history mutation" {
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var usage = try session.prepareCompactionUsage(.{ .elapsed_ms = 1 });
+    defer if (usage.active) usage.deinit(std.testing.allocator);
+    var prepared = try session.prepareCompactSeed("summary", &usage);
+    defer prepared.deinit();
+
+    try std.testing.expectEqual(&session, prepared.owner);
+    try std.testing.expectEqual(session.historyGeneration(), prepared.generation);
+    try session.addBoundary();
+    try std.testing.expect(prepared.generation != session.historyGeneration());
+}
+
+fn exerciseCompactSeedAllocations(allocator: std.mem.Allocator) !void {
+    var session = try Session.init(allocator, .{
+        .provider_id = "provider",
+        .model = "model",
+    });
+    defer session.deinit();
+    try session.addUser("history");
+    var usage = try session.prepareCompactionUsage(.{
+        .stream = .{ .input_tokens = 3, .output_tokens = 1 },
+        .elapsed_ms = 4,
+        .provider_label = "Provider",
+        .response = .{ .id = "response", .route = "route" },
+    });
+    defer if (usage.active) usage.deinit(allocator);
+    var prepared = try session.prepareCompactSeed("summary", &usage);
+    defer prepared.deinit();
+    session.publishCompactSeed(&prepared);
+    try std.testing.expectEqualStrings("summary", session.items()[3].user_message.text);
+}
+
+test "compact seed preparation handles every allocation failure without leaks" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseCompactSeedAllocations,
+        .{},
+    );
+}
+
+test "compact seed publication alternatives perform no allocations" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+
+    var accepted = try Session.init(allocator, .{});
+    defer accepted.deinit();
+    var accepted_usage = try accepted.prepareCompactionUsage(.{ .elapsed_ms = 1 });
+    var accepted_seed = try accepted.prepareCompactSeed("accepted", &accepted_usage);
+
+    failing.fail_index = failing.alloc_index;
+    const accepted_allocations = failing.alloc_index;
+    accepted.publishCompactSeed(&accepted_seed);
+    try std.testing.expectEqual(accepted_allocations, failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
+
+    failing.fail_index = std.math.maxInt(usize);
+    var cancelled = try Session.init(allocator, .{});
+    defer cancelled.deinit();
+    var cancelled_usage = try cancelled.prepareCompactionUsage(.{ .elapsed_ms = 1 });
+    var cancelled_seed = try cancelled.prepareCompactSeed("cancelled", &cancelled_usage);
+
+    failing.fail_index = failing.alloc_index;
+    const cancelled_allocations = failing.alloc_index;
+    var retired = cancelled.publishCompactUsageOnly(&cancelled_seed);
+    try std.testing.expectEqual(cancelled_allocations, failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
+    retired.deinit();
 }
 
 test "typed cut publication performs no allocations" {

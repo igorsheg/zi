@@ -390,9 +390,9 @@ pub const Owner = struct {
         session: *const agent.Session.Session,
         kind: agent.Loop.SeamKind,
         next_action: bool,
-    ) agent.Loop.HookError!void {
+    ) agent.Loop.HookError!agent.Loop.SeamDisposition {
         switch (self.authority) {
-            .unrecorded => return,
+            .unrecorded => return .unrecorded,
             .quarantined => return error.Indeterminate,
             .active => {},
         }
@@ -403,7 +403,7 @@ pub const Owner = struct {
             self.quarantine(.high_water_diverged);
             return error.Indeterminate;
         }
-        if (items.len == durable and !self.activeLog().hasPendingSelection()) return;
+        if (items.len == durable and !self.activeLog().hasPendingSelection()) return .synchronized;
 
         const outcome = self.activeLog().appendSnapshotClassified(durable, items) catch |err| {
             const classification = classifyAppendError(err);
@@ -436,6 +436,7 @@ pub const Owner = struct {
                 .high_water = items.len,
             }) catch |err| return mapObservationError(err);
         }
+        return .synchronized;
     }
 
     /// Retries an outstanding append. Quarantine is sticky until adoption or
@@ -1151,7 +1152,10 @@ test "owner consumes optional authority and owns unrecorded state" {
     try std.testing.expect(!owner.materialized());
     try std.testing.expect(owner.resumeHint() == null);
     try std.testing.expectEqual(ReconcileOutcome.unrecorded, owner.reconcile(&session));
-    try owner.seamHook().call(&session, .completion, false);
+    try std.testing.expectEqual(
+        agent.Loop.SeamDisposition.unrecorded,
+        owner.seamHook().call(&session, .completion, false),
+    );
 }
 
 test "create allocation failure leaves optional log with caller" {
@@ -1190,7 +1194,10 @@ test "active seam exposes pending state then synchronizes through classified app
     try std.testing.expectEqual(@as(usize, 0), pending.durable);
     try std.testing.expectError(error.PendingAppend, owner.prepareSelection(&session, .{}));
     try std.testing.expectEqual(@as(usize, 1), pending.memory);
-    try owner.seamHook().call(&session, .completion, true);
+    try std.testing.expectEqual(
+        agent.Loop.SeamDisposition.synchronized,
+        owner.seamHook().call(&session, .completion, true),
+    );
     try std.testing.expectEqual(@as(u64, 1), owner.generationValue());
     try std.testing.expectEqual(@as(usize, 1), owner.state(&session).synchronized);
     try std.testing.expect(owner.materialized());
@@ -1307,7 +1314,7 @@ test "failed resumed privacy verification drops authority after commit" {
     try std.testing.expect(!owner.tightenResumedAuthority());
     try std.testing.expectEqual(State.unrecorded, owner.state(&session));
     try std.testing.expect(owner.activePath() == null);
-    try owner.seamHook().call(&session, .completion, false);
+    _ = try owner.seamHook().call(&session, .completion, false);
 
     const reopened = try std.Io.Dir.openFile(.cwd(), io, path, .{ .mode = .read_only });
     defer reopened.close(io);
@@ -1451,7 +1458,7 @@ test "lazy old log task note materializes with old selection" {
     retired.deinit();
     defer transition.deinit();
     try session.addTaskNote("[task t1 killed at exit]");
-    try owner.seamHook().call(&session, .task_note, false);
+    _ = try owner.seamHook().call(&session, .task_note, false);
 
     const bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, owner.activePath().?, allocator, .unlimited);
     defer allocator.free(bytes);
@@ -1480,7 +1487,7 @@ test "materialized old log omits published preset selection after settlement" {
     });
     defer session.deinit();
     try session.addUser("old conversation");
-    try owner.seamHook().call(&session, .completion, false);
+    _ = try owner.seamHook().call(&session, .completion, false);
 
     var prepared = try owner.prepareSelection(&session, .{
         .provider = "new",
@@ -1492,7 +1499,7 @@ test "materialized old log omits published preset selection after settlement" {
     retired.deinit();
     defer transition.deinit();
     try session.addTaskNote("[task t1 killed at exit]");
-    try owner.seamHook().call(&session, .task_note, false);
+    _ = try owner.seamHook().call(&session, .task_note, false);
 
     const bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, owner.activePath().?, allocator, .unlimited);
     defer allocator.free(bytes);
@@ -1521,7 +1528,7 @@ test "restored transition selection flushes without a new item" {
     });
     defer session.deinit();
     try session.addUser("old conversation");
-    try owner.seamHook().call(&session, .completion, false);
+    _ = try owner.seamHook().call(&session, .completion, false);
 
     var prepared = try owner.prepareSelection(&session, .{
         .provider = "new",
@@ -1650,7 +1657,7 @@ test "undo cut bridge validates synchronized plans and rejects pending quarantin
     defer session.deinit();
     try session.addUser("first");
     try session.addUser("second");
-    try owner.call(&session, .completion, false);
+    _ = try owner.call(&session, .completion, false);
 
     var memory = try session.prepareTypedCut(1);
     defer memory.deinit();
@@ -1693,7 +1700,7 @@ test "prepared undo quarantines same-size rewrites and named replacements before
         defer session.deinit();
         try session.addUser("first");
         try session.addUser("second");
-        try owner.call(&session, .completion, false);
+        _ = try owner.call(&session, .completion, false);
         var memory = try session.prepareTypedCut(1);
         defer memory.deinit();
         var prepared = try owner.prepareCut(&session, &memory);
@@ -1713,7 +1720,7 @@ test "prepared undo quarantines same-size rewrites and named replacements before
         defer session.deinit();
         try session.addUser("first");
         try session.addUser("second");
-        try owner.call(&session, .completion, false);
+        _ = try owner.call(&session, .completion, false);
         var memory = try session.prepareTypedCut(1);
         defer memory.deinit();
         var prepared = try owner.prepareCut(&session, &memory);
@@ -1745,7 +1752,7 @@ test "undo cut bridge publishes committed sync failure before quarantine" {
     defer session.deinit();
     try session.addUser("first");
     try session.addUser("second");
-    try owner.call(&session, .completion, false);
+    _ = try owner.call(&session, .completion, false);
     var memory = try session.prepareTypedCut(1);
     defer memory.deinit();
     var prepared = try owner.prepareCut(&session, &memory);

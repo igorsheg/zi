@@ -565,7 +565,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
         defer if (sanitized) |bytes| allocator.free(bytes);
         if (resuming and abort_marker_placed) {
             try inputs.session.addContinuation();
-            if (inputs.seam_hook) |seam| try seam.call(inputs.session, .prompt, false);
+            if (inputs.seam_hook) |seam| _ = try seam.call(inputs.session, .prompt, false);
         } else if (!resuming) {
             sanitized = text.Utf8.sanitize(allocator, submitted, terminal.max_prompt_bytes) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -600,7 +600,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
                 },
             }
             try inputs.session.addUser(sanitized.?);
-            if (inputs.seam_hook) |seam| try seam.call(inputs.session, .prompt, false);
+            if (inputs.seam_hook) |seam| _ = try seam.call(inputs.session, .prompt, false);
         }
         resume_reason = .none;
         abort_marker_placed = false;
@@ -803,12 +803,13 @@ test "interactive reuses one session across prompts and exits on EOF" {
             _: *const agent.Session.Session,
             kind: agent.Loop.SeamKind,
             _: bool,
-        ) agent.Loop.HookError!void {
+        ) agent.Loop.HookError!agent.Loop.SeamDisposition {
             switch (kind) {
                 .prompt => self.prompts += 1,
                 .completion => self.completions += 1,
                 else => {},
             }
+            return .synchronized;
         }
     };
 
@@ -931,8 +932,9 @@ test "commands are classified before recall and bypass session provider flow" {
             _: *const agent.Session.Session,
             kind: agent.Loop.SeamKind,
             _: bool,
-        ) agent.Loop.HookError!void {
+        ) agent.Loop.HookError!agent.Loop.SeamDisposition {
             if (kind == .prompt) self.prompts += 1;
+            return .synchronized;
         }
     };
 
@@ -1269,8 +1271,9 @@ test "empty submit resumes a failed turn without adding another user message" {
             _: *const agent.Session.Session,
             kind: agent.Loop.SeamKind,
             _: bool,
-        ) agent.Loop.HookError!void {
+        ) agent.Loop.HookError!agent.Loop.SeamDisposition {
             if (kind == .prompt) self.prompts += 1;
+            return .synchronized;
         }
     };
 
@@ -1451,8 +1454,9 @@ test "marked partial failure resumes through a durable continuation item" {
             _: *const agent.Session.Session,
             kind: agent.Loop.SeamKind,
             _: bool,
-        ) agent.Loop.HookError!void {
+        ) agent.Loop.HookError!agent.Loop.SeamDisposition {
             if (kind == .prompt) self.prompts += 1;
+            return .synchronized;
         }
     };
 

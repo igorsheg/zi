@@ -27,9 +27,14 @@ const maximum_scratch_items: usize = 24 * 1024;
 pub const Cancellation = struct {
     context: *anyopaque,
     sample_fn: *const fn (*anyopaque) bool,
+    resolve_fn: *const fn (*anyopaque) bool,
 
     pub fn sample(self: Cancellation) bool {
         return self.sample_fn(self.context);
+    }
+
+    pub fn resolve(self: Cancellation) bool {
+        return self.resolve_fn(self.context);
     }
 
     pub fn from(implementation: anytype) Cancellation {
@@ -44,8 +49,44 @@ pub const Cancellation = struct {
                 const self: *Implementation = @ptrCast(@alignCast(context));
                 return self.sample();
             }
+
+            fn resolve(context: *anyopaque) bool {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                return self.resolve();
+            }
         };
-        return .{ .context = implementation, .sample_fn = Adapter.sample };
+        return .{
+            .context = implementation,
+            .sample_fn = Adapter.sample,
+            .resolve_fn = Adapter.resolve,
+        };
+    }
+};
+
+/// Runs immediately after accepted seed publication and before observation or
+/// durability. Implementations must be allocation-free, infallible, and non-reentrant.
+pub const AcceptedMutationHook = struct {
+    context: *anyopaque,
+    call_fn: *const fn (*anyopaque) void,
+
+    pub fn call(self: AcceptedMutationHook) void {
+        self.call_fn(self.context);
+    }
+
+    pub fn from(implementation: anytype) AcceptedMutationHook {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("AcceptedMutationHook.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn call(context: *anyopaque) void {
+                const self: *Implementation = @ptrCast(@alignCast(context));
+                self.call();
+            }
+        };
+        return .{ .context = implementation, .call_fn = Adapter.call };
     }
 };
 
@@ -66,6 +107,7 @@ pub const Params = struct {
     observer: ?Observer = null,
     seam_hook: ?SeamHook = null,
     usage_observer: ?UsageObserver = null,
+    accepted_mutation_hook: ?AcceptedMutationHook = null,
 };
 
 pub const Outcome = enum {
@@ -75,8 +117,32 @@ pub const Outcome = enum {
     cancelled,
 };
 
+pub const Mutation = enum { none, usage_only, seed_committed };
+
+pub const Durability = enum {
+    not_attempted,
+    synchronized,
+    unrecorded,
+    failed,
+    indeterminate,
+};
+
+pub const UsageDisposition = enum {
+    committed,
+    preparation_failed,
+};
+
+pub const PostProviderIssue = struct {
+    usage_observer_failed: bool = false,
+    durability: Durability = .not_attempted,
+    diagnostic_omitted: bool = false,
+};
+
 pub const Result = struct {
     outcome: Outcome,
+    mutation: Mutation,
+    usage: UsageDisposition,
+    issue: PostProviderIssue,
     attempts: usize,
     diagnostic: ?[]u8 = null,
 
@@ -90,39 +156,11 @@ pub const RunError = error{
     OutOfMemory,
     SessionBusy,
     InstructionsTooLarge,
-    SummaryTooLarge,
     FinalTextTooLarge,
-    TooManyItems,
-    TooManyPendingToolCalls,
-    TooManyRetryUsages,
-    TextTooLarge,
-    ReasoningTooLarge,
-    ToolArgumentsTooLarge,
-    ToolIdTooLarge,
-    ToolNameTooLarge,
-    ReasoningOpaqueTooLarge,
-    UserTextTooLarge,
-    ProviderIdTooLarge,
-    ModelIdTooLarge,
-    LabelTooLarge,
-    EffortTooLarge,
-    PresetTooLarge,
-    RetainedDataTooLarge,
-    TooManyImages,
-    ImageDataTooLarge,
-    ProvenanceTooLarge,
-    TurnStillStreaming,
-    TurnNeedsRepair,
-    InvalidItemIndex,
-    InvalidItem,
-    InvalidUsage,
     InvalidRegistry,
     InvalidResult,
     InvalidMaxAttempts,
     ScratchTooLarge,
-    HookFailed,
-    HookIndeterminate,
-    UsageCapacityExceeded,
 };
 
 const Captured = struct {
@@ -177,7 +215,7 @@ const Sink = struct {
     turn: *Turn,
     captured: *Captured,
     observer: ?Observer,
-    assembly_error: ?RunError = null,
+    assembly_error: ?anyerror = null,
 
     pub fn emit(self: *Sink, event: ai.StreamEvent.StreamEvent) ai.Provider.DeliveryError!void {
         if (self.observer) |observer| observer.emit(event);
@@ -219,6 +257,11 @@ const CancelState = struct {
         if (self.upstream) |tick| try tick.poll();
         if (self.sample()) return error.Cancelled;
     }
+
+    fn resolve(self: *CancelState) bool {
+        if (self.cancellation) |cancellation| self.latched = self.latched or cancellation.resolve();
+        return self.latched;
+    }
 };
 
 fn resolveModelMetadata(
@@ -230,29 +273,12 @@ fn resolveModelMetadata(
     return source.resolve(allocator, io) catch params.model_metadata;
 }
 
-fn mapHookError(err: Loop.HookError) RunError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Failed => error.HookFailed,
-        error.Indeterminate => error.HookIndeterminate,
-    };
-}
-
 const UsageInputResolution = struct {
     input: SessionModule.UsageInput,
     spend: ai.UsagePricing.Spend,
     attempts: [TurnModule.maximum_retry_usages + 1]ai.Usage.StreamUsage = undefined,
     attempt_count: usize = 0,
 };
-
-fn mapUsageObserverError(err: Loop.UsageObserverError) RunError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.CapacityExceeded => error.UsageCapacityExceeded,
-        error.Failed => error.HookFailed,
-        error.Indeterminate => error.HookIndeterminate,
-    };
-}
 
 fn usageInput(
     params: Params,
@@ -291,8 +317,8 @@ fn usageInput(
     return result;
 }
 
-fn observeLatestUsage(params: Params, resolution: *const UsageInputResolution) RunError!void {
-    const observer = params.usage_observer orelse return;
+fn observeLatestUsage(params: Params, resolution: *const UsageInputResolution) bool {
+    const observer = params.usage_observer orelse return false;
     const item = params.session.items()[params.session.items().len - 1];
     std.debug.assert(item == .turn_usage);
     observer.observe(.{
@@ -301,66 +327,122 @@ fn observeLatestUsage(params: Params, resolution: *const UsageInputResolution) R
         .attempts = resolution.attempts[0..resolution.attempt_count],
         .kind = .compaction,
         .terminal_context_tokens = null,
-    }) catch |err| return mapUsageObserverError(err);
+    }) catch return true;
+    return false;
 }
 
 fn prepareUsage(
     params: Params,
     input: SessionModule.UsageInput,
-) RunError!SessionModule.PreparedUsage {
+) SessionModule.Error!SessionModule.PreparedUsage {
     params.session.beginCompactionMutation();
-    const prepared = params.session.prepareCompactionUsage(input) catch |err| {
-        params.session.endCompactionMutation();
-        return err;
-    };
-    params.session.endCompactionMutation();
-    return prepared;
+    defer params.session.endCompactionMutation();
+    return params.session.prepareCompactionUsage(input);
 }
 
-fn commitUsage(
-    params: Params,
-    prepared: *SessionModule.PreparedUsage,
-    resolution: *const UsageInputResolution,
-) RunError!void {
+fn commitUsage(params: Params, prepared: *SessionModule.PreparedUsage) void {
     params.session.beginCompactionMutation();
+    defer params.session.endCompactionMutation();
     params.session.commitPreparedUsage(prepared);
-    params.session.endCompactionMutation();
-    try observeLatestUsage(params, resolution);
 }
 
-fn commitAccepted(
+fn prepareSeed(
     params: Params,
     seed: []const u8,
-    prepared: *SessionModule.PreparedUsage,
-) RunError!void {
+    usage: *SessionModule.PreparedUsage,
+) SessionModule.Error!SessionModule.PreparedCompactSeed {
     params.session.beginCompactionMutation();
-    params.session.commitCompactSeedPrepared(seed, prepared) catch |err| {
-        params.session.endCompactionMutation();
-        return err;
-    };
-    params.session.endCompactionMutation();
+    defer params.session.endCompactionMutation();
+    return params.session.prepareCompactSeed(seed, usage);
 }
 
-fn callSeam(params: Params, next_action: bool) RunError!void {
-    const hook = params.seam_hook orelse return;
-    hook.call(params.session, .compaction, next_action) catch |err| return mapHookError(err);
+fn publishSeed(params: Params, prepared: *SessionModule.PreparedCompactSeed) void {
+    params.session.beginCompactionMutation();
+    defer params.session.endCompactionMutation();
+    params.session.publishCompactSeed(prepared);
 }
 
-fn commitTerminalUsage(
+fn publishUsageOnly(
     params: Params,
-    prepared: *SessionModule.PreparedUsage,
-    resolution: *const UsageInputResolution,
-) RunError!void {
-    try commitUsage(params, prepared, resolution);
-    try callSeam(params, false);
+    prepared: *SessionModule.PreparedCompactSeed,
+) SessionModule.RetiredCompactSeed {
+    params.session.beginCompactionMutation();
+    defer params.session.endCompactionMutation();
+    return params.session.publishCompactUsageOnly(prepared);
 }
 
-fn copyStreamErrorDiagnostic(
+fn callSeam(params: Params, next_action: bool) Durability {
+    const hook = params.seam_hook orelse return .unrecorded;
+    const disposition = hook.call(params.session, .compaction, next_action) catch |err| return switch (err) {
+        error.Indeterminate => .indeterminate,
+        error.OutOfMemory, error.Failed => .failed,
+    };
+    return switch (disposition) {
+        .synchronized => .synchronized,
+        .unrecorded => .unrecorded,
+    };
+}
+
+fn classifyCommitted(
+    params: Params,
+    resolution: *const UsageInputResolution,
+    next_action: bool,
+) PostProviderIssue {
+    const usage_observer_failed = observeLatestUsage(params, resolution);
+    return .{
+        .usage_observer_failed = usage_observer_failed,
+        .durability = callSeam(params, next_action and !usage_observer_failed),
+    };
+}
+
+fn terminalNextAction(lease: Lease, outcome: Outcome) bool {
+    return lease == .continuation and outcome != .cancelled;
+}
+
+fn ownedErrorDiagnostic(
     allocator: std.mem.Allocator,
-    stream_error: ai.Provider.StreamError,
-) error{OutOfMemory}![]u8 {
-    const name = @errorName(stream_error);
-    return allocator.dupe(u8, name[0..@min(name.len, maximum_diagnostic_bytes)]);
+    err: anyerror,
+    issue: *PostProviderIssue,
+) ?[]u8 {
+    const name = @errorName(err);
+    return allocator.dupe(u8, name[0..@min(name.len, maximum_diagnostic_bytes)]) catch {
+        issue.diagnostic_omitted = true;
+        return null;
+    };
+}
+
+fn usagePreparationFailure(captured: *Captured, attempts: usize) Result {
+    const diagnostic = captured.takeDiagnostic();
+    return .{
+        .outcome = .provider_failure,
+        .mutation = .none,
+        .usage = .preparation_failed,
+        .issue = .{ .diagnostic_omitted = diagnostic == null },
+        .attempts = attempts,
+        .diagnostic = diagnostic,
+    };
+}
+
+fn committedResult(
+    params: Params,
+    resolution: *const UsageInputResolution,
+    outcome: Outcome,
+    mutation: Mutation,
+    attempts: usize,
+    next_action: bool,
+    diagnostic: ?[]u8,
+    diagnostic_omitted: bool,
+) Result {
+    var issue = classifyCommitted(params, resolution, next_action);
+    issue.diagnostic_omitted = diagnostic_omitted;
+    return .{
+        .outcome = outcome,
+        .mutation = mutation,
+        .usage = .committed,
+        .issue = issue,
+        .attempts = attempts,
+        .diagnostic = diagnostic,
+    };
 }
 
 fn appendScratchClone(allocator: std.mem.Allocator, scratch: *std.ArrayList(Item), item: Item) RunError!void {
@@ -422,7 +504,12 @@ fn runWithLease(allocator: std.mem.Allocator, io: std.Io, params: Params, lease:
     const dispatch = try tool.Dispatch.Dispatch.init(params.tools, .{});
     const definitions = try dispatch.advertisedDefinitions(allocator);
     defer allocator.free(definitions);
-    var checkpoint = try Compact.buildCheckpointPrompt(allocator, params.focus);
+    var checkpoint = Compact.buildCheckpointPrompt(allocator, params.focus) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InstructionsTooLarge => return error.InstructionsTooLarge,
+        error.FinalTextTooLarge => return error.FinalTextTooLarge,
+        error.SummaryTooLarge => unreachable,
+    };
     defer checkpoint.deinit(allocator);
 
     const retained = params.session.items();
@@ -466,40 +553,64 @@ fn runWithLease(allocator: std.mem.Allocator, io: std.Io, params: Params, lease:
         const model_metadata = resolveModelMetadata(allocator, io, params);
         const resolution = usageInput(params, &model_metadata, &turn, elapsed_ms, captured.response);
         const cancelled = cancel_state.sample();
-        var prepared = try prepareUsage(params, resolution.input);
+        var prepared = prepareUsage(params, resolution.input) catch
+            return usagePreparationFailure(&captured, attempt);
         defer prepared.deinit(params.session.allocator);
 
         if (sink.assembly_error) |assembly_error| {
-            try commitTerminalUsage(params, &prepared, &resolution);
-            return assembly_error;
+            commitUsage(params, &prepared);
+            var issue: PostProviderIssue = .{};
+            const diagnostic = captured.takeDiagnostic() orelse
+                ownedErrorDiagnostic(allocator, assembly_error, &issue);
+            return committedResult(
+                params,
+                &resolution,
+                .provider_failure,
+                .usage_only,
+                attempt,
+                terminalNextAction(lease, .provider_failure),
+                diagnostic,
+                issue.diagnostic_omitted,
+            );
         }
         if (stream_result) |_| {} else |stream_error| {
-            if (stream_error == error.OutOfMemory) {
-                try commitTerminalUsage(params, &prepared, &resolution);
-                return error.OutOfMemory;
-            }
-            var diagnostic = captured.takeDiagnostic();
-            errdefer if (diagnostic) |value| allocator.free(value);
-            if (diagnostic == null) {
-                diagnostic = copyStreamErrorDiagnostic(allocator, stream_error) catch |err| {
-                    try commitTerminalUsage(params, &prepared, &resolution);
-                    return err;
-                };
-            }
-            try commitTerminalUsage(params, &prepared, &resolution);
-            return .{
-                .outcome = if (stream_error == error.Cancelled or cancelled) .cancelled else .provider_failure,
-                .attempts = attempt,
-                .diagnostic = diagnostic,
-            };
+            commitUsage(params, &prepared);
+            var issue: PostProviderIssue = .{};
+            const diagnostic = captured.takeDiagnostic() orelse
+                ownedErrorDiagnostic(allocator, stream_error, &issue);
+            const outcome: Outcome = if (stream_error == error.Cancelled or cancelled)
+                .cancelled
+            else
+                .provider_failure;
+            return committedResult(
+                params,
+                &resolution,
+                outcome,
+                .usage_only,
+                attempt,
+                terminalNextAction(lease, outcome),
+                diagnostic,
+                issue.diagnostic_omitted,
+            );
         }
         if (turn.state != .done or cancelled) {
-            try commitTerminalUsage(params, &prepared, &resolution);
-            return .{
-                .outcome = if (cancelled) .cancelled else .provider_failure,
-                .attempts = attempt,
-                .diagnostic = captured.takeDiagnostic(),
-            };
+            commitUsage(params, &prepared);
+            var issue: PostProviderIssue = .{};
+            const diagnostic = if (cancelled)
+                captured.takeDiagnostic()
+            else
+                captured.takeDiagnostic() orelse ownedErrorDiagnostic(allocator, error.InvalidResult, &issue);
+            const outcome: Outcome = if (cancelled) .cancelled else .provider_failure;
+            return committedResult(
+                params,
+                &resolution,
+                outcome,
+                .usage_only,
+                attempt,
+                terminalNextAction(lease, outcome),
+                diagnostic,
+                issue.diagnostic_omitted,
+            );
         }
 
         const summary = Compact.selectSummary(.{ .terminal = .done, .items = turn.items.items });
@@ -511,29 +622,112 @@ fn runWithLease(allocator: std.mem.Allocator, io: std.Io, params: Params, lease:
         if (!has_tool_call) {
             if (summary) |text| {
                 var seed = Compact.buildSeed(allocator, text) catch |err| {
-                    try commitTerminalUsage(params, &prepared, &resolution);
-                    return err;
+                    commitUsage(params, &prepared);
+                    var issue: PostProviderIssue = .{};
+                    const diagnostic = ownedErrorDiagnostic(allocator, err, &issue);
+                    return committedResult(
+                        params,
+                        &resolution,
+                        .provider_failure,
+                        .usage_only,
+                        attempt,
+                        terminalNextAction(lease, .provider_failure),
+                        diagnostic,
+                        issue.diagnostic_omitted,
+                    );
                 };
                 defer seed.deinit(allocator);
-                commitAccepted(params, seed.bytes, &prepared) catch |err| {
-                    try commitTerminalUsage(params, &prepared, &resolution);
-                    return err;
+                var seed_candidate = prepareSeed(params, seed.bytes, &prepared) catch |err| {
+                    commitUsage(params, &prepared);
+                    var issue: PostProviderIssue = .{};
+                    const diagnostic = ownedErrorDiagnostic(allocator, err, &issue);
+                    return committedResult(
+                        params,
+                        &resolution,
+                        .provider_failure,
+                        .usage_only,
+                        attempt,
+                        terminalNextAction(lease, .provider_failure),
+                        diagnostic,
+                        issue.diagnostic_omitted,
+                    );
                 };
-                try observeLatestUsage(params, &resolution);
-                if (lease == .standalone) try callSeam(params, false);
-                return .{ .outcome = .compacted, .attempts = attempt };
+                defer seed_candidate.deinit();
+
+                if (cancel_state.resolve()) {
+                    var retired = publishUsageOnly(params, &seed_candidate);
+                    retired.deinit();
+                    return committedResult(
+                        params,
+                        &resolution,
+                        .cancelled,
+                        .usage_only,
+                        attempt,
+                        false,
+                        null,
+                        false,
+                    );
+                }
+
+                publishSeed(params, &seed_candidate);
+                if (params.accepted_mutation_hook) |hook| hook.call();
+                return committedResult(
+                    params,
+                    &resolution,
+                    .compacted,
+                    .seed_committed,
+                    attempt,
+                    lease == .continuation,
+                    null,
+                    false,
+                );
             }
-            try commitTerminalUsage(params, &prepared, &resolution);
-            return .{ .outcome = .no_summary, .attempts = attempt };
+            commitUsage(params, &prepared);
+            return committedResult(
+                params,
+                &resolution,
+                .no_summary,
+                .usage_only,
+                attempt,
+                terminalNextAction(lease, .no_summary),
+                null,
+                false,
+            );
         }
 
-        try commitUsage(params, &prepared, &resolution);
-        if (attempt == params.max_attempts) {
-            try callSeam(params, false);
-            return .{ .outcome = .no_summary, .attempts = attempt };
+        commitUsage(params, &prepared);
+        const retry_compaction = attempt < params.max_attempts;
+        const next_action = retry_compaction or lease == .continuation;
+        var issue = classifyCommitted(params, &resolution, next_action);
+        if (!retry_compaction) return .{
+            .outcome = .no_summary,
+            .mutation = .usage_only,
+            .usage = .committed,
+            .issue = issue,
+            .attempts = attempt,
+        };
+        if (issue.usage_observer_failed or
+            (issue.durability != .synchronized and issue.durability != .unrecorded))
+        {
+            return .{
+                .outcome = .provider_failure,
+                .mutation = .usage_only,
+                .usage = .committed,
+                .issue = issue,
+                .attempts = attempt,
+            };
         }
-        try callSeam(params, true);
-        try appendRejectedResponse(allocator, &scratch, turn.items.items);
+        appendRejectedResponse(allocator, &scratch, turn.items.items) catch |err| {
+            const diagnostic = ownedErrorDiagnostic(allocator, err, &issue);
+            return .{
+                .outcome = .provider_failure,
+                .mutation = .usage_only,
+                .usage = .committed,
+                .issue = issue,
+                .attempts = attempt,
+                .diagnostic = diagnostic,
+            };
+        };
     }
 
     unreachable;
@@ -603,13 +797,14 @@ const SeamRecorder = struct {
         session: *const Session,
         kind: Loop.SeamKind,
         next_action: bool,
-    ) Loop.HookError!void {
+    ) Loop.HookError!Loop.SeamDisposition {
         std.debug.assert(kind == .compaction);
         const last = session.items()[session.items().len - 1];
         std.debug.assert(last == .turn_usage);
         self.next_actions[self.calls] = next_action;
         self.calls += 1;
         if (self.fail_at == self.calls) return error.Failed;
+        return .synchronized;
     }
 };
 
@@ -709,6 +904,76 @@ test "four rejected attempts exhaust the fixed maximum" {
     ));
 }
 
+test "rejected retries stop after observer or durability issue" {
+    inline for (.{ true, false }) |fail_observer| {
+        var session = try Session.init(std.testing.allocator, .{});
+        defer session.deinit();
+        var provider: ScriptedProvider = .{ .steps = &.{ .tool, .success } };
+        var observer: ExactUsage = .{ .failure = error.Failed };
+        var seam: SeamRecorder = .{ .fail_at = if (fail_observer) null else 1 };
+        var result = try run(std.testing.allocator, std.testing.io, .{
+            .session = &session,
+            .provider = ai.Provider.Provider.from(&provider, "provider"),
+            .model = "model",
+            .system_prompt = "system",
+            .usage_observer = if (fail_observer) UsageObserver.from(&observer) else null,
+            .seam_hook = SeamHook.from(&seam),
+        });
+        defer result.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 1), provider.calls);
+        try std.testing.expectEqual(Outcome.provider_failure, result.outcome);
+        try std.testing.expectEqual(Mutation.usage_only, result.mutation);
+        try std.testing.expectEqual(fail_observer, result.issue.usage_observer_failed);
+        try std.testing.expectEqual(
+            if (fail_observer) Durability.synchronized else Durability.failed,
+            result.issue.durability,
+        );
+        try std.testing.expectEqual(@as(usize, 1), seam.calls);
+    }
+}
+
+test "rejected scratch allocation failure is classified after clean durability" {
+    const ArmingSeam = struct {
+        const Self = @This();
+        failing: *std.testing.FailingAllocator,
+        calls: usize = 0,
+
+        pub fn call(
+            self: *Self,
+            _: *const Session,
+            kind: Loop.SeamKind,
+            next_action: bool,
+        ) Loop.HookError!Loop.SeamDisposition {
+            if (kind != .compaction or !next_action) return error.Failed;
+            self.calls += 1;
+            self.failing.fail_index = self.failing.alloc_index;
+            return .synchronized;
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var provider: ScriptedProvider = .{ .steps = &.{ .tool, .success } };
+    var seam: ArmingSeam = .{ .failing = &failing };
+    var result = try run(failing.allocator(), std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .system_prompt = "system",
+        .seam_hook = SeamHook.from(&seam),
+    });
+    defer result.deinit(failing.allocator());
+
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expectEqual(Outcome.provider_failure, result.outcome);
+    try std.testing.expectEqual(Mutation.usage_only, result.mutation);
+    try std.testing.expectEqual(Durability.synchronized, result.issue.durability);
+    try std.testing.expect(result.issue.diagnostic_omitted);
+    try std.testing.expectEqual(@as(usize, 1), seam.calls);
+}
+
 test "metadata failure preserves provider outcomes and terminal usage" {
     const Source = struct {
         const Self = @This();
@@ -752,17 +1017,16 @@ test "final seam failure preserves atomic seed and accepted usage" {
     defer session.deinit();
     var scripted: ScriptedProvider = .{ .steps = &.{.success} };
     var seam: SeamRecorder = .{ .fail_at = 1 };
-    try std.testing.expectError(error.HookFailed, run(
-        std.testing.allocator,
-        std.testing.io,
-        .{
-            .session = &session,
-            .provider = ai.Provider.Provider.from(&scripted, "provider"),
-            .model = "model",
-            .system_prompt = "system",
-            .seam_hook = SeamHook.from(&seam),
-        },
-    ));
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&scripted, "provider"),
+        .model = "model",
+        .system_prompt = "system",
+        .seam_hook = SeamHook.from(&seam),
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Mutation.seed_committed, result.mutation);
+    try std.testing.expectEqual(Durability.failed, result.issue.durability);
     try std.testing.expectEqual(@as(usize, 3), session.items().len);
     try std.testing.expect(session.items()[0] == .turn_boundary);
     try std.testing.expectEqual(ai.Item.UserOrigin.compact_seed, session.items()[1].user_message.origin);
@@ -774,23 +1038,30 @@ fn exerciseRunAllocations(allocator: std.mem.Allocator) !void {
     defer session.deinit();
     try session.addUser("history");
     var scripted: ScriptedProvider = .{ .steps = &.{.success} };
-    var result = try run(allocator, std.testing.io, .{
+    var result = run(allocator, std.testing.io, .{
         .session = &session,
         .provider = ai.Provider.Provider.from(&scripted, "provider"),
         .model = "model",
         .system_prompt = "system",
         .focus = "focus",
-    });
+    }) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), scripted.calls);
+        return err;
+    };
     defer result.deinit(allocator);
-    try std.testing.expectEqual(Outcome.compacted, result.outcome);
+    try std.testing.expect(scripted.calls > 0);
+    if (result.usage == .committed) try std.testing.expect(result.mutation != .none);
 }
 
-test "compaction transaction reports allocation failures without leaks" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseRunAllocations,
-        .{},
-    );
+test "compaction transaction classifies post-provider allocation failures without leaks" {
+    var fail_index: usize = 0;
+    while (fail_index < 256) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        exerciseRunAllocations(failing.allocator()) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        };
+        if (!failing.has_induced_failure) break;
+    } else return error.TestUnexpectedResult;
 }
 
 const CompactionSeamRecorder = struct {
@@ -802,10 +1073,11 @@ const CompactionSeamRecorder = struct {
         _: *const Session,
         kind: Loop.SeamKind,
         next_action: bool,
-    ) Loop.HookError!void {
-        if (kind != .compaction) return;
+    ) Loop.HookError!Loop.SeamDisposition {
+        if (kind != .compaction) return .synchronized;
         self.actions[self.count] = next_action;
         self.count += 1;
+        return .synchronized;
     }
 };
 
@@ -859,7 +1131,7 @@ test "Loop continuation compacts before the next provider stream" {
             };
             defer result.deinit(std.testing.allocator);
             if (result.outcome != .compacted) return error.Failed;
-            return .changed;
+            return .selection_changed;
         }
     };
 
@@ -963,6 +1235,34 @@ fn exerciseEffortOwnership(lease: Lease) !void {
     try std.testing.expectEqual(@as(usize, 2), provider.calls);
     try std.testing.expectEqual(@as(usize, 2), source.calls);
     try std.testing.expectEqualStrings("replaced-effort", effort);
+}
+
+test "continuation terminal outcomes advertise the following main request" {
+    inline for (.{ ScriptedProvider.Step.failure, ScriptedProvider.Step.empty }) |step| {
+        var provider: ScriptedProvider = .{ .steps = &.{step} };
+        var seam: SeamRecorder = .{};
+        var session = try Session.init(std.testing.allocator, .{});
+        defer session.deinit();
+        try session.beginRun();
+        session.beginHookMutation();
+        defer {
+            session.endHookMutation();
+            session.endRun();
+        }
+
+        var result = try runContinuation(std.testing.allocator, std.testing.io, .{
+            .session = &session,
+            .provider = ai.Provider.Provider.from(&provider, "compact"),
+            .model = "model",
+            .system_prompt = "system",
+            .seam_hook = SeamHook.from(&seam),
+        });
+        defer result.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 1), seam.calls);
+        try std.testing.expect(seam.next_actions[0]);
+        try std.testing.expect(result.outcome == .provider_failure or result.outcome == .no_summary);
+    }
 }
 
 test "compaction owns effort across metadata callbacks and logical attempts" {
@@ -1183,6 +1483,11 @@ test "post-stream cancellation discards a complete summary but retains usage" {
             self.calls += 1;
             return true;
         }
+
+        pub fn resolve(self: *Self) bool {
+            self.calls += 1;
+            return true;
+        }
     };
     var sampler: Sampler = .{};
     var provider: ScriptedProvider = .{ .steps = &.{.success} };
@@ -1197,6 +1502,159 @@ test "post-stream cancellation discards a complete summary but retains usage" {
     });
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(Outcome.cancelled, result.outcome);
+    try std.testing.expectEqual(@as(usize, 1), session.items().len);
+    try std.testing.expect(session.items()[0] == .turn_usage);
+}
+
+test "usage preparation failure after stream returns no mutation or callbacks" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var session = try Session.init(failing.allocator(), .{});
+    defer session.deinit();
+    failing.fail_index = failing.alloc_index;
+
+    var provider: ScriptedProvider = .{ .steps = &.{.success} };
+    var seam: SeamRecorder = .{};
+    var usage: UsageRecorder = .{};
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .system_prompt = "system",
+        .seam_hook = SeamHook.from(&seam),
+        .usage_observer = UsageObserver.from(&usage),
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expectEqual(Outcome.provider_failure, result.outcome);
+    try std.testing.expectEqual(Mutation.none, result.mutation);
+    try std.testing.expectEqual(UsageDisposition.preparation_failed, result.usage);
+    try std.testing.expectEqual(Durability.not_attempted, result.issue.durability);
+    try std.testing.expect(result.issue.diagnostic_omitted);
+    try std.testing.expectEqual(@as(usize, 0), seam.calls);
+    try std.testing.expectEqual(@as(usize, 0), usage.calls);
+    try std.testing.expectEqual(@as(usize, 0), session.items().len);
+}
+
+test "observer failure does not suppress recorded durability" {
+    var provider: ScriptedProvider = .{ .steps = &.{.success} };
+    var observer: ExactUsage = .{ .failure = error.Failed };
+    var seam: SeamRecorder = .{};
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .system_prompt = "system",
+        .usage_observer = UsageObserver.from(&observer),
+        .seam_hook = SeamHook.from(&seam),
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Mutation.seed_committed, result.mutation);
+    try std.testing.expect(result.issue.usage_observer_failed);
+    try std.testing.expectEqual(Durability.synchronized, result.issue.durability);
+    try std.testing.expectEqual(@as(usize, 1), seam.calls);
+}
+
+test "late cancellation resolves once after allocation-complete seed preparation" {
+    const LateCancellation = struct {
+        const Self = @This();
+        failing: *std.testing.FailingAllocator,
+        sample_calls: usize = 0,
+        resolve_calls: usize = 0,
+
+        pub fn sample(self: *Self) bool {
+            self.sample_calls += 1;
+            return false;
+        }
+
+        pub fn resolve(self: *Self) bool {
+            self.resolve_calls += 1;
+            self.failing.fail_index = self.failing.alloc_index;
+            return false;
+        }
+    };
+    const Accepted = struct {
+        const Self = @This();
+        session: *Session,
+        calls: usize = 0,
+
+        pub fn call(self: *Self) void {
+            const items = self.session.items();
+            std.debug.assert(items.len == 3);
+            std.debug.assert(items[1] == .user_message);
+            std.debug.assert(items[1].user_message.origin == .compact_seed);
+            self.calls += 1;
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var session = try Session.init(failing.allocator(), .{});
+    defer session.deinit();
+    var cancellation: LateCancellation = .{ .failing = &failing };
+    var accepted: Accepted = .{ .session = &session };
+    var provider: ScriptedProvider = .{ .steps = &.{.success} };
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .system_prompt = "system",
+        .cancellation = Cancellation.from(&cancellation),
+        .accepted_mutation_hook = AcceptedMutationHook.from(&accepted),
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Outcome.compacted, result.outcome);
+    try std.testing.expectEqual(Mutation.seed_committed, result.mutation);
+    try std.testing.expectEqual(@as(usize, 1), cancellation.resolve_calls);
+    try std.testing.expectEqual(@as(usize, 1), accepted.calls);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "late resolved cancellation publishes usage only and skips accepted hook" {
+    const LateCancellation = struct {
+        const Self = @This();
+        resolve_calls: usize = 0,
+
+        pub fn sample(_: *Self) bool {
+            return false;
+        }
+
+        pub fn resolve(self: *Self) bool {
+            self.resolve_calls += 1;
+            return true;
+        }
+    };
+    const Accepted = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        pub fn call(self: *Self) void {
+            self.calls += 1;
+        }
+    };
+
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var cancellation: LateCancellation = .{};
+    var accepted: Accepted = .{};
+    var provider: ScriptedProvider = .{ .steps = &.{.success} };
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .system_prompt = "system",
+        .cancellation = Cancellation.from(&cancellation),
+        .accepted_mutation_hook = AcceptedMutationHook.from(&accepted),
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Outcome.cancelled, result.outcome);
+    try std.testing.expectEqual(Mutation.usage_only, result.mutation);
+    try std.testing.expectEqual(@as(usize, 1), cancellation.resolve_calls);
+    try std.testing.expectEqual(@as(usize, 0), accepted.calls);
     try std.testing.expectEqual(@as(usize, 1), session.items().len);
     try std.testing.expect(session.items()[0] == .turn_usage);
 }
@@ -1223,29 +1681,31 @@ test "accepted usage records actual request provider and model" {
 const ExactHook = struct {
     failure: Loop.HookError,
     calls: usize = 0,
-    pub fn call(self: *ExactHook, _: *const Session, _: Loop.SeamKind, _: bool) Loop.HookError!void {
+    pub fn call(self: *ExactHook, _: *const Session, _: Loop.SeamKind, _: bool) Loop.HookError!Loop.SeamDisposition {
         self.calls += 1;
         return self.failure;
     }
 };
 
 test "final seam errors preserve the accepted atomic arrangement" {
-    inline for (.{
-        .{ error.OutOfMemory, error.OutOfMemory },
-        .{ error.Failed, error.HookFailed },
-        .{ error.Indeterminate, error.HookIndeterminate },
-    }) |case| {
+    inline for ([_]Loop.HookError{ error.OutOfMemory, error.Failed, error.Indeterminate }) |failure| {
         var provider: ScriptedProvider = .{ .steps = &.{.success} };
         var session = try Session.init(std.testing.allocator, .{});
         defer session.deinit();
-        var hook: ExactHook = .{ .failure = case[0] };
-        try std.testing.expectError(case[1], run(std.testing.allocator, std.testing.io, .{
+        var hook: ExactHook = .{ .failure = failure };
+        var result = try run(std.testing.allocator, std.testing.io, .{
             .session = &session,
             .provider = ai.Provider.Provider.from(&provider, "provider"),
             .model = "model",
             .system_prompt = "system",
             .seam_hook = SeamHook.from(&hook),
-        }));
+        });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(Mutation.seed_committed, result.mutation);
+        try std.testing.expectEqual(
+            if (failure == error.Indeterminate) Durability.indeterminate else Durability.failed,
+            result.issue.durability,
+        );
         try std.testing.expectEqual(@as(usize, 3), session.items().len);
         try std.testing.expect(session.items()[0] == .turn_boundary);
         try std.testing.expect(session.items()[1] == .user_message);
@@ -1263,22 +1723,22 @@ const ExactUsage = struct {
 };
 
 test "accepted usage observer errors preserve the atomic arrangement" {
-    inline for (.{
-        .{ error.OutOfMemory, error.OutOfMemory },
-        .{ error.Failed, error.HookFailed },
-        .{ error.Indeterminate, error.HookIndeterminate },
-    }) |case| {
+    inline for ([_]Loop.HookError{ error.OutOfMemory, error.Failed, error.Indeterminate }) |failure| {
         var provider: ScriptedProvider = .{ .steps = &.{.success} };
         var session = try Session.init(std.testing.allocator, .{});
         defer session.deinit();
-        var observer: ExactUsage = .{ .failure = case[0] };
-        try std.testing.expectError(case[1], run(std.testing.allocator, std.testing.io, .{
+        var observer: ExactUsage = .{ .failure = failure };
+        var result = try run(std.testing.allocator, std.testing.io, .{
             .session = &session,
             .provider = ai.Provider.Provider.from(&provider, "provider"),
             .model = "model",
             .system_prompt = "system",
             .usage_observer = UsageObserver.from(&observer),
-        }));
+        });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(Mutation.seed_committed, result.mutation);
+        try std.testing.expect(result.issue.usage_observer_failed);
+        try std.testing.expectEqual(Durability.unrecorded, result.issue.durability);
         try std.testing.expectEqual(@as(usize, 3), session.items().len);
         try std.testing.expect(session.items()[0] == .turn_boundary);
         try std.testing.expect(session.items()[1] == .user_message);
@@ -1328,17 +1788,17 @@ test "oversized accepted summary commits prepared usage and terminal seam" {
     var seam: SeamRecorder = .{};
     var session = try Session.init(std.testing.allocator, .{});
     defer session.deinit();
-    try std.testing.expectError(error.SummaryTooLarge, run(
-        std.testing.allocator,
-        std.testing.io,
-        .{
-            .session = &session,
-            .provider = ai.Provider.Provider.from(&provider, "provider"),
-            .model = "model",
-            .system_prompt = "system",
-            .seam_hook = SeamHook.from(&seam),
-        },
-    ));
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .system_prompt = "system",
+        .seam_hook = SeamHook.from(&seam),
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.provider_failure, result.outcome);
+    try std.testing.expectEqual(Mutation.usage_only, result.mutation);
+    try std.testing.expectEqualStrings("SummaryTooLarge", result.diagnostic.?);
     try std.testing.expectEqual(@as(usize, 1), session.items().len);
     try std.testing.expectEqual(@as(?u64, 7), session.items()[0].turn_usage.value.stream.input_tokens);
     try std.testing.expectEqual(@as(usize, 1), seam.calls);
@@ -1382,17 +1842,17 @@ test "accepted seed admission failure still commits its prepared usage" {
     var seam: SeamRecorder = .{};
     var session = try Session.init(std.testing.allocator, .{ .limits = .{ .items = 1 } });
     defer session.deinit();
-    try std.testing.expectError(error.TooManyItems, run(
-        std.testing.allocator,
-        std.testing.io,
-        .{
-            .session = &session,
-            .provider = ai.Provider.Provider.from(&provider, "provider"),
-            .model = "model",
-            .system_prompt = "system",
-            .seam_hook = SeamHook.from(&seam),
-        },
-    ));
+    var result = try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = ai.Provider.Provider.from(&provider, "provider"),
+        .model = "model",
+        .system_prompt = "system",
+        .seam_hook = SeamHook.from(&seam),
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Outcome.provider_failure, result.outcome);
+    try std.testing.expectEqual(Mutation.usage_only, result.mutation);
+    try std.testing.expectEqualStrings("TooManyItems", result.diagnostic.?);
     try std.testing.expectEqual(@as(usize, 1), session.items().len);
     try std.testing.expect(session.items()[0] == .turn_usage);
     try std.testing.expectEqual(@as(usize, 1), seam.calls);

@@ -3,9 +3,10 @@
 Status: approved
 
 Implementation progress: Slice 1 is complete in commit `9f5e07fb`; Slice 2 is
-complete in commit `23dc6532`; Slice 3 is complete in commit `d111080e`. Slice 4 is
-wired end to end, including typed cuts, classified truncation, `/undo`, prompt recall,
-and brief replay.
+complete in commit `23dc6532`; Slice 3 is complete in commit `d111080e`; Slice 4 is
+complete in commit `2763b20b`. Slice 5 (`/fork`) is deferred. Slice 6 is wired end to
+end, including commit-classified compaction, `/compact [FOCUS]`, cancellation, usage
+and durability settlement, and managed outcome markers.
 
 References:
 
