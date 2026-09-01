@@ -107,7 +107,7 @@ pub fn list(
         scanned += 1;
         if (scanned > limits.max_scan_entries) return error.TooManyEntries;
         if (!std.mem.endsWith(u8, directory_entry.name, ".jsonl")) continue;
-        const standard = isHaxStandardName(directory_entry.name);
+        const standard = isCanonicalName(directory_entry.name);
         if (!standard) result.recovery.noncanonical += 1;
         try validateJoinedPathLength(directory_path, directory_entry.name, limits.max_path_bytes);
         const stat = directory.statFile(io, directory_entry.name, .{ .follow_symlinks = false }) catch {
@@ -272,7 +272,7 @@ pub fn pruneBeforeWithTick(
                 try checkPruneTick(tick);
                 report.scanned += 1;
                 if (report.scanned > limits.max_entries_total) return error.TooManyEntries;
-                if (!isHaxStandardName(entry.name)) {
+                if (!isCanonicalName(entry.name)) {
                     report.recovery.noncanonical += 1;
                     continue;
                 }
@@ -491,7 +491,7 @@ fn entryDescending(_: void, left: Entry, right: Entry) bool {
     return std.mem.order(u8, left.path, right.path) == .gt;
 }
 
-fn isHaxStandardName(name: []const u8) bool {
+fn isCanonicalName(name: []const u8) bool {
     if (name.len != Paths.canonical_name_bytes or name[20] != '_' or
         !std.mem.eql(u8, name[57..], ".jsonl")) return false;
     const shape = "dddd-dd-ddTdd-dd-ddZ";

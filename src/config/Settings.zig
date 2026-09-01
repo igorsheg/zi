@@ -21,7 +21,7 @@ pub const Setting = struct {
 const registry = [_]Setting{
     .{
         .key = "preset",
-        .env = "HAX_PRESET",
+        .env = "ZI_PRESET",
         .default = null,
         .keep_empty = true,
         .kind = .string,
@@ -31,7 +31,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "provider",
-        .env = "HAX_PROVIDER",
+        .env = "ZI_PROVIDER",
         .default = null,
         .keep_empty = true,
         .kind = .string,
@@ -41,7 +41,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "model",
-        .env = "HAX_MODEL",
+        .env = "ZI_MODEL",
         .default = null,
         .keep_empty = true,
         .kind = .string,
@@ -51,7 +51,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "effort",
-        .env = "HAX_EFFORT",
+        .env = "ZI_EFFORT",
         .default = null,
         .keep_empty = true,
         .kind = .string,
@@ -61,7 +61,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "system_prompt",
-        .env = "HAX_SYSTEM_PROMPT",
+        .env = "ZI_SYSTEM_PROMPT",
         .default = null,
         .keep_empty = true,
         .kind = .string,
@@ -72,7 +72,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "system_prompt_append",
-        .env = "HAX_SYSTEM_PROMPT_APPEND",
+        .env = "ZI_SYSTEM_PROMPT_APPEND",
         .default = null,
         .keep_empty = true,
         .kind = .string,
@@ -82,7 +82,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_env",
-        .env = "HAX_NO_ENV",
+        .env = "ZI_NO_ENV",
         .default = null,
         .keep_empty = false,
         .kind = .bool,
@@ -92,7 +92,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_agents_md",
-        .env = "HAX_NO_AGENTS_MD",
+        .env = "ZI_NO_AGENTS_MD",
         .default = null,
         .keep_empty = false,
         .kind = .bool,
@@ -102,7 +102,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_skills",
-        .env = "HAX_NO_SKILLS",
+        .env = "ZI_NO_SKILLS",
         .default = null,
         .keep_empty = false,
         .kind = .bool,
@@ -112,7 +112,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_subagents",
-        .env = "HAX_NO_SUBAGENTS",
+        .env = "ZI_NO_SUBAGENTS",
         .default = null,
         .keep_empty = false,
         .kind = .bool,
@@ -122,7 +122,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_tasks",
-        .env = "HAX_NO_TASKS",
+        .env = "ZI_NO_TASKS",
         .default = null,
         .keep_empty = false,
         .kind = .bool,
@@ -133,7 +133,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "markdown",
-        .env = "HAX_MARKDOWN",
+        .env = "ZI_MARKDOWN",
         .default = "1",
         .keep_empty = false,
         .kind = .bool,
@@ -143,7 +143,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "show_reasoning",
-        .env = "HAX_SHOW_REASONING",
+        .env = "ZI_SHOW_REASONING",
         .default = null,
         .keep_empty = false,
         .kind = .bool,
@@ -153,7 +153,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "sort_models",
-        .env = "HAX_SORT_MODELS",
+        .env = "ZI_SORT_MODELS",
         .default = "auto",
         .keep_empty = false,
         .kind = .string,
@@ -163,7 +163,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "context_limit",
-        .env = "HAX_CONTEXT_LIMIT",
+        .env = "ZI_CONTEXT_LIMIT",
         .default = null,
         .keep_empty = false,
         .kind = .size,
@@ -173,7 +173,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "display_width",
-        .env = "HAX_DISPLAY_WIDTH",
+        .env = "ZI_DISPLAY_WIDTH",
         .default = "auto",
         .keep_empty = false,
         .kind = .int,
@@ -183,18 +183,8 @@ const registry = [_]Setting{
             "always uses full width; a number sets an exact width",
     },
     .{
-        .key = "notify",
-        .env = "HAX_NOTIFY",
-        .default = "auto",
-        .keep_empty = false,
-        .kind = .string,
-        .min = null,
-        .max = null,
-        .description = "Desktop-notification style: auto, bel, osc9, off (auto detects from the terminal)",
-    },
-    .{
         .key = "theme",
-        .env = "HAX_THEME",
+        .env = "ZI_THEME",
         .default = "auto",
         .keep_empty = false,
         .kind = .string,
@@ -204,7 +194,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "tint",
-        .env = "HAX_TINT",
+        .env = "ZI_TINT",
         .default = "teal",
         .keep_empty = false,
         .kind = .string,
@@ -214,18 +204,8 @@ const registry = [_]Setting{
             "by the ansi and off themes",
     },
     .{
-        .key = "keep_awake",
-        .env = "HAX_KEEP_AWAKE",
-        .default = "1",
-        .keep_empty = false,
-        .kind = .bool,
-        .min = null,
-        .max = null,
-        .description = "Inhibit idle system sleep while a turn is running (display may still blank)",
-    },
-    .{
         .key = "compact.auto",
-        .env = "HAX_COMPACT_AUTO",
+        .env = "ZI_COMPACT_AUTO",
         .default = "1",
         .keep_empty = false,
         .kind = .bool,
@@ -235,7 +215,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "compact.threshold",
-        .env = "HAX_COMPACT_THRESHOLD",
+        .env = "ZI_COMPACT_THRESHOLD",
         .default = "85",
         .keep_empty = false,
         .kind = .int,
@@ -245,7 +225,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "max_turns",
-        .env = "HAX_MAX_TURNS",
+        .env = "ZI_MAX_TURNS",
         .default = null,
         .keep_empty = false,
         .kind = .int,
@@ -255,7 +235,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "catalog.url",
-        .env = "HAX_CATALOG_URL",
+        .env = "ZI_CATALOG_URL",
         .default = "https://models.dev/api.json",
         .keep_empty = true,
         .kind = .string,
@@ -265,7 +245,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "catalog.refresh",
-        .env = "HAX_CATALOG_REFRESH",
+        .env = "ZI_CATALOG_REFRESH",
         .default = "24h",
         .keep_empty = false,
         .kind = .duration,
@@ -275,7 +255,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_session",
-        .env = "HAX_NO_SESSION",
+        .env = "ZI_NO_SESSION",
         .default = "auto",
         .keep_empty = false,
         .kind = .string,
@@ -285,7 +265,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "session_retention_days",
-        .env = "HAX_SESSION_RETENTION_DAYS",
+        .env = "ZI_SESSION_RETENTION_DAYS",
         .default = "30",
         .keep_empty = false,
         .kind = .int,
@@ -295,7 +275,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "transcript",
-        .env = "HAX_TRANSCRIPT",
+        .env = "ZI_TRANSCRIPT",
         .default = null,
         .keep_empty = true,
         .kind = .string,
@@ -304,18 +284,8 @@ const registry = [_]Setting{
         .description = "Path to mirror the Ctrl-T transcript view; empty disables",
     },
     .{
-        .key = "trace",
-        .env = "HAX_TRACE",
-        .default = null,
-        .keep_empty = true,
-        .kind = .string,
-        .min = null,
-        .max = null,
-        .description = "Path to a wire-level HTTP/SSE trace dump; empty disables",
-    },
-    .{
         .key = "image_input",
-        .env = "HAX_IMAGE_INPUT",
+        .env = "ZI_IMAGE_INPUT",
         .default = "auto",
         .keep_empty = false,
         .kind = .string,
@@ -325,7 +295,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "tool_output_cap",
-        .env = "HAX_TOOL_OUTPUT_CAP",
+        .env = "ZI_TOOL_OUTPUT_CAP",
         .default = "50k",
         .keep_empty = false,
         .kind = .size,
@@ -335,7 +305,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "bash.timeout",
-        .env = "HAX_BASH_TIMEOUT",
+        .env = "ZI_BASH_TIMEOUT",
         .default = "2m",
         .keep_empty = false,
         .kind = .duration,
@@ -346,7 +316,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "bash.timeout_max",
-        .env = "HAX_BASH_TIMEOUT_MAX",
+        .env = "ZI_BASH_TIMEOUT_MAX",
         .default = "30m",
         .keep_empty = false,
         .kind = .duration,
@@ -356,7 +326,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "bash.timeout_grace",
-        .env = "HAX_BASH_TIMEOUT_GRACE",
+        .env = "ZI_BASH_TIMEOUT_GRACE",
         .default = "2s",
         .keep_empty = false,
         .kind = .duration,
@@ -366,7 +336,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "bash.background_yield",
-        .env = "HAX_BASH_BACKGROUND_YIELD",
+        .env = "ZI_BASH_BACKGROUND_YIELD",
         .default = "5s",
         .keep_empty = false,
         .kind = .duration,
@@ -377,7 +347,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "bash.shell",
-        .env = "HAX_BASH_SHELL",
+        .env = "ZI_BASH_SHELL",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -387,7 +357,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "task.wait_timeout",
-        .env = "HAX_TASK_WAIT_TIMEOUT",
+        .env = "ZI_TASK_WAIT_TIMEOUT",
         .default = "10m",
         .keep_empty = false,
         .kind = .duration,
@@ -397,7 +367,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "task.max_running",
-        .env = "HAX_TASK_MAX_RUNNING",
+        .env = "ZI_TASK_MAX_RUNNING",
         .default = "32",
         .keep_empty = false,
         .kind = .int,
@@ -407,7 +377,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "http.max_retries",
-        .env = "HAX_HTTP_MAX_RETRIES",
+        .env = "ZI_HTTP_MAX_RETRIES",
         .default = "4",
         .keep_empty = false,
         .kind = .int,
@@ -417,7 +387,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "http.retry_base",
-        .env = "HAX_HTTP_RETRY_BASE",
+        .env = "ZI_HTTP_RETRY_BASE",
         .default = "1s",
         .keep_empty = false,
         .kind = .duration,
@@ -427,7 +397,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "http.idle_timeout",
-        .env = "HAX_HTTP_IDLE_TIMEOUT",
+        .env = "ZI_HTTP_IDLE_TIMEOUT",
         .default = "10m",
         .keep_empty = false,
         .kind = .duration,
@@ -437,7 +407,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.base_url",
-        .env = "HAX_OPENAI_BASE_URL",
+        .env = "ZI_OPENAI_BASE_URL",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -447,7 +417,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.api_key",
-        .env = "HAX_OPENAI_API_KEY",
+        .env = "ZI_OPENAI_API_KEY",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -457,7 +427,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.display_name",
-        .env = "HAX_OPENAI_DISPLAY_NAME",
+        .env = "ZI_OPENAI_DISPLAY_NAME",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -467,7 +437,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.api",
-        .env = "HAX_OPENAI_API",
+        .env = "ZI_OPENAI_API",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -477,7 +447,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.reasoning_format",
-        .env = "HAX_OPENAI_REASONING_FORMAT",
+        .env = "ZI_OPENAI_REASONING_FORMAT",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -487,7 +457,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.reasoning_roundtrip",
-        .env = "HAX_REASONING_ROUNDTRIP",
+        .env = "ZI_REASONING_ROUNDTRIP",
         .default = null,
         .keep_empty = true,
         .kind = .string,
@@ -497,7 +467,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.send_cache_key",
-        .env = "HAX_OPENAI_SEND_CACHE_KEY",
+        .env = "ZI_OPENAI_SEND_CACHE_KEY",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -507,7 +477,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.request_cost",
-        .env = "HAX_OPENAI_REQUEST_COST",
+        .env = "ZI_OPENAI_REQUEST_COST",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -518,7 +488,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.cache",
-        .env = "HAX_OPENAI_CACHE",
+        .env = "ZI_OPENAI_CACHE",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -529,7 +499,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.cache_ttl",
-        .env = "HAX_OPENAI_CACHE_TTL",
+        .env = "ZI_OPENAI_CACHE_TTL",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -539,7 +509,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.base_url",
-        .env = "HAX_ANTHROPIC_BASE_URL",
+        .env = "ZI_ANTHROPIC_BASE_URL",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -549,7 +519,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.api_key",
-        .env = "HAX_ANTHROPIC_API_KEY",
+        .env = "ZI_ANTHROPIC_API_KEY",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -559,7 +529,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.display_name",
-        .env = "HAX_ANTHROPIC_DISPLAY_NAME",
+        .env = "ZI_ANTHROPIC_DISPLAY_NAME",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -569,7 +539,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.max_tokens",
-        .env = "HAX_ANTHROPIC_MAX_TOKENS",
+        .env = "ZI_ANTHROPIC_MAX_TOKENS",
         .default = null,
         .keep_empty = false,
         .kind = .int,
@@ -579,7 +549,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.thinking_mode",
-        .env = "HAX_ANTHROPIC_THINKING_MODE",
+        .env = "ZI_ANTHROPIC_THINKING_MODE",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -589,7 +559,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.thinking_budget",
-        .env = "HAX_ANTHROPIC_THINKING_BUDGET",
+        .env = "ZI_ANTHROPIC_THINKING_BUDGET",
         .default = null,
         .keep_empty = false,
         .kind = .int,
@@ -599,7 +569,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.cache",
-        .env = "HAX_ANTHROPIC_CACHE",
+        .env = "ZI_ANTHROPIC_CACHE",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -609,7 +579,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.cache_ttl",
-        .env = "HAX_ANTHROPIC_CACHE_TTL",
+        .env = "ZI_ANTHROPIC_CACHE_TTL",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -619,7 +589,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.version",
-        .env = "HAX_ANTHROPIC_VERSION",
+        .env = "ZI_ANTHROPIC_VERSION",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -629,7 +599,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.llamacpp.base_url",
-        .env = "HAX_LLAMACPP_BASE_URL",
+        .env = "ZI_LLAMACPP_BASE_URL",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -639,7 +609,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.llamacpp.api_key",
-        .env = "HAX_LLAMACPP_API_KEY",
+        .env = "ZI_LLAMACPP_API_KEY",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -649,7 +619,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.llamacpp.port",
-        .env = "HAX_LLAMACPP_PORT",
+        .env = "ZI_LLAMACPP_PORT",
         .default = "8080",
         .keep_empty = false,
         .kind = .int,
@@ -658,28 +628,8 @@ const registry = [_]Setting{
         .description = "Port for the local llama-server (when base_url is unset)",
     },
     .{
-        .key = "providers.openrouter.title",
-        .env = "HAX_OPENROUTER_TITLE",
-        .default = "zi",
-        .keep_empty = true,
-        .kind = .string,
-        .min = null,
-        .max = null,
-        .description = "X-Title header for OpenRouter attribution (empty disables)",
-    },
-    .{
-        .key = "providers.openrouter.referer",
-        .env = "HAX_OPENROUTER_REFERER",
-        .default = "https://github.com/igorsheg/zi",
-        .keep_empty = true,
-        .kind = .string,
-        .min = null,
-        .max = null,
-        .description = "HTTP-Referer header for OpenRouter attribution (empty disables)",
-    },
-    .{
         .key = "providers.mock.script",
-        .env = "HAX_MOCK_SCRIPT",
+        .env = "ZI_MOCK_SCRIPT",
         .default = null,
         .keep_empty = false,
         .kind = .string,
@@ -984,9 +934,9 @@ fn testStore(environment: anytype) Store {
 }
 
 test "registry golden count order and representative metadata" {
-    try std.testing.expectEqual(@as(usize, 66), list().len);
+    try std.testing.expectEqual(@as(usize, 61), list().len);
     try std.testing.expectEqualStrings("preset", list()[0].key);
-    try std.testing.expectEqualStrings("providers.mock.script", list()[65].key);
+    try std.testing.expectEqualStrings("providers.mock.script", list()[60].key);
 
     const threshold = find("compact.threshold").?;
     try std.testing.expectEqual(Kind.int, threshold.kind);
@@ -994,10 +944,6 @@ test "registry golden count order and representative metadata" {
     try std.testing.expectEqual(@as(?i32, 100), threshold.max);
     try std.testing.expectEqualStrings("85", threshold.default.?);
 
-    const title = find("providers.openrouter.title").?;
-    try std.testing.expectEqualStrings("HAX_OPENROUTER_TITLE", title.env);
-    try std.testing.expectEqualStrings("zi", title.default.?);
-    try std.testing.expect(title.keep_empty);
     try std.testing.expect(find("not-a-setting") == null);
 }
 
@@ -1019,10 +965,8 @@ test "registry golden keys are complete ordered and unique" {
         "sort_models",
         "context_limit",
         "display_width",
-        "notify",
         "theme",
         "tint",
-        "keep_awake",
         "compact.auto",
         "compact.threshold",
         "max_turns",
@@ -1031,7 +975,6 @@ test "registry golden keys are complete ordered and unique" {
         "no_session",
         "session_retention_days",
         "transcript",
-        "trace",
         "image_input",
         "tool_output_cap",
         "bash.timeout",
@@ -1066,15 +1009,15 @@ test "registry golden keys are complete ordered and unique" {
         "providers.llamacpp.base_url",
         "providers.llamacpp.api_key",
         "providers.llamacpp.port",
-        "providers.openrouter.title",
-        "providers.openrouter.referer",
         "providers.mock.script",
     };
     try std.testing.expectEqual(expected.len, list().len);
     for (&expected, list()) |key, setting| try std.testing.expectEqualStrings(key, setting.key);
     for (list(), 0..) |left, left_index| {
+        try std.testing.expect(std.mem.startsWith(u8, left.env, "ZI_"));
         for (list()[left_index + 1 ..]) |right| {
             try std.testing.expect(!std.mem.eql(u8, left.key, right.key));
+            try std.testing.expect(!std.mem.eql(u8, left.env, right.env));
         }
     }
 }
@@ -1088,20 +1031,20 @@ test "Store adapter and typed getters preserve fallbacks bounds and source" {
     const markdown = try getBool(default_store, std.testing.allocator, "markdown");
     try std.testing.expect(markdown.value);
 
-    const high: MapEnvironment = .{ .name = "HAX_COMPACT_THRESHOLD", .value = "101" };
+    const high: MapEnvironment = .{ .name = "ZI_COMPACT_THRESHOLD", .value = "101" };
     const bounded = try getInt(testStore(&high), std.testing.allocator, "compact.threshold");
     try std.testing.expectEqual(@as(i32, 85), bounded.value);
     try std.testing.expectEqual(Store.Source.env, bounded.source);
 
-    const signed: MapEnvironment = .{ .name = "HAX_MAX_TURNS", .value = "  +2147483647" };
+    const signed: MapEnvironment = .{ .name = "ZI_MAX_TURNS", .value = "  +2147483647" };
     const maximum = try getInt(testStore(&signed), std.testing.allocator, "max_turns");
     try std.testing.expectEqual(std.math.maxInt(i32), maximum.value);
 
-    const overflow: MapEnvironment = .{ .name = "HAX_MAX_TURNS", .value = "2147483648" };
+    const overflow: MapEnvironment = .{ .name = "ZI_MAX_TURNS", .value = "2147483648" };
     const invalid = try getInt(testStore(&overflow), std.testing.allocator, "max_turns");
     try std.testing.expectEqual(@as(i32, 0), invalid.value);
 
-    const boolean: MapEnvironment = .{ .name = "HAX_MARKDOWN", .value = "OFF" };
+    const boolean: MapEnvironment = .{ .name = "ZI_MARKDOWN", .value = "OFF" };
     const disabled = try getBool(testStore(&boolean), std.testing.allocator, "markdown");
     try std.testing.expect(!disabled.value);
 }
@@ -1164,17 +1107,17 @@ test "duration parser matches hax units whitespace and overflow" {
 }
 
 test "size and duration getters preserve source and use converted bounds" {
-    const invalid_size: MapEnvironment = .{ .name = "HAX_TOOL_OUTPUT_CAP", .value = "0" };
+    const invalid_size: MapEnvironment = .{ .name = "ZI_TOOL_OUTPUT_CAP", .value = "0" };
     const size_fallback = try getSize(testStore(&invalid_size), std.testing.allocator, "tool_output_cap");
     try std.testing.expectEqual(@as(u64, 50 * 1024), size_fallback.value);
     try std.testing.expectEqual(Store.Source.env, size_fallback.source);
 
-    const custom_size: MapEnvironment = .{ .name = "HAX_TOOL_OUTPUT_CAP", .value = "2M" };
+    const custom_size: MapEnvironment = .{ .name = "ZI_TOOL_OUTPUT_CAP", .value = "2M" };
     const size = try getSize(testStore(&custom_size), std.testing.allocator, "tool_output_cap");
     try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), size.value);
     try std.testing.expectEqual(Store.Source.env, size.source);
 
-    const excessive_grace: MapEnvironment = .{ .name = "HAX_BASH_TIMEOUT_GRACE", .value = "301s" };
+    const excessive_grace: MapEnvironment = .{ .name = "ZI_BASH_TIMEOUT_GRACE", .value = "301s" };
     const duration_fallback = try getDurationMs(
         testStore(&excessive_grace),
         std.testing.allocator,
@@ -1183,11 +1126,11 @@ test "size and duration getters preserve source and use converted bounds" {
     try std.testing.expectEqual(@as(u64, 2_000), duration_fallback.value);
     try std.testing.expectEqual(Store.Source.env, duration_fallback.source);
 
-    const maximum_grace: MapEnvironment = .{ .name = "HAX_BASH_TIMEOUT_GRACE", .value = "300000ms" };
+    const maximum_grace: MapEnvironment = .{ .name = "ZI_BASH_TIMEOUT_GRACE", .value = "300000ms" };
     const duration = try getDurationMs(testStore(&maximum_grace), std.testing.allocator, "bash.timeout_grace");
     try std.testing.expectEqual(@as(u64, 300_000), duration.value);
 
-    const below_minimum: MapEnvironment = .{ .name = "HAX_HTTP_RETRY_BASE", .value = "0ms" };
+    const below_minimum: MapEnvironment = .{ .name = "ZI_HTTP_RETRY_BASE", .value = "0ms" };
     const minimum_fallback = try getDurationMs(
         testStore(&below_minimum),
         std.testing.allocator,

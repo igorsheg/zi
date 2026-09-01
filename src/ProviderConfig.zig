@@ -270,8 +270,8 @@ fn unavailableReason(
     if (std.mem.eql(u8, id, "openai")) return "OPENAI_API_KEY not set";
     if (std.mem.eql(u8, id, "anthropic")) return "ANTHROPIC_API_KEY not set";
     if (std.mem.eql(u8, id, "openrouter")) return "OPENROUTER_API_KEY not set";
-    if (std.mem.eql(u8, id, "openai-compatible")) return "HAX_OPENAI_BASE_URL not set";
-    if (std.mem.eql(u8, id, "anthropic-compatible")) return "HAX_ANTHROPIC_BASE_URL not set";
+    if (std.mem.eql(u8, id, "openai-compatible")) return "ZI_OPENAI_BASE_URL not set";
+    if (std.mem.eql(u8, id, "anthropic-compatible")) return "ZI_ANTHROPIC_BASE_URL not set";
     if (isOpenCode(id)) return "OPENCODE_API_KEY not set";
     return "provider is not configured";
 }
@@ -1295,19 +1295,9 @@ fn configure(
         try validateProviderFields(
             inputs.store,
             "providers.openrouter",
-            if (definition != null)
-                &.{ "api_key", "title", "referer", "extra_headers" }
-            else
-                &.{ "api_key", "title", "referer" },
+            if (definition != null) &.{ "api_key", "extra_headers" } else &.{"api_key"},
         );
         try rejectFirstPartyBase(allocator, inputs.store, provider);
-        try acceptOnlyDefault(allocator, inputs.store, "providers.openrouter.title", "zi");
-        try acceptOnlyDefault(
-            allocator,
-            inputs.store,
-            "providers.openrouter.referer",
-            "https://github.com/igorsheg/zi",
-        );
         return keyAuth(
             allocator,
             inputs,
@@ -2150,11 +2140,11 @@ test "provider definition model API rules preserve order and every target" {
     }));
 }
 
-test "first-party fallback does not consume compatible HAX aliases" {
+test "first-party fallback does not consume compatible provider variables" {
     var document = try Document.parse(std.testing.allocator, "{\"provider\":\"openai\",\"model\":\"gpt\"}", .{});
     defer document.deinit();
     const environment: TestEnvironment = .{ .entries = &.{
-        .{ .name = "HAX_OPENAI_API_KEY", .value = "wrong" },
+        .{ .name = "ZI_OPENAI_API_KEY", .value = "wrong" },
         .{ .name = "OPENAI_API_KEY", .value = "right" },
     } };
     var result = try resolve(.{
@@ -3037,8 +3027,8 @@ test "compiled descriptors shadow config-only definitions" {
 
 test "compatible definition retains environment scalar precedence" {
     const environment: TestEnvironment = .{ .entries = &.{
-        .{ .name = "HAX_OPENAI_BASE_URL", .value = "https://env-compatible.test/v1" },
-        .{ .name = "HAX_OPENAI_DISPLAY_NAME", .value = "Environment Name" },
+        .{ .name = "ZI_OPENAI_BASE_URL", .value = "https://env-compatible.test/v1" },
+        .{ .name = "ZI_OPENAI_DISPLAY_NAME", .value = "Environment Name" },
     } };
     var document = try Document.parse(std.testing.allocator, "{\"model\":\"m\"}", .{});
     defer document.deinit();

@@ -371,9 +371,9 @@ pub const Owner = struct {
         var buffer: [512]u8 = undefined;
         const message = std.fmt.bufPrint(
             &buffer,
-            "{s} can't list models — set one with HAX_MODEL or in config",
+            "{s} can't list models — set one with ZI_MODEL or in config",
             .{choice.label},
-        ) catch "that provider can't list models — set one with HAX_MODEL or in config";
+        ) catch "that provider can't list models — set one with ZI_MODEL or in config";
         try self.writeDiagnosticError(message);
     }
 
@@ -854,7 +854,7 @@ fn runModel(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
             var buffer: [512]u8 = undefined;
             const message = std.fmt.bufPrint(
                 &buffer,
-                "{s} can't list models — set one with HAX_MODEL or in config",
+                "{s} can't list models — set one with ZI_MODEL or in config",
                 .{before.provider_label},
             ) catch "the current provider can't list models — set one in config";
             try self.writeDiagnosticNote(message);

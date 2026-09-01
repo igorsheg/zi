@@ -65,13 +65,10 @@ const fixed_environment_overrides = [_]struct { name: []const u8, value: []const
     .{ .name = "AI_AGENT", .value = "zi" },
     .{ .name = "PYTHONUNBUFFERED", .value = "1" },
     .{ .name = "TQDM_DISABLE", .value = "1" },
-    .{ .name = "HAX_TRACE", .value = "" },
-    .{ .name = "HAX_TRANSCRIPT", .value = "" },
-    .{ .name = "ZI_TRACE", .value = "" },
     .{ .name = "ZI_TRANSCRIPT", .value = "" },
 };
 
-/// Borrowed resolved selection for child Zi/hax processes. Provider is
+/// Borrowed resolved selection for nested Zi processes. Provider is
 /// required once a selection is present. Null model or effort values become
 /// empty environment sentinels.
 pub const RunSelection = struct {
@@ -81,10 +78,10 @@ pub const RunSelection = struct {
 };
 
 const RunSelectionState = struct {
-    const provider_prefix = "HAX_PROVIDER=";
-    const model_prefix = "HAX_MODEL=";
-    const effort_prefix = "HAX_EFFORT=";
-    const preset_assignment = "HAX_PRESET=";
+    const provider_prefix = "ZI_PROVIDER=";
+    const model_prefix = "ZI_MODEL=";
+    const effort_prefix = "ZI_EFFORT=";
+    const preset_assignment = "ZI_PRESET=";
 
     provider: [provider_prefix.len + maximum_selection_value_bytes + 1]u8,
     model: [model_prefix.len + maximum_selection_value_bytes + 1]u8,
@@ -288,7 +285,7 @@ pub const Bash = struct {
         state.update(selection);
     }
 
-    /// Rewrites the effective child HAX_EFFORT assignment without allocating.
+    /// Rewrites the effective child ZI_EFFORT assignment without allocating.
     /// The caller must have exclusive non-callback ownership. In particular,
     /// this must not overlap a synchronous run or a background process launch.
     pub fn updateRunEffort(self: *Bash, effort: ?[]const u8) error{InvalidConfig}!void {
@@ -919,16 +916,16 @@ fn entryHasName(entry: []const u8, name: []const u8) bool {
 
 fn inheritedEntryOverridden(entry: []const u8, has_selection: bool) bool {
     if (entryHasName(entry, "ZIG_PROGRESS") or
-        entryHasName(entry, "HAX_SUBAGENT_DEPTH")) return true;
+        entryHasName(entry, "ZI_SUBAGENT_DEPTH")) return true;
     for (fixed_environment_overrides) |override| {
         if (entryHasName(entry, override.name)) return true;
     }
     if (has_selection) {
         const selection_names = [_][]const u8{
-            "HAX_PROVIDER",
-            "HAX_MODEL",
-            "HAX_EFFORT",
-            "HAX_PRESET",
+            "ZI_PROVIDER",
+            "ZI_MODEL",
+            "ZI_EFFORT",
+            "ZI_PRESET",
         };
         for (selection_names) |name| if (entryHasName(entry, name)) return true;
     }
@@ -1056,7 +1053,7 @@ fn createEnvironment(
         allocator,
         entries,
         &initialized,
-        "HAX_SUBAGENT_DEPTH",
+        "ZI_SUBAGENT_DEPTH",
         child_depth,
     );
 
@@ -1403,7 +1400,7 @@ test "bash init run and spill cleanup are OOM safe" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseBashAllocations, .{});
 }
 
-test "bash passes shell basename as argv zero and clears inherited hax tracing" {
+test "bash passes shell basename as argv zero and clears nested Zi transcript" {
     var bash = try Bash.init(std.testing.allocator, std.testing.io, .{
         .environment = std.testing.environ,
         .timeout_ms = 1000,
@@ -1412,13 +1409,13 @@ test "bash passes shell basename as argv zero and clears inherited hax tracing" 
     var result = try bash.tool().run(
         std.testing.allocator,
         std.testing.io,
-        "{\"command\":\"printf '%s:%s:%s' \\\"$0\\\" \\\"$HAX_TRACE\\\" \\\"$HAX_TRANSCRIPT\\\"\"}",
+        "{\"command\":\"printf '%s:%s' \\\"$0\\\" \\\"$ZI_TRANSCRIPT\\\"\"}",
         .{},
     );
     defer result.deinit(std.testing.allocator);
     const expected = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{s}::",
+        "{s}:",
         .{std.fs.path.basename(bash.shell)},
     );
     defer std.testing.allocator.free(expected);
@@ -1508,15 +1505,15 @@ fn expectEnvironmentEntries(
 test "bash child environment preserves raw order and duplicates then appends exact overrides" {
     var inherited = try testEnvironment(&.{
         "KEEP=first",
-        "HAX_PROVIDER=old-1",
+        "ZI_PROVIDER=old-1",
         "KEEP=second",
         "PAGER=less",
-        "HAX_PROVIDER=old-2",
+        "ZI_PROVIDER=old-2",
         "ZIG_PROGRESS=1",
         "AI_AGENT=other",
-        "HAX_SUBAGENT_DEPTH=2",
-        "HAX_TRACE=secret",
-        "HAX_TRANSCRIPT=secret",
+        "ZI_SUBAGENT_DEPTH=2",
+        "ZI_TRACE=secret",
+        "ZI_TRANSCRIPT=secret",
     });
     defer inherited.block.deinit(std.testing.allocator);
     const environment = try createEnvironment(std.testing.allocator, inherited, .{
@@ -1528,6 +1525,7 @@ test "bash child environment preserves raw order and duplicates then appends exa
     try expectEnvironmentEntries(environment.block, &.{
         "KEEP=first",
         "KEEP=second",
+        "ZI_TRACE=secret",
         "PAGER=cat",
         "GIT_PAGER=cat",
         "MANPAGER=cat",
@@ -1543,15 +1541,12 @@ test "bash child environment preserves raw order and duplicates then appends exa
         "AI_AGENT=zi",
         "PYTHONUNBUFFERED=1",
         "TQDM_DISABLE=1",
-        "HAX_TRACE=",
-        "HAX_TRANSCRIPT=",
-        "ZI_TRACE=",
         "ZI_TRANSCRIPT=",
-        "HAX_PROVIDER=anthropic",
-        "HAX_MODEL=claude-sonnet",
-        "HAX_EFFORT=",
-        "HAX_PRESET=",
-        "HAX_SUBAGENT_DEPTH=3",
+        "ZI_PROVIDER=anthropic",
+        "ZI_MODEL=claude-sonnet",
+        "ZI_EFFORT=",
+        "ZI_PRESET=",
+        "ZI_SUBAGENT_DEPTH=3",
     });
 }
 
@@ -1581,9 +1576,9 @@ test "bash effort updates keep environment pointers stable and child values exac
         );
         const expected = if (effort) |value| try std.fmt.allocPrint(
             std.testing.allocator,
-            "HAX_EFFORT={s}",
+            "ZI_EFFORT={s}",
             .{value},
-        ) else try std.testing.allocator.dupe(u8, "HAX_EFFORT=");
+        ) else try std.testing.allocator.dupe(u8, "ZI_EFFORT=");
         defer std.testing.allocator.free(expected);
         try std.testing.expectEqualStrings(
             expected,
@@ -1596,14 +1591,14 @@ test "bash effort updates keep environment pointers stable and child values exac
     var result = try bash.tool().run(
         std.testing.allocator,
         std.testing.io,
-        "{\"command\":\"printf '%s' $HAX_EFFORT\"}",
+        "{\"command\":\"printf '%s' $ZI_EFFORT\"}",
         .{},
     );
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("medium", result.output);
     try std.testing.expectError(error.InvalidConfig, bash.updateRunEffort("0123456789abcdef"));
     try std.testing.expectEqualStrings(
-        "HAX_EFFORT=medium",
+        "ZI_EFFORT=medium",
         std.mem.span(bash.environment.slice[effort_index].?),
     );
 }
@@ -1633,9 +1628,9 @@ test "bash full selection updates are atomic and keep environment pointers stabl
     };
     for (invalid) |selection| {
         try std.testing.expectError(error.InvalidConfig, bash.updateRunSelection(selection));
-        try std.testing.expectEqualStrings("HAX_PROVIDER=old-provider", std.mem.span(bash.environment.slice[start].?));
-        try std.testing.expectEqualStrings("HAX_MODEL=old-model", std.mem.span(bash.environment.slice[start + 1].?));
-        try std.testing.expectEqualStrings("HAX_EFFORT=low", std.mem.span(bash.environment.slice[start + 2].?));
+        try std.testing.expectEqualStrings("ZI_PROVIDER=old-provider", std.mem.span(bash.environment.slice[start].?));
+        try std.testing.expectEqualStrings("ZI_MODEL=old-model", std.mem.span(bash.environment.slice[start + 1].?));
+        try std.testing.expectEqualStrings("ZI_EFFORT=low", std.mem.span(bash.environment.slice[start + 2].?));
     }
 
     try bash.updateRunSelection(.{ .provider = "new-provider", .model = null, .effort = "high" });
@@ -1643,29 +1638,29 @@ test "bash full selection updates are atomic and keep environment pointers stabl
     for (assignment_addresses, 0..) |address, index| {
         try std.testing.expectEqual(address, @intFromPtr(bash.environment.slice[start + index].?));
     }
-    try std.testing.expectEqualStrings("HAX_PROVIDER=new-provider", std.mem.span(bash.environment.slice[start].?));
-    try std.testing.expectEqualStrings("HAX_MODEL=", std.mem.span(bash.environment.slice[start + 1].?));
-    try std.testing.expectEqualStrings("HAX_EFFORT=high", std.mem.span(bash.environment.slice[start + 2].?));
+    try std.testing.expectEqualStrings("ZI_PROVIDER=new-provider", std.mem.span(bash.environment.slice[start].?));
+    try std.testing.expectEqualStrings("ZI_MODEL=", std.mem.span(bash.environment.slice[start + 1].?));
+    try std.testing.expectEqualStrings("ZI_EFFORT=high", std.mem.span(bash.environment.slice[start + 2].?));
 }
 
 test "bash child environment retains selection variables when no selection is supplied" {
     var inherited = try testEnvironment(&.{
-        "HAX_PROVIDER=inherited-1",
-        "HAX_PROVIDER=inherited-2",
+        "ZI_PROVIDER=inherited-1",
+        "ZI_PROVIDER=inherited-2",
     });
     defer inherited.block.deinit(std.testing.allocator);
     const environment = try createEnvironment(std.testing.allocator, inherited, null, 0);
     defer deinitEnvironment(std.testing.allocator, environment);
     try std.testing.expectEqualStrings(
-        "HAX_PROVIDER=inherited-1",
+        "ZI_PROVIDER=inherited-1",
         std.mem.span(environment.block.slice[0].?),
     );
     try std.testing.expectEqualStrings(
-        "HAX_PROVIDER=inherited-2",
+        "ZI_PROVIDER=inherited-2",
         std.mem.span(environment.block.slice[1].?),
     );
     try std.testing.expectEqualStrings(
-        "HAX_SUBAGENT_DEPTH=1",
+        "ZI_SUBAGENT_DEPTH=1",
         std.mem.span(environment.block.slice[environment.block.slice.len - 1].?),
     );
 }

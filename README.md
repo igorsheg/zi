@@ -1,8 +1,7 @@
 # Zi
 
-Zi is a from-scratch Zig 0.16 rewrite of [hax](https://github.com/OleksandrChekhovskyi/hax).
-The rewrite currently contains provider-independent conversation and agent-loop
-components, provider wire adapters, a bounded cancellable libcurl HTTP/SSE transport,
+Zi is a Zig 0.16 coding agent with provider-independent conversation and agent-loop
+components, native provider adapters, a bounded cancellable libcurl HTTP/SSE transport,
 persistent sessions, synchronous tools, and normal-buffer interactive and one-shot CLIs.
 
 ## Build
@@ -37,7 +36,7 @@ libcurl sysroot and matching pkg-config metadata.
 Interactive output stays in the terminal's normal buffer. On a TTY, Markdown
 rendering is enabled by default and follows the configured theme, tint, and
 display-width policy. Tool calls show bounded head or head/tail previews, while
-read calls collapse to one-line breadcrumbs. Set `HAX_SHOW_REASONING=1` to show
+read calls collapse to one-line breadcrumbs. Set `ZI_SHOW_REASONING=1` to show
 provider reasoning in dim italic text. Bare `--resume` opens a normal-buffer,
 type-to-filter picker for conversations in the current directory. Piped output remains plain.
 
@@ -46,11 +45,11 @@ type-to-filter picker for conversations in the current directory. Piped output r
 The internal mock provider exercises dispatch and rendering without an LLM:
 
 ```sh
-HAX_PROVIDER=mock ./zig-out/bin/zi
-HAX_PROVIDER=mock HAX_MOCK_SCRIPT=scripts/mock/layout.txt ./zig-out/bin/zi
+ZI_PROVIDER=mock ./zig-out/bin/zi
+ZI_PROVIDER=mock ZI_MOCK_SCRIPT=scripts/mock/layout.txt ./zig-out/bin/zi
 ```
 
-With `HAX_MOCK_SCRIPT` (`providers.mock.script`), each request consumes one
+With `ZI_MOCK_SCRIPT` (`providers.mock.script`), each request consumes one
 scripted turn: `text`, `reasoning`, `space`, `tool <name> <json>`, `delay <ms>`,
 `usage in=N out=M [cached=K] [cache_write=W] [cache_write_1h=H] [cost=D]`, and
 `end-turn`; a final turn may end at EOF. `\n`, `\t`, and `\\` escapes decode in

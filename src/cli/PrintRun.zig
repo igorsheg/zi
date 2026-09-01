@@ -2565,8 +2565,8 @@ fn renderLlamaDiscoveryDiagnostic(writer: *std.Io.Writer, base_url: []const u8) 
     try DiagnosticText.write(writer, base_url);
     try writer.writeAll(
         "/models\nzi: is llama-server running? " ++
-            "(set HAX_MODEL to tolerate an unreachable server, or adjust " ++
-            "HAX_LLAMACPP_PORT / HAX_LLAMACPP_BASE_URL)\n",
+            "(set ZI_MODEL to tolerate an unreachable server, or adjust " ++
+            "ZI_LLAMACPP_PORT / ZI_LLAMACPP_BASE_URL)\n",
     );
 }
 
@@ -2947,8 +2947,8 @@ test "llama discovery diagnostic escapes the configured endpoint" {
     try std.testing.expectEqualStrings(
         "zi: llama.cpp: failed to auto-discover model from " ++
             "http://127.0.0.1:8080/v1\\nspoof/models\n" ++
-            "zi: is llama-server running? (set HAX_MODEL to tolerate an unreachable server, " ++
-            "or adjust HAX_LLAMACPP_PORT / HAX_LLAMACPP_BASE_URL)\n",
+            "zi: is llama-server running? (set ZI_MODEL to tolerate an unreachable server, " ++
+            "or adjust ZI_LLAMACPP_PORT / ZI_LLAMACPP_BASE_URL)\n",
         output.written(),
     );
 }

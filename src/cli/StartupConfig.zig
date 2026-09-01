@@ -410,11 +410,11 @@ pub fn prepare(inputs: PrepareInputs) Error!Prepared {
     };
     const facts: StartupFacts = .{
         .cli = inputs.selection,
-        .env_provider = inputs.environment.get("HAX_PROVIDER"),
-        .env_model = inputs.environment.get("HAX_MODEL"),
-        .env_effort = inputs.environment.get("HAX_EFFORT"),
-        .env_preset = inputs.environment.get("HAX_PRESET"),
-        .env_system_prompt = inputs.environment.get("HAX_SYSTEM_PROMPT"),
+        .env_provider = inputs.environment.get("ZI_PROVIDER"),
+        .env_model = inputs.environment.get("ZI_MODEL"),
+        .env_effort = inputs.environment.get("ZI_EFFORT"),
+        .env_preset = inputs.environment.get("ZI_PRESET"),
+        .env_system_prompt = inputs.environment.get("ZI_SYSTEM_PROMPT"),
         .strict_one_shot = inputs.strict_one_shot,
     };
     var selection = config.Selection.init(inputs.allocator, base);
@@ -1064,7 +1064,7 @@ test "empty environment preset suppresses a lower preset without replacing a res
     const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(base);
     var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
-    const entries = [_][*:0]const u8{"HAX_PRESET="};
+    const entries = [_][*:0]const u8{"ZI_PRESET="};
     var environment = ProcessAdapters.Environment.init(testEnviron(&entries));
     var inputs = testInputs(std.testing.allocator, base, config.SecureOpen.Capability.from(&access), &environment);
     inputs.resumed = .{ .provider = "recorded-p", .model = "recorded-m", .preset = "saved" };
@@ -1072,6 +1072,25 @@ test "empty environment preset suppresses a lower preset without replacing a res
     defer owner.deinit();
     try expectSetting(&owner, "provider", "saved-p", .conversation);
     try expectSetting(&owner, "preset", "saved", .conversation);
+}
+
+test "startup ignores the old product environment prefix" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTiers(&tmp, "{\"model\":\"configured-model\"}", "{}");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    const entries = [_][*:0]const u8{"HAX" ++ "_MODEL=ignored"};
+    var environment = ProcessAdapters.Environment.init(testEnviron(&entries));
+    var owner = try initOwner(testInputs(
+        std.testing.allocator,
+        base,
+        config.SecureOpen.Capability.from(&access),
+        &environment,
+    ));
+    defer owner.deinit();
+    try expectSetting(&owner, "model", "configured-model", .config);
 }
 
 test "per-setting environment suppresses persisted preset and stale implicit preset warns" {
@@ -1082,7 +1101,7 @@ test "per-setting environment suppresses persisted preset and stale implicit pre
     defer std.testing.allocator.free(base);
     var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
 
-    const per_setting_entries = [_][*:0]const u8{"HAX_MODEL=environment-m"};
+    const per_setting_entries = [_][*:0]const u8{"ZI_MODEL=environment-m"};
     var per_setting_environment = ProcessAdapters.Environment.init(testEnviron(&per_setting_entries));
     var owner = try initOwner(testInputs(
         std.testing.allocator,
@@ -1323,7 +1342,7 @@ test "prepare store applies environment retention with a run preset" {
     const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(base);
     var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
-    const entries = [_][*:0]const u8{"HAX_SESSION_RETENTION_DAYS=14"};
+    const entries = [_][*:0]const u8{"ZI_SESSION_RETENTION_DAYS=14"};
     var environment = ProcessAdapters.Environment.init(testEnviron(&entries));
     var inputs = testInputs(std.testing.allocator, base, config.SecureOpen.Capability.from(&access), &environment);
     inputs.selection.preset = "work";

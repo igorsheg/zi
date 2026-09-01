@@ -5,15 +5,14 @@ Status: approved
 References:
 
 - `docs/prompt-recall-research.md`
-- hax product behavior at `189816fb8b02956a6913d7638e6d2cc90a91d61a`
 - zig-ai implementation posture at `e2c5aef5f93015322891028a2048a217e7081687`
 
 ## Problem
 
 Zi forgets every submitted prompt as soon as the next input starts. Up and Down are
 recognized but do nothing, Ctrl-R does nothing, and restarting Zi loses all prompt
-recall. This also prevents faithful slash commands: hax keeps handled command lines
-available during the process without writing them to persistent prompt history.
+recall. Handled slash commands must remain available during the process without being
+written to persistent prompt history.
 
 ## Product contract
 
@@ -90,7 +89,7 @@ terminal buffer. Zi never enters the alternate screen.
 - The oldest prompt is evicted when a distinct newer prompt exceeds the limit.
 - In-memory prompt size remains bounded by Zi's 1 MiB editor limit.
 - Search and navigation operate on the retained deduplicated order.
-- History is global across working directories, matching hax.
+- History is global across working directories.
 
 ## Persistent history
 
@@ -112,8 +111,7 @@ becomes `\n`. Unknown escape forms remain literal when read.
 - After more than 3000 physical records, Zi rewrites the file to the retained set.
 - Files are owner-only and final symlinks or non-regular files are not followed.
 - Concurrent Zi processes append whole records without interleaving.
-- Startup compaction coordinates with appends and does not reproduce hax's known
-  lost-append race.
+- Startup compaction coordinates with appends and does not lose concurrent appends.
 
 A process-local entry later submitted as an ordinary prompt is written exactly once.
 
@@ -151,10 +149,9 @@ Prompt history is best-effort infrastructure:
 
 ## Help behavior
 
-Prompt recall adds no `/help` rows. hax intentionally omits standard readline-style
-history navigation and search from its shortcut table, just as it omits ordinary
-motion bindings. Zi preserves that choice. Existing help text must not imply that
-handled slash commands persist across runs.
+Prompt recall adds no `/help` rows. Standard readline-style history navigation, search,
+and ordinary motion bindings remain absent from the shortcut table. Existing help text
+must not imply that handled slash commands persist across runs.
 
 ## Privacy and scope
 
@@ -176,7 +173,7 @@ Core behavior:
 
 - Up/Down and Ctrl-P/Ctrl-N traverse exact retained entries and restore a live draft.
 - Recalled edits are temporary until submitted.
-- Exact erasedups and 1000-entry eviction match hax.
+- Exact erasedups and 1000-entry eviction define the retention policy.
 - Ctrl-R/Ctrl-S search, cancellation, acceptance, no-match, paste filtering, and UTF-8
   Backspace match the interaction contract.
 

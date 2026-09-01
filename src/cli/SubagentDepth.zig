@@ -9,7 +9,7 @@ pub const diagnostic =
 /// Checks the exact environment snapshot supplied by process initialization.
 /// It never reads ambient process state. Absent and empty values mean depth 0.
 pub fn checkEnvironment(environment: *const ProcessAdapters.Environment) Error!u8 {
-    return checkValue(environment.get("HAX_SUBAGENT_DEPTH"));
+    return checkValue(environment.get("ZI_SUBAGENT_DEPTH"));
 }
 
 /// Returns an accepted parent depth. Malformed, negative, overflowing, and
@@ -50,6 +50,12 @@ fn isAsciiWhitespace(byte: u8) bool {
         ' ', '\t', '\n', '\r', 0x0b, 0x0c => true,
         else => false,
     };
+}
+
+test "subagent depth ignores the old product prefix" {
+    const entries = [_][*:0]const u8{"HAX" ++ "_SUBAGENT_DEPTH=2"};
+    var environment = ProcessAdapters.Environment.init(.{ .block = .{ .slice = @ptrCast(&entries) } });
+    try std.testing.expectEqual(@as(u8, 0), try checkEnvironment(&environment));
 }
 
 test "subagent depth accepts the hax strtol integer domain below the cap" {

@@ -1457,7 +1457,7 @@ pub const Log = struct {
         json.beginObject() catch return error.OutOfMemory;
         jsonField(&json, "type", "session") catch return error.OutOfMemory;
         jsonField(&json, "version", format_version) catch return error.OutOfMemory;
-        jsonField(&json, "hax_version", self.writer_version.?) catch return error.OutOfMemory;
+        jsonField(&json, "zi_version", self.writer_version.?) catch return error.OutOfMemory;
         jsonOptional(&json, "id", self.id) catch return error.OutOfMemory;
         jsonOptional(&json, "timestamp", self.timestamp) catch return error.OutOfMemory;
         jsonOptional(&json, "cwd", self.cwd) catch return error.OutOfMemory;
@@ -3417,6 +3417,10 @@ test "lazy materialization and load round trip" {
         session_path = try allocator.dupe(u8, log.path());
     }
     defer allocator.free(session_path);
+    const encoded = try std.Io.Dir.readFileAlloc(.cwd(), io, session_path, allocator, .unlimited);
+    defer allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"zi_version\":\"0.4.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "hax" ++ "_version") == null);
     var loaded = try load(allocator, io, session_path, .{});
     defer loaded.deinit();
     try std.testing.expectEqual(@as(usize, 2), loaded.session.items().len);
@@ -3513,6 +3517,31 @@ test "hax header policy and torn resume preserve the first byte and repair on ap
         loadAllocationExercise,
         .{path},
     );
+}
+
+test "load ignores unknown session header metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [4096]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const path = try std.fmt.allocPrint(allocator, "{s}/unknown-header.jsonl", .{root_buffer[0..root_len]});
+    defer allocator.free(path);
+    const fixture =
+        "{\"type\":\"session\",\"version\":1,\"future_metadata\":{\"value\":7}," ++
+        "\"provider\":\"alpha\",\"model\":\"m1\"}\n" ++
+        "{\"kind\":\"user\",\"text\":\"kept\"}\n";
+    var file = try std.Io.Dir.createFile(.cwd(), io, path, .{});
+    try file.writeStreamingAll(io, fixture);
+    file.close(io);
+
+    var loaded = try load(allocator, io, path, .{});
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.session.items().len);
+    try std.testing.expectEqualStrings("kept", loaded.session.items()[0].user_message.text);
+    try std.testing.expectEqualStrings("alpha", loaded.meta.selection.provider.?);
+    try std.testing.expectEqualStrings("m1", loaded.meta.selection.model.?);
 }
 
 test "headerless records, early selections, and unknown type fields follow hax" {

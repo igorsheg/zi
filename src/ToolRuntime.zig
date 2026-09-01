@@ -662,7 +662,7 @@ test "owner validates and atomically forwards full Bash selection updates" {
     var result = try owner.tools()[3].run(
         std.testing.allocator,
         std.testing.io,
-        "{\"command\":\"printf '%s|%s|%s' $HAX_PROVIDER $HAX_MODEL $HAX_EFFORT\"}",
+        "{\"command\":\"printf '%s|%s|%s' $ZI_PROVIDER $ZI_MODEL $ZI_EFFORT\"}",
         .{},
     );
     try std.testing.expectEqualStrings("old-provider|old-model|low", result.output);
@@ -672,7 +672,7 @@ test "owner validates and atomically forwards full Bash selection updates" {
     result = try owner.tools()[3].run(
         std.testing.allocator,
         std.testing.io,
-        "{\"command\":\"printf '<%s>|<%s>|<%s>' \\\"$HAX_PROVIDER\\\" \\\"$HAX_MODEL\\\" \\\"$HAX_EFFORT\\\"\"}",
+        "{\"command\":\"printf '<%s>|<%s>|<%s>' \\\"$ZI_PROVIDER\\\" \\\"$ZI_MODEL\\\" \\\"$ZI_EFFORT\\\"\"}",
         .{},
     );
     defer result.deinit(std.testing.allocator);
@@ -709,7 +709,7 @@ test "owner forwards allocation-free Bash effort updates and rejects callback re
     var result = try owner.tools()[3].run(
         std.testing.allocator,
         std.testing.io,
-        "{\"command\":\"printf '%s' $HAX_EFFORT\"}",
+        "{\"command\":\"printf '%s' $ZI_EFFORT\"}",
         .{},
     );
     defer result.deinit(std.testing.allocator);
@@ -719,7 +719,7 @@ test "owner forwards allocation-free Bash effort updates and rejects callback re
     result = try owner.tools()[3].run(
         std.testing.allocator,
         std.testing.io,
-        "{\"command\":\"printf '<%s>' $HAX_EFFORT\"}",
+        "{\"command\":\"printf '<%s>' $ZI_EFFORT\"}",
         .{},
     );
     try std.testing.expectEqualStrings("<>", result.output);

@@ -12,7 +12,7 @@ machinery.
 
 ## Milestone
 
-Add these commands to the interactive REPL in hax registry order:
+Add these commands to the interactive REPL in registry order:
 
 - `/new` with alias `/clear`;
 - `/resume`;
@@ -22,7 +22,7 @@ Add these commands to the interactive REPL in hax registry order:
 - `/compact` follows future preset/config slots until those commands land;
 - `/help` remains last among implemented commands.
 
-This milestone implements the five lifecycle commands and the `HAX_TRANSCRIPT`
+This milestone implements the five lifecycle commands and the `ZI_TRANSCRIPT`
 behavior they visibly reshape. It does not include later preset/config, `/session`,
 `/tasks`, `/usage`, clipboard/editor, image-paste, login, notification, or keep-awake
 work.
@@ -44,12 +44,11 @@ is created. Usage totals and stale pause, retry, context, and deferred-compactio
 reset. Zi clears tracked temporary files after tasks stop and prints the normal startup
 banner for the fresh conversation.
 
-`/new PRESET` applies and persists the named preset before task settlement, matching
-hax. An invalid preset reports an error and leaves both selection and conversation
-unchanged. The later `/preset` command is not required for this form. A successful
-preset remains active if later task settlement prevents the reset; Zi reports that
-partial result and keeps the current history. Terminal task notes use the newly applied
-preset selection, as in hax.
+`/new PRESET` applies and persists the named preset before task settlement. An invalid
+preset reports an error and leaves both selection and conversation unchanged. The later
+`/preset` command is not required for this form. A successful preset remains active if
+later task settlement prevents the reset; Zi reports that partial result and keeps the
+current history. Terminal task notes use the newly applied preset selection.
 
 Without a preset commit, failure to prepare or publish the fresh conversation keeps the
 current selection and history intact. `/new` preserves recording availability: it
@@ -76,7 +75,7 @@ On success Zi:
 6. replaces the transcript view;
 7. briefly replays the latest visible user turn under a `resumed` heading.
 
-History adoption matches hax partial-success behavior. Zi distinguishes complete
+History adoption distinguishes complete
 restoration, core provider/model/effort restoration with a missing or invalid recorded
 preset, and failure of the core selection. Only core failure keeps the current live
 selection. Every partial outcome still adopts valid history and records the actual
@@ -183,8 +182,7 @@ first-send hooks, or durable prompt-history admission.
 
 ## Safety and limits
 
-Zi preserves its existing bounded safety contract even where hax accepts unbounded
-input. Session files, JSON lines, retained items, images, picker rows, label scans,
+Zi preserves its existing bounded safety contract for every input. Session files, JSON lines, retained items, images, picker rows, label scans,
 typed turns, command arguments, and compaction text remain capped by their current
 public limits.
 
@@ -195,7 +193,7 @@ divergence.
 
 ## Acceptance checks
 
-- `/help` advertises the new commands and `/clear` alias in hax-compatible order.
+- `/help` advertises the new commands and `/clear` alias in registry order.
 - Recognized lifecycle commands never reach the provider or conversation history.
 - `/new` preserves selection, resets usage/history, settles tasks, keeps the old file,
   and lazily records the next conversation.
@@ -208,10 +206,10 @@ divergence.
 - Undo truncation failure preserves the complete branch.
 - Fork preserves the source, gives the destination a new identity, and isolates future
   appends.
-- Removed prompts reappear in prompt recall where hax does so.
+- Removed prompts reappear in prompt recall after undo.
 - Manual compaction covers success, cancellation, provider failure, no summary, tool
   rejection, four-attempt exhaustion, usage ordering, and same-file persistence.
-- Background task behavior matches hax: settle before new/resume, preserve across fork.
+- Background tasks settle before new/resume and remain active across fork.
 - Allocation, I/O, cancellation, and cleanup failures preserve documented transaction
   boundaries.
 - PTY probes confirm picker, banner, replay, spinner, interruption, normal-buffer

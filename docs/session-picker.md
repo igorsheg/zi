@@ -2,7 +2,6 @@
 
 ## Product contract
 
-Zi follows hax v0.4.0 behavior at the revision recorded in `THIRD_PARTY_NOTICES.md`.
 Bare `zi --resume` opens a normal-buffer picker for sessions in the current working directory.
 It never starts providers before selection. Cancellation, non-TTY use, and picker setup failure exit
 successfully. An empty list prints `no past conversations in this directory` and exits successfully.

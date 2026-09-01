@@ -19,7 +19,7 @@ Add the next coherent hax product family to Zi:
 - `/compact`.
 
 Hax defines observable behavior. ZigAI informs Zig 0.16 ownership and transaction
-posture. This effort includes the `HAX_TRANSCRIPT` mirror reshaped by these commands.
+posture. This effort includes the `ZI_TRANSCRIPT` mirror reshaped by these commands.
 It does not yet include later preset/config, `/session`, `/tasks`, `/usage`,
 clipboard/editor, image-paste, authentication, notification, or keep-awake work.
 

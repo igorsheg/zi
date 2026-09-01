@@ -1,6 +1,6 @@
 # Display and streaming-Markdown layout fixture.
 #
-#   HAX_PROVIDER=mock HAX_MOCK_SCRIPT=scripts/mock/layout.txt ./zig-out/bin/zi
+#   ZI_PROVIDER=mock ZI_MOCK_SCRIPT=scripts/mock/layout.txt ./zig-out/bin/zi
 #
 # Turns 1–7 assume a 100-cell window. Their shell control flow forces the
 # verbose bash-header path; read-only commands normally use a silent header.
@@ -13,19 +13,19 @@ end-turn
 
 # Turn 2: bash header reflows across two rows.
 text Medium-length bash command — should wrap across two rows.
-tool bash {"command":"for f in src/providers/openai.c src/providers/codex.c src/providers/llamacpp.c; do echo $f; done"}
+tool bash {"command":"for f in src/ai/OpenAiChat.zig src/ai/Codex.zig src/ai/LocalDiscovery.zig; do echo $f; done"}
 usage in=160 out=18
 end-turn
 
 # Turn 3: bash header fills three rows without truncation.
 text Long bash command — should fill all 3 rows without truncation.
-tool bash {"command":"for f in src/providers/openai.c src/providers/codex.c src/providers/llamacpp.c src/providers/openrouter.c src/providers/openai_compat.c src/providers/mock.c; do echo \"== $f ==\"; wc -l \"$f\"; head -1 \"$f\"; tail -1 \"$f\"; done"}
+tool bash {"command":"for f in src/ai/OpenAiChat.zig src/ai/Codex.zig src/ai/LocalDiscovery.zig src/ai/ProviderRegistry.zig src/ai/OpenAiResponses.zig src/ai/Mock.zig; do echo \"== $f ==\"; wc -l \"$f\"; head -1 \"$f\"; tail -1 \"$f\"; done"}
 usage in=260 out=20
 end-turn
 
 # Turn 4: bash header truncates at the three-row budget.
 text Very long bash command — should overflow and truncate.
-tool bash {"command":"for f in src/providers/openai.c src/providers/codex.c src/providers/llamacpp.c src/providers/openrouter.c src/providers/openai_compat.c src/providers/mock.c src/providers/probe.c; do echo \"== $f ==\"; wc -l \"$f\"; head -3 \"$f\"; tail -3 \"$f\"; echo \"-- lines summary --\"; awk '{c++} END {print c}' \"$f\"; echo \"-- words summary --\"; awk '{w+=NF} END {print w}' \"$f\"; done"}
+tool bash {"command":"for f in src/ai/OpenAiChat.zig src/ai/Codex.zig src/ai/LocalDiscovery.zig src/ai/ProviderRegistry.zig src/ai/OpenAiResponses.zig src/ai/Mock.zig src/ProviderConfig.zig; do echo \"== $f ==\"; wc -l \"$f\"; head -3 \"$f\"; tail -3 \"$f\"; echo \"-- lines summary --\"; awk '{c++} END {print c}' \"$f\"; echo \"-- words summary --\"; awk '{w+=NF} END {print w}' \"$f\"; done"}
 usage in=320 out=24
 end-turn
 
@@ -43,7 +43,7 @@ end-turn
 
 # Turn 7: read uses a one-line silent header.
 text Read with a deeply nested path.
-tool read {"path":"src/providers/this/is/an/intentionally/very/deeply/nested/imaginary/path/to/some/test_fixture.c","offset":30,"limit":31}
+tool read {"path":"src/ai/this/is/an/intentionally/very/deeply/nested/imaginary/path/to/some/TestFixture.zig","offset":30,"limit":31}
 usage in=400 out=12
 end-turn
 
@@ -52,7 +52,7 @@ usage in=440 out=14
 end-turn
 
 
-# Turns 8–28 assume HAX_DISPLAY_WIDTH=80 for reproducible wrapping.
+# Turns 8–28 assume ZI_DISPLAY_WIDTH=80 for reproducible wrapping.
 
 # Turn 8: long unwrapped paragraph.
 text Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
@@ -174,9 +174,9 @@ end-turn
 text A table with mixed alignment and inline styling in the cells:
 text \n| File | Lines | Note |
 text \n|:-----|------:|:----:|
-text \n| `markdown.c` | 1900 | the **streaming** renderer |
-text \n| `ansi.h` | 47 | _SGR_ constants |
-text \n| `util.h` | 300 | `buf` + helpers |
+text \n| `Markdown.zig` | 1200 | the **block** renderer |
+text \n| `Theme.zig` | 530 | _color_ policy |
+text \n| `SafeText.zig` | 290 | UTF-8 sanitation |
 usage in=1000 out=60
 end-turn
 
@@ -184,8 +184,8 @@ end-turn
 text This one is too wide to align at 80 cells, so it reflows to a list:
 text \n| Component | Responsibility | Notes |
 text \n|---|---|---|
-text \n| provider adapter | Translate native SSE events into the unified stream_event vocabulary | one per backend, lives in src/providers |
-text \n| turn state machine | Assemble one streamed response into the flat item sequence | pure, no I/O, driven by turn_on_event |
+text \n| provider adapter | Translate native SSE events into the unified StreamEvent vocabulary | one per backend, lives in src/ai |
+text \n| turn state machine | Assemble one streamed response into the flat item sequence | pure, no I/O, driven by Turn.consume |
 usage in=1080 out=90
 end-turn
 

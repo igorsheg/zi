@@ -255,7 +255,7 @@ temporary resources.
 ## Advisory transcript
 
 This capability lands the first `src/transcript/` module because the already-supported
-`HAX_TRANSCRIPT` setting is observable across all five commands.
+`ZI_TRANSCRIPT` setting is observable across all five commands.
 
 `transcript/root.zig` exports a provider-neutral owner that:
 

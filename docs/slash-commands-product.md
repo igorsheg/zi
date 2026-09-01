@@ -28,7 +28,7 @@ Those will extend the same registry after the selection commands prove the desig
 
 ## Command recognition
 
-Zi matches hax:
+Zi recognizes commands under these rules:
 
 - `/` must be the first byte of the submitted line.
 - Names use ASCII letters, digits, `_`, and `-`, with exact case-sensitive lookup.
@@ -47,8 +47,8 @@ Zi matches hax:
 by the currently supported interactive shortcuts. It wraps to the configured
 terminal width and stays in the normal terminal buffer.
 
-During this incremental port, Zi will not advertise hax commands until their
-handlers land. The final command set and ordering will match hax.
+Zi advertises only commands with implemented handlers. Registry order defines help and
+lookup order.
 
 ## `/model`
 
@@ -57,13 +57,13 @@ handlers land. The final command set and ordering will match hax.
 - With no provider, it asks the user to choose one with `/provider`.
 - While fetching, it shows `fetching models...`.
 - Unsupported enumeration, fetch failure, no models, one model, and multiple models
-  produce distinct hax-compatible outcomes.
+  produce distinct documented outcomes.
 - One model skips the model picker.
 - Multiple models open `select a model`.
 - Rows identify the wire model ID and show available context, image, price,
   capability, and provider-description facts.
 - Advisory limitations dim a row but do not prevent selection.
-- Provider order is preserved when configured. Otherwise Zi uses hax's model order.
+- Provider order is preserved when configured. Otherwise Zi uses canonical model order.
 - If the chosen model has effort levels, Zi asks for effort before committing.
 - Cancelling either picker keeps the entire previous selection.
 
@@ -73,8 +73,8 @@ handlers land. The final command set and ordering will match hax.
 
 - The first item is `default`, meaning the provider chooses.
 - A literal provider level called `none` stays distinct from `default`.
-- Models or providers without selectable effort report the same explanatory outcome
-  as hax and leave the current selection untouched.
+- Models or providers without selectable effort report an explanatory outcome and leave
+  the current selection untouched.
 - Cancellation changes nothing.
 
 ## `/provider`
@@ -97,7 +97,7 @@ handlers land. The final command set and ordering will match hax.
 After the final choice, Zi:
 
 1. switches the live provider, model, and effort together;
-2. exits any active preset, matching hax explicit-selection behavior;
+2. exits any active preset;
 3. rebuilds model-dependent prompt and tool policy before the next request;
 4. keeps the existing conversation items;
 5. records the new selection for subsequent session items and resume;
