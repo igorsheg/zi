@@ -16,6 +16,8 @@ pub const LocalStartup = @import("LocalStartup.zig");
 pub const ModelOrder = @import("ModelOrder.zig");
 pub const NewConversation = @import("NewConversation.zig");
 pub const ResumeConversation = @import("ResumeConversation.zig");
+pub const TurnPicker = @import("TurnPicker.zig");
+pub const UndoConversation = @import("UndoConversation.zig");
 pub const RunSelection = @import("RunSelection.zig");
 pub const RunLogSeam = @import("RunLogSeam.zig");
 pub const Stats = @import("Stats.zig");
@@ -228,6 +230,8 @@ test {
     _ = ModelOrder;
     _ = NewConversation;
     _ = ResumeConversation;
+    _ = TurnPicker;
+    _ = UndoConversation;
     _ = RunSelection;
     _ = RunLogSeam;
     _ = Stats;

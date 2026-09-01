@@ -63,6 +63,7 @@ pub const TerminalRunner = struct {
     display_columns: terminal.DisplayColumns.Policy,
     style: terminal.Picker.Style,
     limits: terminal.Picker.Limits = .{},
+    repeat_clipped_label: bool = false,
 
     pub fn run(
         self: *TerminalRunner,
@@ -76,15 +77,25 @@ pub const TerminalRunner = struct {
             self.stdin,
             self.stdout.handle,
             self.writer,
-            .{
-                .title = title,
-                .items = items,
-                .initial_index = initial_index,
-                .display_columns = self.display_columns,
-                .style = self.style,
-            },
+            self.pickerOptions(title, items, initial_index),
             self.limits,
         );
+    }
+
+    fn pickerOptions(
+        self: *const TerminalRunner,
+        title: []const u8,
+        items: []const terminal.Picker.Item,
+        initial_index: usize,
+    ) terminal.Picker.Options {
+        return .{
+            .title = title,
+            .items = items,
+            .initial_index = initial_index,
+            .repeat_clipped_label = self.repeat_clipped_label,
+            .display_columns = self.display_columns,
+            .style = self.style,
+        };
     }
 };
 
@@ -304,6 +315,23 @@ pub fn effort(
     ) orelse return .canceled;
     std.debug.assert(selected <= levels.count);
     return .{ .selected = if (selected == 0) null else levels.valueAt(selected - 1) };
+}
+
+test "terminal runner forwards clipped-label repetition and defaults it off" {
+    const items = [_]terminal.Picker.Item{.{ .label = "row" }};
+    const base: TerminalRunner = .{
+        .allocator = undefined,
+        .io = undefined,
+        .stdin = undefined,
+        .stdout = undefined,
+        .writer = undefined,
+        .display_columns = .auto,
+        .style = .{},
+    };
+    try std.testing.expect(!base.pickerOptions("title", &items, 0).repeat_clipped_label);
+    var repeating = base;
+    repeating.repeat_clipped_label = true;
+    try std.testing.expect(repeating.pickerOptions("title", &items, 0).repeat_clipped_label);
 }
 
 const FakeRunner = struct {

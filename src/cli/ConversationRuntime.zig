@@ -192,6 +192,12 @@ pub const ResumeResult = struct {
 };
 
 pub const PrepareResumeError = agent.Session.Error || error{ Reentrant, StaleCandidate };
+pub const PrepareUndoError = error{ Reentrant, StaleCandidate, Quarantined };
+
+pub const UndoResult = struct {
+    removed_turns: usize,
+    effect: agent.Session.CutEffect,
+};
 
 pub const Owner = struct {
     allocator: std.mem.Allocator,
@@ -461,6 +467,80 @@ pub const Owner = struct {
         return candidate;
     }
 
+    /// Takes ownership of an already-prepared memory cut. The matching
+    /// durability cut remains caller-owned until its classified execution.
+    // ziglint-ignore: Z015
+    pub fn prepareUndo(
+        self: *Owner,
+        selection: *RunSelection.Owner,
+        entry: EntryState,
+        memory: *agent.Session.PreparedCut,
+        durability_cut: *const SessionDurability.PreparedCut,
+    ) PrepareUndoError!UndoCandidate {
+        if (self.phase != .idle or self.issued_authorization_nonce != null) return error.Reentrant;
+        const guard = self.currentGuard(selection);
+        if (!guardEqual(entry.guard, guard)) return error.StaleCandidate;
+        if (entry.authority == .quarantined) return error.Quarantined;
+        if (!memory.active or memory.owner != &self.session_value or
+            memory.generation != guard.session_history or
+            memory.original_items != self.session_value.items().len or
+            memory.original_typed_turns != self.session_value.typedTurnCount() or
+            !durability_cut.active or durability_cut.owner != self.durability_value or
+            durability_cut.generation != guard.durability or
+            durability_cut.session != &self.session_value or
+            durability_cut.session_generation != memory.generation or
+            durability_cut.original_items != memory.original_items or
+            durability_cut.retained_items != memory.retained_items or
+            durability_cut.original_typed_turns != memory.original_typed_turns or
+            durability_cut.retained_typed_turns != memory.retained_typed_turns)
+        {
+            return error.StaleCandidate;
+        }
+        const candidate: UndoCandidate = .{
+            .owner = self,
+            .selection = selection,
+            .entry = entry,
+            .memory = memory.*,
+            .expected_durability_generation = guard.durability +% 1,
+        };
+        memory.* = undefined;
+        return candidate;
+    }
+
+    /// Binds only after the disk cut committed. The final guard must differ
+    /// from the prepared entry solely by that durability commit.
+    // ziglint-ignore: Z015
+    pub fn bindUndo(
+        self: *Owner,
+        selection: *RunSelection.Owner,
+        candidate: *UndoCandidate,
+        final_guard: Guard,
+    ) BindError!void {
+        if (!candidate.active or candidate.owner != self or candidate.selection != selection or
+            candidate.authorization != null)
+        {
+            return error.StaleCandidate;
+        }
+        const expected = candidate.entry.guard;
+        if (final_guard.conversation != expected.conversation or
+            final_guard.session_history != expected.session_history or
+            final_guard.session_selection != expected.session_selection or
+            final_guard.run_selection != expected.run_selection or
+            final_guard.durability != candidate.expected_durability_generation)
+        {
+            return error.StaleCandidate;
+        }
+        try self.bindAuthorization(
+            selection,
+            candidate,
+            &candidate.authorization,
+            candidate.entry,
+            final_guard,
+            .undo,
+            null,
+        );
+    }
+
     // ziglint-ignore: Z015
     pub fn bindResume(
         self: *Owner,
@@ -606,6 +686,16 @@ pub const Owner = struct {
             if (settlement != null) return error.SettlementIncomplete;
             try self.validateGuard(selection, final_guard);
             if (entry.authority == .quarantined) return error.Quarantined;
+            if (transition == .undo) {
+                if (entry.guard.conversation != final_guard.conversation or
+                    entry.guard.session_history != final_guard.session_history or
+                    entry.guard.session_selection != final_guard.session_selection or
+                    entry.guard.run_selection != final_guard.run_selection or
+                    entry.guard.durability +% 1 != final_guard.durability)
+                {
+                    return error.StaleCandidate;
+                }
+            }
         }
         if (self.issued_authorization_nonce != null) return error.StaleCandidate;
         const nonce = self.next_authorization_nonce;
@@ -735,6 +825,24 @@ pub const NewCandidate = struct {
     }
 };
 
+pub const UndoCandidate = struct {
+    owner: *Owner,
+    selection: *RunSelection.Owner,
+    entry: EntryState,
+    memory: agent.Session.PreparedCut,
+    expected_durability_generation: u64,
+    authorization: ?PublicationAuthorization = null,
+    active: bool = true,
+
+    pub fn deinit(self: *UndoCandidate) void {
+        if (self.active) {
+            if (self.authorization) |*value| self.owner.cancelAuthorization(value);
+            self.memory.deinit();
+        }
+        self.* = undefined;
+    }
+};
+
 pub const ResumeCandidate = struct {
     owner: *Owner,
     selection: *RunSelection.Owner,
@@ -803,6 +911,41 @@ pub const ResumeRetired = struct {
         self.* = undefined;
     }
 };
+
+pub const UndoRetired = struct {
+    cut: agent.Session.RetiredCut,
+    result: UndoResult,
+    active: bool = true,
+
+    pub fn deinit(self: *UndoRetired) void {
+        if (self.active) self.cut.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn publishUndo(lease: *PublishLease, candidate: *UndoCandidate) UndoRetired {
+    std.debug.assert(lease.active);
+    const authorization = lease.authorization;
+    const owner = authorization.owner;
+    std.debug.assert(owner.phase == .publishing);
+    std.debug.assert(authorization.transition == .undo);
+    std.debug.assert(authorization.candidate_address == @as(*anyopaque, @ptrCast(candidate)));
+    std.debug.assert(authorization.nonce == owner.consumed_authorization_nonce);
+    std.debug.assert(candidate.active);
+    std.debug.assert(guardEqual(authorization.final_guard, owner.currentGuard(authorization.selection)));
+
+    const result: UndoResult = .{
+        .removed_turns = candidate.memory.original_typed_turns - candidate.memory.retained_typed_turns,
+        .effect = candidate.memory.effect,
+    };
+    const retired_cut = owner.session_value.publishTypedCutRetired(&candidate.memory);
+    owner.generation_value +%= 1;
+    authorization.selection.committing = false;
+    owner.phase = .idle;
+    candidate.active = false;
+    lease.active = false;
+    return .{ .cut = retired_cut, .result = result };
+}
 
 pub fn publishResume(lease: *PublishLease, candidate: *ResumeCandidate) ResumeRetired {
     std.debug.assert(lease.active);
@@ -940,10 +1083,13 @@ test {
     _ = Owner.bindNew;
     _ = Owner.prepareResume;
     _ = Owner.bindResume;
+    _ = Owner.prepareUndo;
+    _ = Owner.bindUndo;
     _ = Owner.bindAuthorization;
     _ = Owner.beginPublish;
     _ = publishNew;
     _ = publishResume;
+    _ = publishUndo;
 }
 
 test "recording policy permits mock only when explicitly enabled" {
@@ -1439,5 +1585,110 @@ test "cancelled fresh preparation releases every allocation under OOM" {
         std.testing.allocator,
         exerciseCancelledFreshAllocation,
         .{},
+    );
+}
+
+test "undo authorization binds only the expected durability commit and cannot replay" {
+    const allocator = std.testing.allocator;
+    var startup: SessionStartup.Candidate = .{
+        .allocator = allocator,
+        .session = try agent.Session.Session.init(allocator, .{}),
+        .log = null,
+        .identity = .{ .origin = .fresh },
+        .meta = null,
+        .recovery = null,
+        .index_recovery = null,
+        .warning = null,
+    };
+    defer if (startup.active) startup.deinit();
+    try startup.session.addUser("one");
+    try startup.session.addUser("two");
+    const owner = try Owner.create(allocator, &startup, .{
+        .io = std.testing.io,
+        .recording_policy = .disabled,
+        .fresh = .{
+            .state_root = null,
+            .cwd = "/work",
+            .writer_version = "test",
+            .timestamp_provider = .{ .next_fn = fixedTimestamp },
+            .uuid_provider = .{ .next_fn = fixedUuid },
+        },
+    });
+    defer owner.deinit();
+    var selection = testSelection();
+    const entry = owner.captureEntryState(&selection);
+    var memory = try owner.session().prepareTypedCut(1);
+    var durability_cut = try owner.durability().prepareCut(owner.session(), &memory);
+    defer if (durability_cut.active) durability_cut.deinit();
+    var candidate = try owner.prepareUndo(&selection, entry, &memory, &durability_cut);
+    defer if (candidate.active) candidate.deinit();
+
+    const disk = try owner.durability().executeCut(&durability_cut);
+    var commit = disk.committed;
+    defer commit.deinit();
+    var stale = owner.captureEntryState(&selection).guard;
+    stale.session_history +%= 1;
+    try std.testing.expectError(error.StaleCandidate, owner.bindUndo(&selection, &candidate, stale));
+
+    try owner.bindUndo(&selection, &candidate, owner.captureEntryState(&selection).guard);
+    try std.testing.expectEqual(
+        @intFromPtr(&candidate),
+        @intFromPtr(candidate.authorization.?.candidate_address),
+    );
+    var copied_authorization = candidate.authorization.?;
+    var lease = try owner.beginPublish(&candidate.authorization.?);
+    var retired = publishUndo(&lease, &candidate);
+    commit.finish();
+
+    try std.testing.expectEqual(@as(usize, 1), retired.result.removed_turns);
+    try std.testing.expectEqual(@as(usize, 1), owner.session().typedTurnCount());
+    try std.testing.expectEqualStrings("one", owner.session().typedTurn(0).?.text);
+    retired.deinit();
+    try std.testing.expectError(error.StaleCandidate, owner.beginPublish(&copied_authorization));
+}
+
+test "undo preparation rejects stale entry and foreign candidate facts" {
+    const allocator = std.testing.allocator;
+    var startup: SessionStartup.Candidate = .{
+        .allocator = allocator,
+        .session = try agent.Session.Session.init(allocator, .{}),
+        .log = null,
+        .identity = .{ .origin = .fresh },
+        .meta = null,
+        .recovery = null,
+        .index_recovery = null,
+        .warning = null,
+    };
+    defer if (startup.active) startup.deinit();
+    try startup.session.addUser("one");
+    const owner = try Owner.create(allocator, &startup, .{
+        .io = std.testing.io,
+        .recording_policy = .disabled,
+        .fresh = .{
+            .state_root = null,
+            .cwd = "/work",
+            .writer_version = "test",
+            .timestamp_provider = .{ .next_fn = fixedTimestamp },
+            .uuid_provider = .{ .next_fn = fixedUuid },
+        },
+    });
+    defer owner.deinit();
+    var selection = testSelection();
+    var entry = owner.captureEntryState(&selection);
+    var memory = try owner.session().prepareTypedCut(0);
+    defer if (memory.active) memory.deinit();
+    var durability_cut = try owner.durability().prepareCut(owner.session(), &memory);
+    defer durability_cut.deinit();
+
+    entry.guard.run_selection +%= 1;
+    try std.testing.expectError(
+        error.StaleCandidate,
+        owner.prepareUndo(&selection, entry, &memory, &durability_cut),
+    );
+    durability_cut.retained_items +%= 1;
+    entry = owner.captureEntryState(&selection);
+    try std.testing.expectError(
+        error.StaleCandidate,
+        owner.prepareUndo(&selection, entry, &memory, &durability_cut),
     );
 }

@@ -243,6 +243,74 @@ pub const RetiredAuthority = struct {
     }
 };
 
+pub const PrepareCutError = error{
+    OutOfMemory,
+    InvalidPlan,
+    FileTooLarge,
+    LineTooLarge,
+    TooManyItems,
+    Failed,
+    PendingAppend,
+    Quarantined,
+    Mismatch,
+};
+
+/// Move-only durability half of an undo cut. It never exposes the active Log.
+pub const PreparedCut = struct {
+    owner: *Owner,
+    generation: u64,
+    session: *agent.Session.Session,
+    session_generation: u64,
+    original_items: usize,
+    retained_items: usize,
+    original_typed_turns: usize,
+    retained_typed_turns: usize,
+    disk: ?persistence.SessionFile.PreparedCut,
+    active: bool = true,
+
+    pub fn deinit(self: *PreparedCut) void {
+        if (self.active) if (self.disk) |*disk| disk.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Must be finished after matching memory publication. Deinit also applies the
+/// required quarantine, so a committed sync failure cannot resume appending.
+pub const CutCommit = struct {
+    owner: *Owner,
+    generation: u64,
+    session: *const agent.Session.Session,
+    durability: persistence.SessionFile.MutationDurability,
+    retained_items: usize,
+    active: bool = true,
+
+    pub fn finish(self: *CutCommit) void {
+        std.debug.assert(self.active);
+        std.debug.assert(self.owner.generation == self.generation);
+        std.debug.assert(self.session.items().len == self.retained_items);
+        if (self.durability == .sync_failed) self.owner.quarantine(.sync_failed);
+        self.active = false;
+    }
+
+    pub fn deinit(self: *CutCommit) void {
+        if (self.active) self.finish();
+        self.* = undefined;
+    }
+};
+
+pub const CutOutcome = union(enum) {
+    unchanged: persistence.SessionFile.TruncateUnchanged,
+    committed: CutCommit,
+    indeterminate: persistence.SessionFile.TruncateIndeterminate,
+};
+
+pub const ExecuteCutError = error{
+    InvalidPlan,
+    StaleCut,
+    HighWaterMismatch,
+    Failed,
+};
+
 pub const Owner = struct {
     allocator: std.mem.Allocator,
     authority: Authority,
@@ -412,6 +480,132 @@ pub const Owner = struct {
                 }
                 self.generation +%= 1;
                 break :blk .synchronized;
+            },
+        };
+    }
+
+    /// Prepares disk agreement for an already-prepared in-memory undo cut.
+    pub fn prepareCut(
+        self: *Owner,
+        session: *agent.Session.Session,
+        memory: *const agent.Session.PreparedCut,
+    ) PrepareCutError!PreparedCut {
+        if (!memory.active or memory.owner != session or
+            memory.generation != session.historyGeneration() or
+            memory.original_items != session.items().len or
+            memory.original_typed_turns != session.typedTurnCount())
+        {
+            return error.InvalidPlan;
+        }
+        const no_disk = switch (self.authority) {
+            .unrecorded => true,
+            .quarantined => return error.Quarantined,
+            .active => |*log| !log.materialized(),
+        };
+        if (no_disk) return .{
+            .owner = self,
+            .generation = self.generation,
+            .session = session,
+            .session_generation = memory.generation,
+            .original_items = memory.original_items,
+            .retained_items = memory.retained_items,
+            .original_typed_turns = memory.original_typed_turns,
+            .retained_typed_turns = memory.retained_typed_turns,
+            .disk = null,
+        };
+        switch (self.state(session)) {
+            .pending_append => return error.PendingAppend,
+            .quarantined => return error.Quarantined,
+            .unrecorded => unreachable,
+            .synchronized => {},
+        }
+        const log = self.activeLog();
+        var disk = log.prepareCut(memory.retained_typed_turns) catch |err| switch (err) {
+            error.Removed => {
+                self.quarantine(.removed);
+                return error.Quarantined;
+            },
+            error.Poisoned, error.InvalidPlan, error.IoFailure, error.NotRegular => {
+                self.quarantine(.external_change);
+                return error.Quarantined;
+            },
+            else => return mapPrepareCutError(err),
+        };
+        errdefer disk.deinit();
+        if (disk.plan.original_typed_turns != memory.original_typed_turns or
+            disk.plan.retained_typed_turns != memory.retained_typed_turns or
+            disk.plan.retained_item_records != memory.retained_items)
+        {
+            return error.Mismatch;
+        }
+        return .{
+            .owner = self,
+            .generation = self.generation,
+            .session = session,
+            .session_generation = memory.generation,
+            .original_items = memory.original_items,
+            .retained_items = memory.retained_items,
+            .original_typed_turns = memory.original_typed_turns,
+            .retained_typed_turns = memory.retained_typed_turns,
+            .disk = disk,
+        };
+    }
+
+    /// Executes the classified file mutation before the caller publishes memory.
+    pub fn executeCut(self: *Owner, prepared: *PreparedCut) ExecuteCutError!CutOutcome {
+        if (!prepared.active or prepared.owner != self or prepared.generation != self.generation or
+            prepared.session.historyGeneration() != prepared.session_generation or
+            prepared.session.items().len != prepared.original_items or
+            prepared.session.typedTurnCount() != prepared.original_typed_turns)
+        {
+            return error.StaleCut;
+        }
+        if (prepared.disk == null) {
+            prepared.active = false;
+            self.generation +%= 1;
+            return .{ .committed = .{
+                .owner = self,
+                .generation = self.generation,
+                .session = prepared.session,
+                .durability = .synced,
+                .retained_items = prepared.retained_items,
+            } };
+        }
+        const outcome = self.activeLog().truncatePrepared(
+            &prepared.disk.?,
+            prepared.retained_items,
+        ) catch |err| {
+            switch (err) {
+                error.Removed => self.quarantine(.removed),
+                error.HighWaterMismatch => self.quarantine(.high_water_diverged),
+                error.InvalidPlan, error.Poisoned, error.IoFailure, error.NotRegular => {
+                    self.quarantine(.external_change);
+                },
+                error.OutOfMemory,
+                error.FileTooLarge,
+                error.LineTooLarge,
+                error.TooManyItems,
+                error.StaleCut,
+                => {},
+            }
+            return mapExecuteCutError(err);
+        };
+        prepared.active = false;
+        return switch (outcome) {
+            .unchanged => |reason| .{ .unchanged = reason },
+            .committed => |value| blk: {
+                self.generation +%= 1;
+                break :blk .{ .committed = .{
+                    .owner = self,
+                    .generation = self.generation,
+                    .session = prepared.session,
+                    .durability = value.durability,
+                    .retained_items = value.retained_items,
+                } };
+            },
+            .indeterminate => |reason| blk: {
+                self.quarantine(.truncate_indeterminate);
+                break :blk .{ .indeterminate = reason };
             },
         };
     }
@@ -693,6 +887,26 @@ pub const Owner = struct {
         };
     }
 };
+
+fn mapPrepareCutError(err: persistence.SessionFile.CutError) PrepareCutError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidPlan => error.InvalidPlan,
+        error.FileTooLarge => error.FileTooLarge,
+        error.LineTooLarge => error.LineTooLarge,
+        error.TooManyItems => error.TooManyItems,
+        error.Poisoned, error.IoFailure, error.NotRegular, error.Removed => error.Failed,
+    };
+}
+
+fn mapExecuteCutError(err: persistence.SessionFile.TruncateError) ExecuteCutError {
+    return switch (err) {
+        error.StaleCut => error.StaleCut,
+        error.HighWaterMismatch => error.HighWaterMismatch,
+        error.InvalidPlan => error.InvalidPlan,
+        else => error.Failed,
+    };
+}
 
 const AppendErrorClass = union(enum) {
     retryable: ReconcileFailure,
@@ -1370,4 +1584,179 @@ test "selection preparation supports unrecorded authority and rejects quarantine
         error.Quarantined,
         owner.prepareSelection(&session, .{ .provider = "other" }),
     );
+}
+
+test "undo cut bridge commits unrecorded and lazy memory cuts without a disk mutation" {
+    const allocator = std.testing.allocator;
+
+    var none: ?persistence.SessionFile.Log = null;
+    const unrecorded = try Owner.create(allocator, &none, .{});
+    defer unrecorded.deinit();
+    var session = try agent.Session.Session.init(allocator, .{});
+    defer session.deinit();
+    try session.addUser("first");
+    try session.addUser("second");
+    var memory = try session.prepareTypedCut(1);
+    defer memory.deinit();
+    var prepared = try unrecorded.prepareCut(&session, &memory);
+    defer prepared.deinit();
+    const outcome = try unrecorded.executeCut(&prepared);
+    var commit = outcome.committed;
+    defer commit.deinit();
+    session.publishTypedCut(&memory);
+    commit.finish();
+    try std.testing.expectEqual(@as(usize, 1), session.typedTurnCount());
+    try std.testing.expect(unrecorded.state(&session) == .unrecorded);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [4096]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    var lazy_log: ?persistence.SessionFile.Log = try testLog(
+        allocator,
+        std.testing.io,
+        root_buffer[0..root_len],
+        .{},
+    );
+    const lazy = try Owner.create(allocator, &lazy_log, .{});
+    defer lazy.deinit();
+    var lazy_session = try agent.Session.Session.init(allocator, .{});
+    defer lazy_session.deinit();
+    try lazy_session.addUser("only");
+    var lazy_memory = try lazy_session.prepareTypedCut(0);
+    defer lazy_memory.deinit();
+    var lazy_prepared = try lazy.prepareCut(&lazy_session, &lazy_memory);
+    defer lazy_prepared.deinit();
+    const lazy_outcome = try lazy.executeCut(&lazy_prepared);
+    var lazy_commit = lazy_outcome.committed;
+    defer lazy_commit.deinit();
+    lazy_session.publishTypedCut(&lazy_memory);
+    lazy_commit.finish();
+    try std.testing.expectEqual(@as(usize, 0), lazy.activeLog().highWater());
+    try std.testing.expect(!lazy.materialized());
+}
+
+test "undo cut bridge validates synchronized plans and rejects pending quarantine mismatch and stale candidates" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [4096]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    var log: ?persistence.SessionFile.Log = try testLog(allocator, io, root_buffer[0..root_len], .{});
+    const owner = try Owner.create(allocator, &log, .{});
+    defer owner.deinit();
+    var session = try agent.Session.Session.init(allocator, .{});
+    defer session.deinit();
+    try session.addUser("first");
+    try session.addUser("second");
+    try owner.call(&session, .completion, false);
+
+    var memory = try session.prepareTypedCut(1);
+    defer memory.deinit();
+    var mismatched = memory;
+    mismatched.retained_items += 1;
+    try std.testing.expectError(error.Mismatch, owner.prepareCut(&session, &mismatched));
+
+    var prepared = try owner.prepareCut(&session, &memory);
+    defer prepared.deinit();
+    var selection = try owner.prepareSelection(&session, .{ .provider = "p" });
+    defer selection.deinit();
+    owner.publishSelection(&session, &selection);
+    try std.testing.expectError(error.StaleCut, owner.executeCut(&prepared));
+    try std.testing.expect(owner.authority == .active);
+
+    try session.addUser("pending");
+    var pending_memory = try session.prepareTypedCut(2);
+    defer pending_memory.deinit();
+    try std.testing.expectError(error.PendingAppend, owner.prepareCut(&session, &pending_memory));
+    owner.quarantine(.external_change);
+    try std.testing.expectError(error.Quarantined, owner.prepareCut(&session, &pending_memory));
+}
+
+test "prepared undo quarantines same-size rewrites and named replacements before truncate" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDir(io, "second", .default_dir);
+    const second_root = try tmp.dir.realPathFileAlloc(io, "second", allocator);
+    defer allocator.free(second_root);
+
+    {
+        var log: ?persistence.SessionFile.Log = try testLog(allocator, io, root, .{});
+        const owner = try Owner.create(allocator, &log, .{});
+        defer owner.deinit();
+        var session = try agent.Session.Session.init(allocator, .{});
+        defer session.deinit();
+        try session.addUser("first");
+        try session.addUser("second");
+        try owner.call(&session, .completion, false);
+        var memory = try session.prepareTypedCut(1);
+        defer memory.deinit();
+        var prepared = try owner.prepareCut(&session, &memory);
+        defer prepared.deinit();
+
+        try owner.activeLog().file.?.writePositionalAll(io, "X", 0);
+        try std.testing.expectError(error.InvalidPlan, owner.executeCut(&prepared));
+        try std.testing.expectEqual(QuarantineReason.external_change, owner.state(&session).quarantined);
+        try std.testing.expectError(error.Indeterminate, owner.call(&session, .completion, false));
+    }
+
+    {
+        var log: ?persistence.SessionFile.Log = try testLog(allocator, io, second_root, .{});
+        const owner = try Owner.create(allocator, &log, .{});
+        defer owner.deinit();
+        var session = try agent.Session.Session.init(allocator, .{});
+        defer session.deinit();
+        try session.addUser("first");
+        try session.addUser("second");
+        try owner.call(&session, .completion, false);
+        var memory = try session.prepareTypedCut(1);
+        defer memory.deinit();
+        var prepared = try owner.prepareCut(&session, &memory);
+        defer prepared.deinit();
+
+        const path = owner.activePath().?;
+        const moved = try std.fmt.allocPrint(allocator, "{s}.old", .{path});
+        defer allocator.free(moved);
+        try std.Io.Dir.rename(.cwd(), path, .cwd(), moved, io);
+        const replacement = try std.Io.Dir.createFile(.cwd(), io, path, .{});
+        replacement.close(io);
+        try std.testing.expectError(error.InvalidPlan, owner.executeCut(&prepared));
+        try std.testing.expectEqual(QuarantineReason.external_change, owner.state(&session).quarantined);
+        try std.testing.expectError(error.Indeterminate, owner.call(&session, .completion, false));
+    }
+}
+
+test "undo cut bridge publishes committed sync failure before quarantine" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [4096]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    var log: ?persistence.SessionFile.Log = try testLog(allocator, io, root_buffer[0..root_len], .{});
+    const owner = try Owner.create(allocator, &log, .{});
+    defer owner.deinit();
+    var session = try agent.Session.Session.init(allocator, .{});
+    defer session.deinit();
+    try session.addUser("first");
+    try session.addUser("second");
+    try owner.call(&session, .completion, false);
+    var memory = try session.prepareTypedCut(1);
+    defer memory.deinit();
+    var prepared = try owner.prepareCut(&session, &memory);
+    defer prepared.deinit();
+    owner.activeLog().append_sync_file_fn = failSync;
+    const outcome = try owner.executeCut(&prepared);
+    var commit = outcome.committed;
+    defer commit.deinit();
+    try std.testing.expectEqual(persistence.SessionFile.MutationDurability.sync_failed, commit.durability);
+    try std.testing.expect(owner.state(&session) == .pending_append);
+    session.publishTypedCut(&memory);
+    commit.finish();
+    try std.testing.expectEqual(QuarantineReason.sync_failed, owner.state(&session).quarantined);
 }

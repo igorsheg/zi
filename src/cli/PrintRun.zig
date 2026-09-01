@@ -33,6 +33,8 @@ const SessionStartup = @import("SessionStartup.zig");
 const ConversationRuntime = @import("ConversationRuntime.zig");
 const NewConversation = @import("NewConversation.zig");
 const ResumeConversation = @import("ResumeConversation.zig");
+const TurnPicker = @import("TurnPicker.zig");
+const UndoConversation = @import("UndoConversation.zig");
 const StartupConfig = @import("StartupConfig.zig");
 const LocalStartup = @import("LocalStartup.zig");
 const OneShot = @import("OneShot.zig");
@@ -831,6 +833,16 @@ pub fn run(
         .cutoff_epoch_seconds = resume_cutoff,
     };
     const resume_conversation_runner = ResumeConversation.Runner.from(&resume_conversation_service);
+    var undo_reset: UndoReset = .{ .marker = &compaction_marker };
+    var undo_conversation_service: UndoConversation.Service = .{
+        .allocator = allocator,
+        .conversation = conversation,
+        .selection = &live,
+        .usage = &usage,
+        .transcript_sink = UndoConversation.TranscriptSink.from(run_log_seam),
+        .reset_sink = UndoConversation.ResetSink.from(&undo_reset),
+    };
+    const undo_conversation_runner = UndoConversation.Runner.from(&undo_conversation_service);
     var catalog_hook: CatalogHook = .{
         .catalog_runtime = &catalog_runtime,
         .stats = &stats,
@@ -951,6 +963,7 @@ pub fn run(
                 commands.setRunLogSeam(run_log_seam);
                 commands.setNewConversation(new_conversation_runner);
                 commands.setResumeConversation(resume_conversation_runner);
+                commands.setUndoConversation(undo_conversation_runner);
                 commands.setIo(io);
                 var cooked_inputs = interactive_inputs;
                 cooked_inputs.command_gateway = commands.gateway();
@@ -979,6 +992,8 @@ pub fn run(
                 new_conversation_runner,
                 resume_conversation_runner,
                 &resume_conversation_service,
+                undo_conversation_runner,
+                &undo_conversation_service,
                 theme,
                 display_columns,
                 markdown_enabled,
@@ -1367,6 +1382,8 @@ fn runRawInteractive(
     new_conversation: NewConversation.Runner,
     resume_conversation: ResumeConversation.Runner,
     resume_service: *ResumeConversation.Service,
+    undo_conversation: UndoConversation.Runner,
+    undo_service: *UndoConversation.Service,
     theme: render.Theme,
     display_columns: terminal_module.DisplayColumns.Policy,
     markdown_enabled: bool,
@@ -1489,6 +1506,7 @@ fn runRawInteractive(
     commands.setRunLogSeam(run_log_seam);
     commands.setNewConversation(new_conversation);
     commands.setResumeConversation(resume_conversation);
+    commands.setUndoConversation(undo_conversation);
     var selection_picker: SelectionPicker.TerminalRunner = .{
         .allocator = allocator,
         .io = io,
@@ -1503,7 +1521,22 @@ fn runRawInteractive(
             .ok_close = theme.ok.close,
         },
     };
-    commands.setSelectionPicker(io, SelectionPicker.Runner.from(&selection_picker));
+    const picker_runner = SelectionPicker.Runner.from(&selection_picker);
+    commands.setSelectionPicker(io, picker_runner);
+    var turn_selection_picker: SelectionPicker.TerminalRunner = .{
+        .allocator = allocator,
+        .io = io,
+        .stdin = stdin_file,
+        .stdout = stdout_file,
+        .writer = inputs_value.stdout,
+        .display_columns = display_columns,
+        .style = selection_picker.style,
+        .repeat_clipped_label = true,
+    };
+    var turn_picker: TurnPicker.Adapter = .{
+        .allocator = allocator,
+        .picker = SelectionPicker.Runner.from(&turn_selection_picker),
+    };
     var markdown_renderer = render.MarkdownStreamRenderer.init(
         allocator,
         inputs_value.stdout,
@@ -1547,9 +1580,15 @@ fn runRawInteractive(
     };
     resume_service.picker = SessionPicker.Runner.from(&resume_picker);
     resume_service.replay_sink = ResumeConversation.ReplaySink.from(&resume_replay);
+    undo_service.prompt_history = &history;
+    undo_service.picker = TurnPicker.Runner.from(&turn_picker);
+    undo_service.replay_sink = UndoConversation.ReplaySink.from(&resume_replay);
     defer {
         resume_service.picker = null;
         resume_service.replay_sink = null;
+        undo_service.prompt_history = null;
+        undo_service.picker = null;
+        undo_service.replay_sink = null;
     }
     if (resumed) {
         const history_inputs: render.History.Inputs = .{
@@ -2108,6 +2147,16 @@ const ResumeReset = struct {
         self.base.marker.pending = false;
         self.base.tools.resetConversation() catch unreachable;
         self.base.session_info.resumed = true;
+    }
+};
+
+/// Undo clears only deferred compaction presentation. Tool outputs, background
+/// tasks, and session identity remain owned by their existing runtimes.
+const UndoReset = struct {
+    marker: *CompactionMarker,
+
+    pub fn reset(self: *UndoReset) void {
+        self.marker.pending = false;
     }
 };
 

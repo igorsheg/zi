@@ -6,6 +6,7 @@ const DiagnosticText = @import("DiagnosticText.zig");
 const Interactive = @import("Interactive.zig");
 const NewConversation = @import("NewConversation.zig");
 const ResumeConversation = @import("ResumeConversation.zig");
+const UndoConversation = @import("UndoConversation.zig");
 const ProviderConfig = @import("../ProviderConfig.zig");
 const RunSelection = @import("RunSelection.zig");
 const RunLogSeam = @import("RunLogSeam.zig");
@@ -71,6 +72,13 @@ const specs = [_]Slash.Spec{
         .handler_fn = runResume,
     },
     .{
+        .name = "undo",
+        .summary = "revert conversation to before an earlier message (optional: turns back)",
+        .arguments = .optional,
+        .display = .managed,
+        .handler_fn = runUndo,
+    },
+    .{
         .name = "provider",
         .summary = "switch provider, then model and effort",
         .display = .managed,
@@ -116,6 +124,7 @@ pub const Owner = struct {
     selection_picker: ?SelectionPicker.Runner = null,
     new_conversation: ?NewConversation.Runner = null,
     resume_conversation: ?ResumeConversation.Runner = null,
+    undo_conversation: ?UndoConversation.Runner = null,
     persistence_warning_written: bool = false,
 
     pub fn init(
@@ -172,6 +181,10 @@ pub const Owner = struct {
 
     pub fn setResumeConversation(self: *Owner, runner: ResumeConversation.Runner) void {
         self.resume_conversation = runner;
+    }
+
+    pub fn setUndoConversation(self: *Owner, runner: UndoConversation.Runner) void {
+        self.undo_conversation = runner;
     }
 
     pub fn gateway(self: *Owner) Interactive.CommandGateway {
@@ -476,6 +489,47 @@ fn runNew(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
     }
 }
 
+fn runUndo(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
+    const self: *Owner = @ptrCast(@alignCast(context));
+    const runner = self.undo_conversation orelse return .handled;
+    switch (runner.run(call.argument)) {
+        .changed => |changed| {
+            if (changed.sync_failed) try self.writeError(
+                "the session file was truncated but could not be synchronized; recording is uncertain",
+            );
+            runner.replay();
+            return .history_changed;
+        },
+        .unchanged => |reason| {
+            switch (reason) {
+                .nothing => try self.writeNote(UndoConversation.nothing_to_undo),
+                .needs_number => try self.writeNote(UndoConversation.needs_number),
+                .invalid_range => |maximum| {
+                    var buffer: [128]u8 = undefined;
+                    const message = try std.fmt.bufPrint(
+                        &buffer,
+                        "/undo takes a number of turns between 1 and {d}",
+                        .{maximum},
+                    );
+                    try self.writeError(message);
+                },
+                .canceled => {},
+                .reconcile_retryable => try self.writeError(
+                    "couldn't finish recording the conversation; try /undo again",
+                ),
+                .reconcile_quarantined => try self.writeError(
+                    "the conversation is unrecordable; it was not changed",
+                ),
+                .preparation => try self.writeError(
+                    "couldn't prepare the undo; conversation left unchanged",
+                ),
+                .disk_unchanged, .disk_indeterminate => try self.writeError(UndoConversation.disk_failure),
+            }
+            return .handled;
+        },
+    }
+}
+
 fn runResume(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
     const self: *Owner = @ptrCast(@alignCast(context));
     if (self.frame == null) {
@@ -554,7 +608,7 @@ fn writeResumeWarnings(self: *Owner, changed: ResumeConversation.Changed) !void 
     );
 }
 
-fn runProvider(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
+fn runProvider(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
     const self: *Owner = @ptrCast(@alignCast(context));
     const live = self.run_selection orelse return .handled;
     const io = self.io orelse return .handled;
@@ -601,7 +655,7 @@ fn runProvider(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome
         }
     }
     if (std.mem.eql(u8, selected_provider.id, before.provider)) {
-        return runModel(context, .{ .spec = &specs[3], .argument = null });
+        return runModel(context, call);
     }
 
     var prospective = live.prepareProviderListing(selected_provider.id) catch {
@@ -1115,6 +1169,25 @@ const FakeResumeRunner = struct {
     }
 };
 
+const FakeUndoRunner = struct {
+    outcome: UndoConversation.Outcome,
+    calls: usize = 0,
+    replay_calls: usize = 0,
+    argument: ?[]const u8 = null,
+    replay_writer: ?*std.Io.Writer = null,
+
+    pub fn run(self: *FakeUndoRunner, argument: ?[]const u8) UndoConversation.Outcome {
+        self.calls += 1;
+        self.argument = argument;
+        return self.outcome;
+    }
+
+    pub fn replay(self: *FakeUndoRunner) void {
+        self.replay_calls += 1;
+        if (self.replay_writer) |writer| writer.writeAll("replay\n") catch unreachable;
+    }
+};
+
 const FakeNewRunner = struct {
     outcome: NewConversation.Outcome,
     calls: usize = 0,
@@ -1170,6 +1243,67 @@ test "resume writes selection and recording warnings before advisory replay" {
             "replay\n",
         output.written(),
     );
+}
+
+test "undo forwards optional numbers and maps only committed cuts to history changes" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+    var runner: FakeUndoRunner = .{ .outcome = .{ .unchanged = .needs_number } };
+    owner.setUndoConversation(UndoConversation.Runner.from(&runner));
+
+    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/undo"));
+    try std.testing.expectEqualStrings(
+        "/undo needs a number of turns when not interactive\n",
+        output.written(),
+    );
+    output.clearRetainingCapacity();
+    runner.outcome = .{ .unchanged = .{ .invalid_range = 3 } };
+    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/undo  2x"));
+    try std.testing.expectEqualStrings("2x", runner.argument.?);
+    try std.testing.expectEqualStrings(
+        "/undo takes a number of turns between 1 and 3\n",
+        output.written(),
+    );
+
+    output.clearRetainingCapacity();
+    runner.outcome = .{ .changed = .{
+        .result = .{ .removed_turns = 2, .effect = .{
+            .old_context_floor = 0,
+            .new_context_floor = 0,
+            .invalidates_context = true,
+        } },
+        .sync_failed = false,
+    } };
+    runner.replay_writer = &output.writer;
+    try std.testing.expectEqual(.history_changed, try executeTestCommand(&owner, "/undo 2"));
+    try std.testing.expectEqualStrings("2", runner.argument.?);
+    try std.testing.expectEqualStrings("replay\n", output.written());
+    try std.testing.expectEqual(@as(usize, 1), runner.replay_calls);
+
+    output.clearRetainingCapacity();
+    runner.outcome.changed.sync_failed = true;
+    try std.testing.expectEqual(.history_changed, try executeTestCommand(&owner, "/undo 1"));
+    try std.testing.expectEqualStrings(
+        "the session file was truncated but could not be synchronized; recording is uncertain\n" ++
+            "replay\n",
+        output.written(),
+    );
+}
+
+test "undo reports disk failure before any advisory replay" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+    var runner: FakeUndoRunner = .{
+        .outcome = .{ .unchanged = .{ .disk_indeterminate = .changed } },
+        .replay_writer = &output.writer,
+    };
+    owner.setUndoConversation(UndoConversation.Runner.from(&runner));
+
+    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/undo 1"));
+    try std.testing.expectEqualStrings(UndoConversation.disk_failure ++ "\n", output.written());
+    try std.testing.expectEqual(@as(usize, 0), runner.replay_calls);
 }
 
 test "new and clear forward optional presets and map only changed history" {
@@ -1249,6 +1383,8 @@ test "help lists only implemented commands and supported shortcuts" {
             "  /new         start a fresh conversation (optional: preset)\n" ++
             "  /clear       alias for /new\n" ++
             "  /resume      resume a previous conversation\n" ++
+            "  /undo        revert conversation to before an earlier message (optional: turns\n" ++
+            "               back)\n" ++
             "  /provider    switch provider, then model and effort\n" ++
             "  /model       switch model, then effort\n" ++
             "  /effort      set reasoning effort\n" ++

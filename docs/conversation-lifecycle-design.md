@@ -3,8 +3,9 @@
 Status: approved
 
 Implementation progress: Slice 1 is complete in commit `9f5e07fb`; Slice 2 is
-complete in commit `23dc6532`. Slice 3 is wired end to end, including live `/resume`,
-stable locked loading, detached selection restore, coordinated publication, and brief replay.
+complete in commit `23dc6532`; Slice 3 is complete in commit `d111080e`. Slice 4 is
+wired end to end, including typed cuts, classified truncation, `/undo`, prompt recall,
+and brief replay.
 
 References:
 

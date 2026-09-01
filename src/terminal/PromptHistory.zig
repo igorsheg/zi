@@ -53,6 +53,7 @@ entries: std.ArrayList([]u8) = .empty,
 position: usize = 0,
 draft: ?[]u8 = null,
 newest_unpersisted: bool = false,
+generation: u64 = 0,
 appender: ?Appender = null,
 
 pub fn init(allocator: std.mem.Allocator) PromptHistory {
@@ -71,16 +72,18 @@ pub fn setAppender(self: *PromptHistory, appender: ?Appender) void {
 }
 
 pub fn beginRead(self: *PromptHistory) void {
+    const changed = self.draft != null or self.position != self.entries.items.len;
     if (self.draft) |owned_draft| self.allocator.free(owned_draft);
     self.draft = null;
     self.position = self.entries.items.len;
+    if (changed) self.generation +%= 1;
 }
 
 /// Copies a decoded persistent entry. This never invokes the appender.
 pub fn seed(self: *PromptHistory, entry_bytes: []const u8) error{OutOfMemory}!void {
     var prepared = try self.prepareAdmission(entry_bytes, .persistent);
-    defer prepared.deinit(self.allocator);
-    self.commitAdmission(&prepared, .persistent);
+    defer prepared.deinit();
+    self.publishAdmission(&prepared);
 }
 
 /// Copies and admits an entry. Persistent append failures other than allocation
@@ -91,14 +94,14 @@ pub fn admit(
     admission: Admission,
 ) error{OutOfMemory}!void {
     var prepared = try self.prepareAdmission(entry_bytes, admission);
-    defer prepared.deinit(self.allocator);
+    defer prepared.deinit();
 
-    if (admission == .persistent and prepared != .noop) {
+    if (prepared.admission == .persistent and prepared.value != .noop) {
         if (self.appender) |appender| {
-            _ = try appender.append(self.allocator, prepared.entry(self));
+            _ = try appender.append(self.allocator, prepared.entry());
         }
     }
-    self.commitAdmission(&prepared, admission);
+    self.publishAdmission(&prepared);
 }
 
 pub fn count(self: *const PromptHistory) usize {
@@ -115,7 +118,7 @@ pub fn currentPosition(self: *const PromptHistory) usize {
     return self.position;
 }
 
-const PreparedAdmission = union(enum) {
+const PreparedValue = union(enum) {
     noop,
     promote_newest,
     replace: struct {
@@ -123,59 +126,104 @@ const PreparedAdmission = union(enum) {
         duplicate_index: ?usize,
         evict_oldest: bool,
     },
+};
 
-    fn entry(prepared: *const PreparedAdmission, history: *const PromptHistory) []const u8 {
-        return switch (prepared.*) {
+/// Move-only prompt admission prepared without changing live history.
+pub const PreparedAdmission = struct {
+    owner: *PromptHistory,
+    allocator: std.mem.Allocator,
+    generation: u64,
+    admission: Admission,
+    value: PreparedValue,
+    active: bool = true,
+
+    fn entry(self: *const PreparedAdmission) []const u8 {
+        return switch (self.value) {
             .noop => "",
-            .promote_newest => history.entries.items[history.entries.items.len - 1],
+            .promote_newest => self.owner.entries.items[self.owner.entries.items.len - 1],
             .replace => |replacement| replacement.owned_entry,
         };
     }
 
-    fn deinit(prepared: *PreparedAdmission, allocator: std.mem.Allocator) void {
-        switch (prepared.*) {
-            .replace => |replacement| allocator.free(replacement.owned_entry),
+    pub fn deinit(self: *PreparedAdmission) void {
+        if (self.active) switch (self.value) {
+            .replace => |replacement| self.allocator.free(replacement.owned_entry),
             else => {},
-        }
-        prepared.* = undefined;
+        };
+        self.* = undefined;
     }
 };
 
-fn prepareAdmission(
+pub fn prepareAdmission(
     self: *PromptHistory,
     entry_bytes: []const u8,
     admission: Admission,
 ) error{OutOfMemory}!PreparedAdmission {
-    if (entry_bytes.len == 0 or entry_bytes.len > maximum_entry_bytes) return .noop;
-
-    const duplicate_index = self.findExact(entry_bytes);
-    if (duplicate_index) |index| {
-        if (index + 1 == self.entries.items.len) {
-            if (admission == .persistent and self.newest_unpersisted) return .promote_newest;
-            return .noop;
+    var value: PreparedValue = .noop;
+    if (entry_bytes.len != 0 and entry_bytes.len <= maximum_entry_bytes) {
+        const duplicate_index = self.findExact(entry_bytes);
+        if (duplicate_index) |index| {
+            if (index + 1 == self.entries.items.len) {
+                if (admission == .persistent and self.newest_unpersisted) {
+                    value = .promote_newest;
+                }
+                return .{
+                    .owner = self,
+                    .allocator = self.allocator,
+                    .generation = self.generation,
+                    .admission = admission,
+                    .value = value,
+                };
+            }
         }
-    }
 
-    const owned_entry = try self.allocator.dupe(u8, entry_bytes);
-    errdefer self.allocator.free(owned_entry);
-    const evict_oldest = duplicate_index == null and self.entries.items.len == maximum_entries;
-    if (duplicate_index == null and !evict_oldest) {
-        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        const owned_entry = try self.allocator.dupe(u8, entry_bytes);
+        errdefer self.allocator.free(owned_entry);
+        const evict_oldest = duplicate_index == null and self.entries.items.len == maximum_entries;
+        if (duplicate_index == null and !evict_oldest) {
+            try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        }
+        value = .{ .replace = .{
+            .owned_entry = owned_entry,
+            .duplicate_index = duplicate_index,
+            .evict_oldest = evict_oldest,
+        } };
     }
-    return .{ .replace = .{
-        .owned_entry = owned_entry,
-        .duplicate_index = duplicate_index,
-        .evict_oldest = evict_oldest,
-    } };
+    return .{
+        .owner = self,
+        .allocator = self.allocator,
+        .generation = self.generation,
+        .admission = admission,
+        .value = value,
+    };
 }
 
-fn commitAdmission(
-    self: *PromptHistory,
-    prepared: *PreparedAdmission,
-    admission: Admission,
-) void {
-    switch (prepared.*) {
-        .noop => return,
+pub fn validateAdmission(
+    self: *const PromptHistory,
+    prepared: *const PreparedAdmission,
+) error{StaleAdmission}!void {
+    if (!prepared.active or prepared.owner != self or
+        prepared.allocator.ptr != self.allocator.ptr or
+        prepared.allocator.vtable != self.allocator.vtable or
+        prepared.generation != self.generation)
+    {
+        return error.StaleAdmission;
+    }
+}
+
+/// Publishes a validated admission without allocating. The captured admission
+/// mode is authoritative.
+pub fn publishAdmission(self: *PromptHistory, prepared: *PreparedAdmission) void {
+    std.debug.assert(prepared.active);
+    std.debug.assert(prepared.owner == self);
+    std.debug.assert(prepared.allocator.ptr == self.allocator.ptr);
+    std.debug.assert(prepared.allocator.vtable == self.allocator.vtable);
+    std.debug.assert(prepared.generation == self.generation);
+    switch (prepared.value) {
+        .noop => {
+            prepared.active = false;
+            return;
+        },
         .promote_newest => self.newest_unpersisted = false,
         .replace => |replacement| {
             if (replacement.duplicate_index) |index| {
@@ -184,13 +232,14 @@ fn commitAdmission(
                 self.allocator.free(self.entries.orderedRemove(0));
             }
             self.entries.appendAssumeCapacity(replacement.owned_entry);
-            self.newest_unpersisted = admission == .session;
-            prepared.* = .noop;
+            self.newest_unpersisted = prepared.admission == .session;
         },
     }
     if (self.draft) |owned_draft| self.allocator.free(owned_draft);
     self.draft = null;
     self.position = self.entries.items.len;
+    self.generation +%= 1;
+    prepared.active = false;
 }
 
 fn findExact(self: *const PromptHistory, entry_bytes: []const u8) ?usize {
@@ -271,6 +320,7 @@ pub fn commitNavigation(self: *PromptHistory, prepared: *PreparedNavigation) voi
         if (self.draft) |owned_draft| self.allocator.free(owned_draft);
         self.draft = null;
     }
+    self.generation +%= 1;
     prepared.* = undefined;
 }
 
@@ -315,12 +365,15 @@ pub fn acceptSearch(
     owned_original: *?[]u8,
 ) void {
     std.debug.assert(match_index < self.entries.items.len);
+    var changed = self.position != match_index;
     self.position = match_index;
     if (original_position == self.entries.items.len) {
+        changed = changed or self.draft != null or owned_original.* != null;
         if (self.draft) |owned_draft| self.allocator.free(owned_draft);
         self.draft = owned_original.*;
         owned_original.* = null;
     }
+    if (changed) self.generation +%= 1;
 }
 
 const RecordingAppender = struct {
@@ -645,4 +698,148 @@ test "all owner, erasedup, navigation, and appender allocation failures are atom
         appenderAllocationFailureCase,
         .{},
     );
+}
+
+test "prepared admission stores mode and mutates generation exactly once" {
+    var history = init(std.testing.allocator);
+    defer history.deinit();
+
+    var session_entry = try history.prepareAdmission("entry", .session);
+    defer session_entry.deinit();
+    const initial_generation = session_entry.generation;
+    try history.validateAdmission(&session_entry);
+    history.publishAdmission(&session_entry);
+    try std.testing.expect(history.newest_unpersisted);
+    try std.testing.expectEqual(initial_generation +% 1, history.generation);
+
+    var no_op = try history.prepareAdmission("entry", .session);
+    defer no_op.deinit();
+    const after_session = history.generation;
+    history.publishAdmission(&no_op);
+    try std.testing.expectEqual(after_session, history.generation);
+    try std.testing.expect(history.newest_unpersisted);
+
+    var promote = try history.prepareAdmission("entry", .persistent);
+    defer promote.deinit();
+    try std.testing.expectEqual(Admission.persistent, promote.admission);
+    history.publishAdmission(&promote);
+    try std.testing.expect(!history.newest_unpersisted);
+    try std.testing.expectEqual(after_session +% 1, history.generation);
+}
+
+test "prepared admission publishes replace promotion and eviction without allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var history = init(allocator);
+    defer history.deinit();
+
+    for (0..maximum_entries) |index| {
+        var buffer: [32]u8 = undefined;
+        const entry_bytes = try std.fmt.bufPrint(&buffer, "entry-{d}", .{index});
+        try history.seed(entry_bytes);
+    }
+    var evict = try history.prepareAdmission("newest", .session);
+    defer evict.deinit();
+    failing.fail_index = failing.alloc_index;
+    const allocations_before = failing.alloc_index;
+    history.publishAdmission(&evict);
+    try std.testing.expectEqual(allocations_before, failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(maximum_entries, history.count());
+    try std.testing.expectEqualStrings("entry-1", history.entry(0).?);
+    try std.testing.expectEqualStrings("newest", history.entry(maximum_entries - 1).?);
+
+    failing.fail_index = std.math.maxInt(usize);
+    var replace = try history.prepareAdmission("entry-1", .persistent);
+    defer replace.deinit();
+    failing.fail_index = failing.alloc_index;
+    const replace_allocations = failing.alloc_index;
+    history.publishAdmission(&replace);
+    try std.testing.expectEqual(replace_allocations, failing.alloc_index);
+    try std.testing.expectEqualStrings("entry-2", history.entry(0).?);
+    try std.testing.expectEqualStrings("entry-1", history.entry(maximum_entries - 1).?);
+}
+
+test "prepared admissions become stale after every history mutation kind" {
+    var history = init(std.testing.allocator);
+    defer history.deinit();
+    try history.seed("one");
+    try history.seed("two");
+    history.beginRead();
+
+    var after_admission = try history.prepareAdmission("candidate-a", .session);
+    defer after_admission.deinit();
+    try history.admit("three", .session);
+    try std.testing.expectError(error.StaleAdmission, history.validateAdmission(&after_admission));
+
+    var after_seed = try history.prepareAdmission("candidate-b", .session);
+    defer after_seed.deinit();
+    try history.seed("four");
+    try std.testing.expectError(error.StaleAdmission, history.validateAdmission(&after_seed));
+
+    var navigation = (try history.prepareNavigation("draft", .older)).?;
+    history.commitNavigation(&navigation);
+    var after_begin_read = try history.prepareAdmission("candidate-c", .session);
+    defer after_begin_read.deinit();
+    history.beginRead();
+    try std.testing.expectError(error.StaleAdmission, history.validateAdmission(&after_begin_read));
+
+    var after_navigation = try history.prepareAdmission("candidate-d", .session);
+    defer after_navigation.deinit();
+    var move_older = (try history.prepareNavigation("draft", .older)).?;
+    history.commitNavigation(&move_older);
+    try std.testing.expectError(error.StaleAdmission, history.validateAdmission(&after_navigation));
+
+    history.beginRead();
+    var after_search = try history.prepareAdmission("candidate-e", .session);
+    defer after_search.deinit();
+    var original: ?[]u8 = try std.testing.allocator.dupe(u8, "draft");
+    history.acceptSearch(0, history.count(), &original);
+    try std.testing.expect(original == null);
+    try std.testing.expectError(error.StaleAdmission, history.validateAdmission(&after_search));
+}
+
+test "prepared admission rejects foreign allocator inactive and stale candidates" {
+    var first = init(std.testing.allocator);
+    defer first.deinit();
+    var second = init(std.testing.allocator);
+    defer second.deinit();
+
+    var foreign = try first.prepareAdmission("foreign", .session);
+    defer foreign.deinit();
+    try std.testing.expectError(error.StaleAdmission, second.validateAdmission(&foreign));
+
+    var inactive = try first.prepareAdmission("", .session);
+    const original_allocator = inactive.allocator;
+    var fixed_storage: [8]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&fixed_storage);
+    inactive.allocator = fixed.allocator();
+    try std.testing.expectError(error.StaleAdmission, first.validateAdmission(&inactive));
+    inactive.allocator = original_allocator;
+    inactive.active = false;
+    try std.testing.expectError(error.StaleAdmission, first.validateAdmission(&inactive));
+    inactive.active = true;
+    inactive.deinit();
+}
+
+test "begin read navigation and search increment only for actual mutation" {
+    var history = init(std.testing.allocator);
+    defer history.deinit();
+    try history.seed("entry");
+    const after_seed = history.generation;
+
+    history.beginRead();
+    try std.testing.expectEqual(after_seed, history.generation);
+    var no_change_original: ?[]u8 = null;
+    history.acceptSearch(history.currentPosition() - 1, 0, &no_change_original);
+    const after_position = history.generation;
+    try std.testing.expectEqual(after_seed +% 1, after_position);
+    history.acceptSearch(history.currentPosition(), 0, &no_change_original);
+    try std.testing.expectEqual(after_position, history.generation);
+
+    history.beginRead();
+    try std.testing.expectEqual(after_position +% 1, history.generation);
+    var navigation = (try history.prepareNavigation("draft", .older)).?;
+    history.commitNavigation(&navigation);
+    try std.testing.expectEqual(after_position +% 2, history.generation);
 }

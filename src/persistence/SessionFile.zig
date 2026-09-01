@@ -197,10 +197,11 @@ pub const TouchError = error{
 };
 
 pub const MutationDurability = enum { synced, sync_failed };
+pub const FileIdentity = NativeIdentity.Identity;
 
 /// Allocation-free authority retained only by a locked resume candidate until
 /// its one post-publication privacy check succeeds.
-const VerifiedSnapshot = struct {
+pub const StatToken = struct {
     device: u64,
     inode: std.Io.File.INode,
     nlink: std.Io.File.NLink,
@@ -209,7 +210,7 @@ const VerifiedSnapshot = struct {
     mtime_nanoseconds: i96,
     ctime_nanoseconds: i96,
 
-    fn init(identity: NativeIdentity.Identity, stat: std.Io.File.Stat) VerifiedSnapshot {
+    fn init(identity: NativeIdentity.Identity, stat: std.Io.File.Stat) StatToken {
         return .{
             .device = identity.device,
             .inode = identity.inode,
@@ -221,19 +222,85 @@ const VerifiedSnapshot = struct {
         };
     }
 
-    fn matches(self: VerifiedSnapshot, identity: NativeIdentity.Identity, stat: std.Io.File.Stat) bool {
+    fn matches(self: StatToken, identity: NativeIdentity.Identity, stat: std.Io.File.Stat) bool {
         return self.device == identity.device and self.inode == identity.inode and
             self.inode == stat.inode and self.nlink == stat.nlink and self.size == stat.size and
             self.kind == stat.kind and self.mtime_nanoseconds == stat.mtime.nanoseconds and
             self.ctime_nanoseconds == stat.ctime.nanoseconds;
     }
 
-    fn matchesPrivate(self: VerifiedSnapshot, identity: NativeIdentity.Identity, stat: std.Io.File.Stat) bool {
+    fn matchesPrivate(self: StatToken, identity: NativeIdentity.Identity, stat: std.Io.File.Stat) bool {
         return self.device == identity.device and self.inode == identity.inode and
             self.inode == stat.inode and self.nlink == stat.nlink and self.size == stat.size and
             self.kind == stat.kind and self.mtime_nanoseconds == stat.mtime.nanoseconds and
             stat.permissions.toMode() & 0o777 == 0o600;
     }
+};
+
+/// Move-only verified source snapshot for one truncate or future fork.
+pub const PreparedCut = struct {
+    owner: *Log,
+    generation: u64,
+    allocator: std.mem.Allocator,
+    plan: SessionCut.Plan,
+    opened_identity: FileIdentity,
+    named_identity: FileIdentity,
+    link_count: u64,
+    original_size: u64,
+    stat_token: StatToken,
+    original_bytes: []u8,
+    selection_pending_after_cut: bool,
+    active: bool = true,
+
+    pub fn deinit(self: *PreparedCut) void {
+        if (self.active) self.allocator.free(self.original_bytes);
+        self.* = undefined;
+    }
+};
+
+pub const TruncateUnchanged = enum { set_length_failed_verified_original };
+
+pub const TruncateIndeterminate = enum {
+    changed,
+    removed,
+    replaced,
+    unreadable,
+    content_mismatch,
+};
+
+pub const TruncateOutcome = union(enum) {
+    unchanged: TruncateUnchanged,
+    committed: struct {
+        durability: MutationDurability,
+        retained_items: usize,
+    },
+    indeterminate: TruncateIndeterminate,
+};
+
+pub const CutError = error{
+    OutOfMemory,
+    InvalidPlan,
+    FileTooLarge,
+    LineTooLarge,
+    TooManyItems,
+    Poisoned,
+    IoFailure,
+    NotRegular,
+    Removed,
+};
+
+pub const TruncateError = error{
+    OutOfMemory,
+    InvalidPlan,
+    FileTooLarge,
+    LineTooLarge,
+    TooManyItems,
+    Poisoned,
+    IoFailure,
+    NotRegular,
+    Removed,
+    StaleCut,
+    HighWaterMismatch,
 };
 
 pub const AppendFailure = enum {
@@ -397,6 +464,7 @@ pub const Log = struct {
     append_delete_fn: *const fn (std.Io, []const u8) error{IoFailure}!void = deleteForkTarget,
     append_sync_directory_fn: *const fn (std.Io, []const u8) error{IoFailure}!void = syncParentDirectory,
     set_length_fn: *const fn (std.Io, std.Io.File, u64) error{IoFailure}!void = setLength,
+    truncate_post_fn: *const fn (*Log, std.Io.File) void = noTruncatePost,
     set_permissions_fn: *const fn (std.Io, std.Io.File) error{IoFailure}!void = setPrivatePermissions,
     opened_identity_fn: *const fn (std.Io.File) error{IoFailure}!NativeIdentity.Identity = NativeIdentity.opened,
     named_identity_fn: *const fn (std.Io, []const u8) error{IoFailure}!NativeIdentity.Identity = NativeIdentity.named,
@@ -422,7 +490,8 @@ pub const Log = struct {
     selection_generation: u64 = 0,
     written_items: usize = 0,
     poisoned: bool = false,
-    verified_snapshot: ?VerifiedSnapshot = null,
+    mutation_generation: u64 = 0,
+    verified_snapshot: ?StatToken = null,
 
     pub fn prepare(
         allocator: std.mem.Allocator,
@@ -596,7 +665,7 @@ pub const Log = struct {
     fn matchesVerifiedSnapshot(
         self: *Log,
         file: std.Io.File,
-        token: VerifiedSnapshot,
+        token: StatToken,
         private: bool,
     ) bool {
         const opened_stat = file.stat(self.io) catch return false;
@@ -734,102 +803,318 @@ pub const Log = struct {
         );
     }
 
-    /// Cuts the materialized JSONL log after `keep_turns` typed turns and
-    /// updates the item high-water mark to the caller's retained snapshot.
-    /// A fresh lazy log has no file to change and is a no-op.
-    ///
-    /// The Log's lifetime exclusive lock excludes cooperating writers. A
-    /// process that ignores that lock can still mutate between stat and I/O;
-    /// detected size changes poison the Log rather than risk an extension or
-    /// a later positional append at a stale offset.
-    pub fn truncate(
-        self: *Log,
-        keep_turns: usize,
-        retained_item_count: usize,
-    ) Error!void {
-        const file = self.file orelse return;
+    /// Captures one exact bounded snapshot through the retained locked descriptor.
+    pub fn prepareCut(self: *Log, retained_typed_turns: usize) CutError!PreparedCut {
+        const file = self.file orelse return error.InvalidPlan;
         if (self.poisoned) return error.Poisoned;
-        if (retained_item_count > self.limits.max_items) return error.TooManyItems;
-
-        const original_offset = self.append_offset;
-        const original_high_water = self.written_items;
-        const original_selection_pending = self.selection_pending;
         const initial_stat = file.stat(self.io) catch return error.IoFailure;
         if (initial_stat.kind != .file) return error.NotRegular;
         if (initial_stat.nlink == 0) return error.Removed;
         if (initial_stat.size > self.limits.max_file_bytes) return error.FileTooLarge;
-        if (initial_stat.size != self.append_offset) {
-            self.poison();
-            return error.IoFailure;
+        if (initial_stat.size != self.append_offset) return error.InvalidPlan;
+        const opened_identity = self.opened_identity_fn(file) catch return error.IoFailure;
+        const named_identity = self.named_identity_fn(self.io, self.path_value) catch return error.IoFailure;
+        if (!opened_identity.eql(named_identity)) return error.InvalidPlan;
+        const named_stat = std.Io.Dir.statFile(
+            .cwd(),
+            self.io,
+            self.path_value,
+            .{ .follow_symlinks = false },
+        ) catch return error.IoFailure;
+        const token = StatToken.init(opened_identity, initial_stat);
+        if (!token.matches(named_identity, named_stat)) return error.InvalidPlan;
+
+        const size: usize = std.math.cast(usize, initial_stat.size) orelse return error.FileTooLarge;
+        const original_bytes = self.allocator.alloc(u8, size) catch return error.OutOfMemory;
+        errdefer self.allocator.free(original_bytes);
+        if (size != 0) {
+            const read = file.readPositionalAll(self.io, original_bytes, 0) catch return error.IoFailure;
+            if (read != size) return error.IoFailure;
         }
-        const initial_size: usize = std.math.cast(usize, initial_stat.size) orelse
-            return error.FileTooLarge;
-        const data = self.allocator.alloc(u8, initial_size) catch return error.OutOfMemory;
-        defer self.allocator.free(data);
-        if (initial_size != 0) {
-            const read = file.readPositionalAll(self.io, data, 0) catch return error.IoFailure;
-            if (read != initial_size) {
-                self.poison();
-                return error.IoFailure;
-            }
-        }
-        const cut = SessionCut.findCut(self.allocator, data, keep_turns, .{
+        const value = SessionCut.plan(self.allocator, original_bytes, retained_typed_turns, .{
             .max_file_bytes = self.limits.max_file_bytes,
             .max_line_bytes = self.limits.max_line_bytes,
             .max_tokens = self.limits.item_json.max_tokens,
             .max_nesting = self.limits.item_json.max_nesting,
             .max_turns = self.limits.max_items,
-        }) catch |err| return mapCut(err);
-        const cut_offset: u64 = @intCast(cut);
-
-        const current_stat = file.stat(self.io) catch return error.IoFailure;
-        if (current_stat.kind != .file) return error.NotRegular;
-        if (current_stat.nlink == 0) return error.Removed;
-        if (current_stat.size != initial_stat.size) {
-            self.poison();
-            return error.IoFailure;
+        }) catch |err| return mapCutForPlan(err);
+        if (value.original_size != initial_stat.size or value.cut_offset > value.original_size) {
+            return error.InvalidPlan;
         }
-        if (cut_offset > current_stat.size) {
-            self.poison();
-            return error.IoFailure;
-        }
-
-        // Stage the live selection before the irreversible operation. Any
-        // post-cut reconciliation failure must leave a safe restatement queued.
-        self.selection_pending = true;
-        self.set_length_fn(self.io, file, cut_offset) catch {
-            // A failed setLength normally leaves the file unchanged. If its
-            // outcome is indeterminate, retain the old logical state but stop
-            // later appends from using it.
-            const after = file.stat(self.io) catch {
-                self.poison();
-                return error.IoFailure;
-            };
-            if (after.size == current_stat.size) {
-                self.selection_pending = original_selection_pending;
-            } else {
-                self.poison();
-            }
-            self.append_offset = original_offset;
-            self.written_items = original_high_water;
-            return error.IoFailure;
-        };
-
-        self.append_offset = cut_offset;
-        self.written_items = retained_item_count;
-
-        // Metadata reconciliation is intentionally best-effort. The cut is
-        // already complete, so a read or allocation failure cannot undo it.
-        var effective = self.read_effective_selection_fn(
+        var effective = effectiveSelectionFromBytes(
             self.allocator,
-            self.io,
-            file,
+            original_bytes[0..@intCast(value.cut_offset)],
             self.limits,
-        ) catch return;
+        ) catch |err| return mapCutSelectionError(err);
         defer effective.deinit(self.allocator);
-        if (selectionEqual(effective.borrow(), self.selection.borrow())) {
-            self.selection_pending = false;
+
+        const stable_stat = file.stat(self.io) catch return error.IoFailure;
+        const stable_opened = self.opened_identity_fn(file) catch return error.IoFailure;
+        const stable_named = self.named_identity_fn(self.io, self.path_value) catch return error.IoFailure;
+        const stable_named_stat = std.Io.Dir.statFile(
+            .cwd(),
+            self.io,
+            self.path_value,
+            .{ .follow_symlinks = false },
+        ) catch return error.IoFailure;
+        if (!token.matches(stable_opened, stable_stat) or
+            !token.matches(stable_named, stable_named_stat) or
+            !opened_identity.eql(stable_named))
+        {
+            return error.InvalidPlan;
         }
+        return .{
+            .owner = self,
+            .generation = self.mutation_generation,
+            .allocator = self.allocator,
+            .plan = value,
+            .opened_identity = opened_identity,
+            .named_identity = named_identity,
+            .link_count = @intCast(initial_stat.nlink),
+            .original_size = initial_stat.size,
+            .stat_token = token,
+            .original_bytes = original_bytes,
+            .selection_pending_after_cut = !selectionEqual(effective.borrow(), self.selection.borrow()),
+        };
+    }
+
+    /// Performs an authoritative truncate. Once setLength starts this function
+    /// returns only a classified outcome and performs no allocation.
+    pub fn truncatePrepared(
+        self: *Log,
+        prepared: *PreparedCut,
+        retained_items: usize,
+    ) TruncateError!TruncateOutcome {
+        if (self.poisoned) return error.Poisoned;
+        if (!prepared.active or prepared.owner != self or
+            prepared.allocator.ptr != self.allocator.ptr or
+            prepared.allocator.vtable != self.allocator.vtable or
+            prepared.generation != self.mutation_generation)
+        {
+            return error.StaleCut;
+        }
+        if (retained_items > self.limits.max_items) return error.TooManyItems;
+        if (retained_items != prepared.plan.retained_item_records or
+            prepared.original_size != self.append_offset)
+        {
+            return error.HighWaterMismatch;
+        }
+        if (prepared.plan.original_size != prepared.original_size or
+            prepared.plan.cut_offset >= prepared.original_size)
+        {
+            return error.InvalidPlan;
+        }
+        const file = self.file orelse return error.InvalidPlan;
+        try self.validatePreparedCut(file, prepared);
+
+        prepared.active = false;
+        defer {
+            prepared.allocator.free(prepared.original_bytes);
+            prepared.original_bytes = &.{};
+        }
+        const set_length_failed = failed: {
+            self.set_length_fn(self.io, file, prepared.plan.cut_offset) catch break :failed true;
+            break :failed false;
+        };
+        self.truncate_post_fn(self, file);
+        const classification = self.classifyTruncate(file, prepared);
+        switch (classification) {
+            .original => {
+                if (!set_length_failed) {
+                    self.poison();
+                    return .{ .indeterminate = .changed };
+                }
+                return .{ .unchanged = .set_length_failed_verified_original };
+            },
+            .retained => {
+                self.append_offset = prepared.plan.cut_offset;
+                self.written_items = retained_items;
+                self.selection_pending = prepared.selection_pending_after_cut;
+                self.mutation_generation +%= 1;
+                var durability: MutationDurability = .synced;
+                self.append_sync_file_fn(self.io, file) catch {
+                    durability = .sync_failed;
+                };
+                if (durability == .sync_failed) self.poison();
+                return .{ .committed = .{
+                    .durability = durability,
+                    .retained_items = retained_items,
+                } };
+            },
+            .indeterminate => |reason| {
+                self.poison();
+                return .{ .indeterminate = reason };
+            },
+        }
+    }
+
+    /// Backward-compatible wrapper used by the legacy fork/truncate tests.
+    pub fn truncate(self: *Log, keep_turns: usize, retained_item_count: usize) Error!void {
+        if (self.file == null) return;
+        var prepared = self.prepareCut(keep_turns) catch |err| return mapLegacyCutError(err);
+        defer prepared.deinit();
+        if (prepared.plan.cut_offset == prepared.plan.original_size) {
+            self.selection_pending = prepared.selection_pending_after_cut;
+            return;
+        }
+        const outcome = self.truncatePrepared(&prepared, retained_item_count) catch |err|
+            return mapLegacyTruncateError(err);
+        switch (outcome) {
+            .unchanged, .indeterminate => return error.IoFailure,
+            .committed => |value| if (value.durability == .sync_failed) return error.IoFailure,
+        }
+    }
+
+    const TruncateClassification = union(enum) {
+        original,
+        retained,
+        indeterminate: TruncateIndeterminate,
+    };
+
+    fn validatePreparedCut(
+        self: *Log,
+        file: std.Io.File,
+        prepared: *const PreparedCut,
+    ) TruncateError!void {
+        const opened_stat = file.stat(self.io) catch return error.IoFailure;
+        if (opened_stat.kind != .file) return error.NotRegular;
+        if (opened_stat.nlink == 0) return error.Removed;
+        const opened_identity = self.opened_identity_fn(file) catch return error.IoFailure;
+        const named_stat = std.Io.Dir.statFile(
+            .cwd(),
+            self.io,
+            self.path_value,
+            .{ .follow_symlinks = false },
+        ) catch return error.Removed;
+        const named_identity = self.named_identity_fn(self.io, self.path_value) catch return error.Removed;
+        if (!prepared.stat_token.matches(opened_identity, opened_stat) or
+            !prepared.stat_token.matches(named_identity, named_stat) or
+            !prepared.opened_identity.eql(opened_identity) or
+            !prepared.named_identity.eql(named_identity))
+        {
+            return error.InvalidPlan;
+        }
+        if (!(self.matchesFileBytes(
+            file,
+            prepared.original_bytes,
+            prepared.plan.original_fingerprint,
+        ) catch return error.IoFailure)) return error.InvalidPlan;
+        const final_opened_stat = file.stat(self.io) catch return error.IoFailure;
+        const final_opened_identity = self.opened_identity_fn(file) catch return error.IoFailure;
+        const final_named_stat = std.Io.Dir.statFile(
+            .cwd(),
+            self.io,
+            self.path_value,
+            .{ .follow_symlinks = false },
+        ) catch return error.Removed;
+        const final_named_identity = self.named_identity_fn(self.io, self.path_value) catch return error.Removed;
+        if (!prepared.stat_token.matches(final_opened_identity, final_opened_stat) or
+            !prepared.stat_token.matches(final_named_identity, final_named_stat))
+        {
+            return error.InvalidPlan;
+        }
+    }
+
+    fn classifyTruncate(self: *Log, file: std.Io.File, prepared: *PreparedCut) TruncateClassification {
+        const opened_stat = file.stat(self.io) catch return .{ .indeterminate = .unreadable };
+        if (opened_stat.kind != .file) return .{ .indeterminate = .changed };
+        if (opened_stat.nlink == 0) return .{ .indeterminate = .removed };
+        const opened_identity = self.opened_identity_fn(file) catch return .{ .indeterminate = .unreadable };
+        if (!prepared.opened_identity.eql(opened_identity)) return .{ .indeterminate = .replaced };
+        const named_stat = std.Io.Dir.statFile(
+            .cwd(),
+            self.io,
+            self.path_value,
+            .{ .follow_symlinks = false },
+        ) catch return .{ .indeterminate = .removed };
+        if (named_stat.kind != .file or named_stat.nlink == 0) return .{ .indeterminate = .removed };
+        const named_identity = self.named_identity_fn(self.io, self.path_value) catch
+            return .{ .indeterminate = .removed };
+        if (!prepared.named_identity.eql(named_identity) or !opened_identity.eql(named_identity)) {
+            return .{ .indeterminate = .replaced };
+        }
+
+        const expected_size: usize = if (opened_stat.size == prepared.original_size)
+            @intCast(prepared.original_size)
+        else if (opened_stat.size == prepared.plan.cut_offset)
+            @intCast(prepared.plan.cut_offset)
+        else
+            return .{ .indeterminate = .changed };
+        const final_opened_stat = file.stat(self.io) catch return .{ .indeterminate = .unreadable };
+        const final_opened_identity = self.opened_identity_fn(file) catch
+            return .{ .indeterminate = .unreadable };
+        const final_named_stat = std.Io.Dir.statFile(
+            .cwd(),
+            self.io,
+            self.path_value,
+            .{ .follow_symlinks = false },
+        ) catch return .{ .indeterminate = .removed };
+        const final_named_identity = self.named_identity_fn(self.io, self.path_value) catch
+            return .{ .indeterminate = .removed };
+        if (!sameSnapshotStat(opened_stat, final_opened_stat) or
+            !sameSnapshotStat(final_opened_stat, final_named_stat) or
+            !opened_identity.eql(final_opened_identity) or
+            !opened_identity.eql(final_named_identity))
+        {
+            return .{ .indeterminate = .changed };
+        }
+        const expected_bytes = if (opened_stat.size == prepared.original_size)
+            prepared.original_bytes
+        else
+            prepared.original_bytes[0..expected_size];
+        const expected_fingerprint = if (opened_stat.size == prepared.original_size)
+            prepared.plan.original_fingerprint
+        else
+            prepared.plan.retained_fingerprint;
+        if (opened_stat.size == prepared.original_size and
+            !prepared.stat_token.matches(final_opened_identity, final_opened_stat))
+        {
+            return .{ .indeterminate = .content_mismatch };
+        }
+        const matches = self.matchesFileBytes(file, expected_bytes, expected_fingerprint) catch
+            return .{ .indeterminate = .unreadable };
+        if (!matches) return .{ .indeterminate = .content_mismatch };
+        const checked_stat = file.stat(self.io) catch return .{ .indeterminate = .unreadable };
+        const checked_identity = self.opened_identity_fn(file) catch return .{ .indeterminate = .unreadable };
+        const checked_named_stat = std.Io.Dir.statFile(
+            .cwd(),
+            self.io,
+            self.path_value,
+            .{ .follow_symlinks = false },
+        ) catch return .{ .indeterminate = .removed };
+        const checked_named_identity = self.named_identity_fn(self.io, self.path_value) catch
+            return .{ .indeterminate = .removed };
+        if (!sameSnapshotStat(final_opened_stat, checked_stat) or
+            !sameSnapshotStat(checked_stat, checked_named_stat) or
+            !final_opened_identity.eql(checked_identity) or
+            !checked_identity.eql(checked_named_identity))
+        {
+            return .{ .indeterminate = .changed };
+        }
+        return if (opened_stat.size == prepared.original_size) .original else .retained;
+    }
+
+    fn matchesFileBytes(
+        self: *Log,
+        file: std.Io.File,
+        expected: []const u8,
+        expected_fingerprint: SessionCut.Fingerprint,
+    ) error{IoFailure}!bool {
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        var chunk: [4096]u8 = undefined;
+        var offset: usize = 0;
+        while (offset < expected.len) {
+            const length = @min(chunk.len, expected.len - offset);
+            const read = file.readPositionalAll(self.io, chunk[0..length], @intCast(offset)) catch
+                return error.IoFailure;
+            if (read != length) return false;
+            if (!std.mem.eql(u8, expected[offset..][0..length], chunk[0..length])) return false;
+            hasher.update(chunk[0..length]);
+            offset += length;
+        }
+        var observed: SessionCut.Fingerprint = undefined;
+        hasher.final(&observed);
+        return std.mem.eql(u8, &expected_fingerprint, &observed);
     }
 
     /// Creates a locked sibling session containing the first `keep_turns`
@@ -1063,6 +1348,7 @@ pub const Log = struct {
         std.debug.assert(prepared.generation == self.selection_generation);
         prepared.active = false;
         self.selection_generation +%= 1;
+        self.mutation_generation +%= 1;
         const replacement = prepared.replacement orelse return .{
             .allocator = self.allocator,
             .selection = null,
@@ -1095,6 +1381,7 @@ pub const Log = struct {
         self.selection = old;
         self.selection_pending = false;
         self.selection_generation +%= 1;
+        self.mutation_generation +%= 1;
         return .{
             .generation = self.selection_generation,
             .allocator = self.allocator,
@@ -1112,6 +1399,7 @@ pub const Log = struct {
             transition.selection = old;
             self.selection_pending = self.header_written;
             self.selection_generation +%= 1;
+            self.mutation_generation +%= 1;
             transition.generation = self.selection_generation;
         }
         transition.restored = true;
@@ -1124,6 +1412,7 @@ pub const Log = struct {
     }
 
     pub fn discardSelection(self: *Log) void {
+        if (self.selection_pending) self.mutation_generation +%= 1;
         self.selection_pending = false;
     }
 
@@ -1318,6 +1607,7 @@ pub const Log = struct {
         self.separator_pending = false;
         self.append_offset += @intCast(appended_bytes);
         self.written_items = item_count;
+        self.mutation_generation +%= 1;
         self.append_sync_file_fn(self.io, self.file.?) catch {
             self.poison();
             return .{ .committed = .sync_failed };
@@ -1426,6 +1716,8 @@ fn setLength(io: std.Io, file: std.Io.File, length: u64) error{IoFailure}!void {
     file.setLength(io, length) catch return error.IoFailure;
 }
 
+fn noTruncatePost(_: *Log, _: std.Io.File) void {}
+
 fn setPrivatePermissions(io: std.Io, file: std.Io.File) error{IoFailure}!void {
     file.setPermissions(io, .fromMode(0o600)) catch return error.IoFailure;
 }
@@ -1480,6 +1772,37 @@ fn failSetLength(_: std.Io, _: std.Io.File, _: u64) error{IoFailure}!void {
 fn mutateThenFailSetLength(io: std.Io, file: std.Io.File, length: u64) error{IoFailure}!void {
     file.setLength(io, length) catch return error.IoFailure;
     return error.IoFailure;
+}
+
+fn setUnexpectedLength(io: std.Io, file: std.Io.File, length: u64) error{IoFailure}!void {
+    file.setLength(io, length + 1) catch return error.IoFailure;
+}
+
+fn postTruncateContentMismatch(log: *Log, file: std.Io.File) void {
+    file.writePositionalAll(log.io, "X", 0) catch return;
+}
+
+fn failOpenedIdentity(_: std.Io.File) error{IoFailure}!NativeIdentity.Identity {
+    return error.IoFailure;
+}
+
+fn postTruncateUnreadable(log: *Log, _: std.Io.File) void {
+    log.opened_identity_fn = failOpenedIdentity;
+}
+
+fn postTruncateRemoved(log: *Log, _: std.Io.File) void {
+    std.Io.Dir.deleteFile(.cwd(), log.io, log.path_value) catch return;
+}
+
+fn postTruncateReplaced(log: *Log, _: std.Io.File) void {
+    var moved_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const moved = std.fmt.bufPrint(&moved_buffer, "{s}.moved", .{log.path_value}) catch return;
+    std.Io.Dir.rename(.cwd(), log.path_value, .cwd(), moved, log.io) catch return;
+    const replacement = std.Io.Dir.createFile(.cwd(), log.io, log.path_value, .{
+        .read = true,
+        .permissions = .fromMode(0o600),
+    }) catch return;
+    replacement.close(log.io);
 }
 
 fn failEffectiveSelection(
@@ -1544,6 +1867,14 @@ fn readEffectiveSelectionOpened(
         if (read != size) return error.IoFailure;
     }
 
+    return effectiveSelectionFromBytes(allocator, data, limits);
+}
+
+fn effectiveSelectionFromBytes(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    limits: Limits,
+) Error!OwnedSelection {
     var current: OwnedSelection = .{};
     errdefer current.deinit(allocator);
     var cursor: usize = 0;
@@ -1923,7 +2254,7 @@ fn loadLockedForResumeWithVerifier(
     const verified_stat = file.stat(io) catch return error.IoFailure;
     const verified_identity = NativeIdentity.opened(file) catch return error.IoFailure;
     if (!sameSnapshotStat(stat, verified_stat)) return error.IoFailure;
-    const verified_snapshot = VerifiedSnapshot.init(verified_identity, verified_stat);
+    const verified_snapshot = StatToken.init(verified_identity, verified_stat);
 
     var selection = OwnedSelection.init(allocator, loaded.meta.selection.borrow()) catch |err| return mapAlloc(err);
     errdefer selection.deinit(allocator);
@@ -2461,6 +2792,53 @@ fn mapCut(err: SessionCut.Error) Error {
         error.FileTooLarge => error.FileTooLarge,
         error.LineTooLarge => error.LineTooLarge,
         error.TooManyTokens, error.TooDeep, error.TooManyTurns => error.ResourceLimit,
+    };
+}
+
+fn mapCutForPlan(err: SessionCut.Error) CutError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.FileTooLarge => error.FileTooLarge,
+        error.LineTooLarge => error.LineTooLarge,
+        error.InvalidLimits, error.TooManyTokens, error.TooDeep, error.TooManyTurns => error.InvalidPlan,
+    };
+}
+
+fn mapCutSelectionError(err: Error) CutError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.FileTooLarge => error.FileTooLarge,
+        error.LineTooLarge => error.LineTooLarge,
+        error.NotRegular => error.NotRegular,
+        error.Removed => error.Removed,
+        else => error.InvalidPlan,
+    };
+}
+
+fn mapLegacyCutError(err: CutError) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.FileTooLarge => error.FileTooLarge,
+        error.LineTooLarge => error.LineTooLarge,
+        error.TooManyItems => error.TooManyItems,
+        error.Poisoned => error.Poisoned,
+        error.NotRegular => error.NotRegular,
+        error.Removed => error.Removed,
+        error.InvalidPlan, error.IoFailure => error.IoFailure,
+    };
+}
+
+fn mapLegacyTruncateError(err: TruncateError) Error {
+    return switch (err) {
+        error.StaleCut, error.HighWaterMismatch => error.IoFailure,
+        error.OutOfMemory => error.OutOfMemory,
+        error.FileTooLarge => error.FileTooLarge,
+        error.LineTooLarge => error.LineTooLarge,
+        error.TooManyItems => error.TooManyItems,
+        error.Poisoned => error.Poisoned,
+        error.NotRegular => error.NotRegular,
+        error.Removed => error.Removed,
+        error.InvalidPlan, error.IoFailure => error.IoFailure,
     };
 }
 
@@ -3598,7 +3976,7 @@ test "truncate keep zero and fresh log no-op" {
     try std.testing.expect((try log.file.?.stat(io)).size > size_after_cut);
 }
 
-test "truncate failures preserve logical state and poison only an indeterminate mutation" {
+test "truncate failures classify verified original and reported failure after prefix" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3635,13 +4013,13 @@ test "truncate failures preserve logical state and poison only an indeterminate 
     try std.testing.expectEqual(@as(u64, fixture.len), (try log.file.?.stat(io)).size);
 
     log.set_length_fn = mutateThenFailSetLength;
-    try std.testing.expectError(error.IoFailure, log.truncate(0, 0));
-    try std.testing.expect(log.poisoned);
-    try std.testing.expectEqual(old_offset, log.append_offset);
-    try std.testing.expectEqual(@as(usize, 2), log.highWater());
+    try log.truncate(0, 0);
+    try std.testing.expect(!log.poisoned);
+    try std.testing.expect(log.append_offset < old_offset);
+    try std.testing.expectEqual(@as(usize, 0), log.highWater());
 }
 
-test "truncate compares model label and poisons an externally changed size" {
+test "truncate compares model label and rejects an externally changed size before mutation" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3686,7 +4064,7 @@ test "truncate compares model label and poisons an externally changed size" {
     defer size_log.deinit();
     try size_log.file.?.setLength(io, fixture.len - 1);
     try std.testing.expectError(error.IoFailure, size_log.truncate(0, 0));
-    try std.testing.expect(size_log.poisoned);
+    try std.testing.expect(!size_log.poisoned);
     try std.testing.expectEqual(@as(u64, fixture.len - 1), (try size_log.file.?.stat(io)).size);
 }
 
@@ -3771,8 +4149,7 @@ test "fork keep zero failure cleanup OOM and unavailable states" {
     defer allocator.free(source_path);
     const fixture =
         "{\"type\":\"session\",\"id\":\"source\",\"provider\":\"p\"}\n" ++
-        "{\"kind\":\"user\",\"origin\":\"synthetic\"}\n" ++
-        "{\"kind\":\"user\"}\n";
+        "{\"kind\":\"user\",\"text\":\"u\"}\n";
     var file = try std.Io.Dir.createFile(.cwd(), io, source_path, .{ .read = true });
     try file.writeStreamingAll(io, fixture);
     file.close(io);
@@ -3996,4 +4373,193 @@ test "locked resume retains exclusive lock and appends through the loaded descri
     var loaded = try load(allocator, io, path_value, .{});
     defer loaded.deinit();
     try std.testing.expectEqual(@as(usize, 2), loaded.session.items().len);
+}
+
+test "prepared truncate classifies unchanged reported-prefix and sync failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [4096]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const fixture =
+        "{\"type\":\"session\",\"provider\":\"p\"}\n" ++
+        "{\"kind\":\"user\",\"text\":\"first\"}\n" ++
+        "{\"kind\":\"assistant\",\"text\":\"answer\"}\n" ++
+        "{\"kind\":\"turn_boundary\"}\n" ++
+        "{\"kind\":\"user\",\"text\":\"second\"}\n" ++
+        "{\"kind\":\"assistant\",\"text\":\"answer\"}\n";
+
+    const unchanged_path = try std.fmt.allocPrint(allocator, "{s}/unchanged.jsonl", .{root_buffer[0..root_len]});
+    defer allocator.free(unchanged_path);
+    var file = try std.Io.Dir.createFile(.cwd(), io, unchanged_path, .{ .read = true });
+    try file.writeStreamingAll(io, fixture);
+    file.close(io);
+    var unchanged_log = try Log.resumeExisting(allocator, io, .{
+        .path = unchanged_path,
+        .selection = .{ .provider = "p" },
+        .loaded_item_count = 5,
+    });
+    defer unchanged_log.deinit();
+    var unchanged_cut = try unchanged_log.prepareCut(1);
+    defer unchanged_cut.deinit();
+    unchanged_log.set_length_fn = failSetLength;
+    const unchanged = try unchanged_log.truncatePrepared(&unchanged_cut, 2);
+    try std.testing.expectEqual(
+        TruncateUnchanged.set_length_failed_verified_original,
+        unchanged.unchanged,
+    );
+    try std.testing.expectEqual(@as(usize, 5), unchanged_log.highWater());
+
+    const committed_path = try std.fmt.allocPrint(allocator, "{s}/committed.jsonl", .{root_buffer[0..root_len]});
+    defer allocator.free(committed_path);
+    file = try std.Io.Dir.createFile(.cwd(), io, committed_path, .{ .read = true });
+    try file.writeStreamingAll(io, fixture);
+    file.close(io);
+    var committed_log = try Log.resumeExisting(allocator, io, .{
+        .path = committed_path,
+        .selection = .{ .provider = "p" },
+        .loaded_item_count = 5,
+    });
+    defer committed_log.deinit();
+    var committed_cut = try committed_log.prepareCut(1);
+    defer committed_cut.deinit();
+    committed_log.set_length_fn = mutateThenFailSetLength;
+    const committed = try committed_log.truncatePrepared(&committed_cut, 2);
+    try std.testing.expectEqual(MutationDurability.synced, committed.committed.durability);
+    try std.testing.expectEqual(@as(usize, 2), committed_log.highWater());
+
+    const sync_path = try std.fmt.allocPrint(allocator, "{s}/sync.jsonl", .{root_buffer[0..root_len]});
+    defer allocator.free(sync_path);
+    file = try std.Io.Dir.createFile(.cwd(), io, sync_path, .{ .read = true });
+    try file.writeStreamingAll(io, fixture);
+    file.close(io);
+    var sync_log = try Log.resumeExisting(allocator, io, .{
+        .path = sync_path,
+        .selection = .{ .provider = "p" },
+        .loaded_item_count = 5,
+    });
+    defer sync_log.deinit();
+    var sync_cut = try sync_log.prepareCut(1);
+    defer sync_cut.deinit();
+    sync_log.append_sync_file_fn = failSyncFile;
+    const sync_outcome = try sync_log.truncatePrepared(&sync_cut, 2);
+    try std.testing.expectEqual(MutationDurability.sync_failed, sync_outcome.committed.durability);
+    try std.testing.expect(sync_log.poisoned);
+}
+
+test "prepared truncate classifies every indeterminate post-mutation observation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [4096]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const fixture =
+        "{\"type\":\"session\"}\n" ++
+        "{\"kind\":\"user\",\"text\":\"first\"}\n" ++
+        "{\"kind\":\"turn_boundary\"}\n" ++
+        "{\"kind\":\"user\",\"text\":\"second\"}\n";
+    const cases = [_]struct {
+        name: []const u8,
+        set_length: *const fn (std.Io, std.Io.File, u64) error{IoFailure}!void,
+        post: *const fn (*Log, std.Io.File) void,
+        expected: TruncateIndeterminate,
+    }{
+        .{
+            .name = "changed",
+            .set_length = setUnexpectedLength,
+            .post = noTruncatePost,
+            .expected = .changed,
+        },
+        .{
+            .name = "removed",
+            .set_length = setLength,
+            .post = postTruncateRemoved,
+            .expected = .removed,
+        },
+        .{
+            .name = "replaced",
+            .set_length = setLength,
+            .post = postTruncateReplaced,
+            .expected = .replaced,
+        },
+        .{
+            .name = "unreadable",
+            .set_length = setLength,
+            .post = postTruncateUnreadable,
+            .expected = .unreadable,
+        },
+        .{
+            .name = "content",
+            .set_length = setLength,
+            .post = postTruncateContentMismatch,
+            .expected = .content_mismatch,
+        },
+    };
+    for (cases, 0..) |case, index| {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{d}-{s}.jsonl",
+            .{ root_buffer[0..root_len], index, case.name },
+        );
+        defer allocator.free(path);
+        var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .read = true });
+        try file.writeStreamingAll(io, fixture);
+        file.close(io);
+        var log = try Log.resumeExisting(allocator, io, .{
+            .path = path,
+            .selection = .{},
+            .loaded_item_count = 3,
+        });
+        defer log.deinit();
+        var prepared = try log.prepareCut(1);
+        defer prepared.deinit();
+        log.set_length_fn = case.set_length;
+        log.truncate_post_fn = case.post;
+        const outcome = try log.truncatePrepared(&prepared, 1);
+        try std.testing.expectEqual(case.expected, outcome.indeterminate);
+        try std.testing.expect(log.poisoned);
+    }
+}
+
+test "prepared truncate is stale after log mutation and allocates nothing after setLength" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/allocation.jsonl", .{root});
+    defer std.testing.allocator.free(path);
+    const fixture =
+        "{\"type\":\"session\"}\n" ++
+        "{\"kind\":\"user\",\"text\":\"first\"}\n" ++
+        "{\"kind\":\"turn_boundary\"}\n" ++
+        "{\"kind\":\"user\",\"text\":\"second\"}\n";
+    var file = try std.Io.Dir.createFile(.cwd(), io, path, .{ .read = true });
+    try file.writeStreamingAll(io, fixture);
+    file.close(io);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var log = try Log.resumeExisting(failing.allocator(), io, .{
+        .path = path,
+        .selection = .{},
+        .loaded_item_count = 3,
+    });
+    defer log.deinit();
+    var stale = try log.prepareCut(1);
+    defer stale.deinit();
+    var selection = try log.prepareSelection(.{ .provider = "p" });
+    defer selection.deinit();
+    log.publishSelection(&selection);
+    try std.testing.expectError(error.StaleCut, log.truncatePrepared(&stale, 1));
+
+    var prepared = try log.prepareCut(1);
+    defer prepared.deinit();
+    failing.fail_index = failing.alloc_index;
+    const allocations_before = failing.alloc_index;
+    const outcome = try log.truncatePrepared(&prepared, 1);
+    try std.testing.expectEqual(MutationDurability.synced, outcome.committed.durability);
+    try std.testing.expectEqual(allocations_before, failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
 }

@@ -134,6 +134,57 @@ pub const Retired = struct {
     }
 };
 
+pub fn isTypedTurn(item: ai.Item.Item) bool {
+    return item == .user_message and item.user_message.origin == .external;
+}
+
+pub const TypedTurn = struct {
+    ordinal: usize,
+    item_index: usize,
+    text: []const u8,
+};
+
+pub const CutEffect = struct {
+    old_context_floor: usize,
+    new_context_floor: usize,
+    invalidates_context: bool,
+};
+
+/// Owns item payloads removed by a published cut. The item slice borrows the
+/// session's retained backing and must be deinitialized before another history
+/// mutation can reuse that capacity.
+pub const RetiredCut = struct {
+    allocator: std.mem.Allocator,
+    items: []Item,
+    active: bool = true,
+
+    pub fn deinit(self: *RetiredCut) void {
+        if (self.active) for (self.items) |*item| item.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+/// Move-only suffix cut prepared without changing live history. The removed
+/// prompt is borrowed only while the captured history generation remains valid.
+pub const PreparedCut = struct {
+    owner: *Session,
+    generation: u64,
+    original_items: usize,
+    retained_items: usize,
+    original_typed_turns: usize,
+    retained_typed_turns: usize,
+    retained_bytes: usize,
+    retained_images: usize,
+    retained_image_base64_bytes: usize,
+    first_removed_prompt: ?[]const u8,
+    effect: CutEffect,
+    active: bool = true,
+
+    pub fn deinit(self: *PreparedCut) void {
+        self.* = undefined;
+    }
+};
+
 /// Move-only usage footer prepared for an allocation-free session commit.
 pub const PreparedUsage = struct {
     item: ai.Item.Item,
@@ -446,6 +497,96 @@ pub const Session = struct {
 
     pub fn items(self: *const Session) []const Item {
         return self.record.items;
+    }
+
+    pub fn typedTurnCount(self: *const Session) usize {
+        var count: usize = 0;
+        for (self.record.items) |item| count += @intFromBool(isTypedTurn(item));
+        return count;
+    }
+
+    /// Returns a zero-based typed turn borrowed until the next session mutation.
+    pub fn typedTurn(self: *const Session, ordinal: usize) ?TypedTurn {
+        var current: usize = 0;
+        for (self.record.items, 0..) |item, item_index| {
+            if (!isTypedTurn(item)) continue;
+            if (current == ordinal) return .{
+                .ordinal = ordinal,
+                .item_index = item_index,
+                .text = item.user_message.text,
+            };
+            current += 1;
+        }
+        return null;
+    }
+
+    /// Prepares removal of one or more typed turns and their complete suffix.
+    /// The live session must be idle and remains unchanged on every failure.
+    pub fn prepareTypedCut(
+        self: *Session,
+        retained_typed_turns: usize,
+    ) (Error || error{InvalidTurnCount})!PreparedCut {
+        if (self.run_state != .idle) return error.SessionBusy;
+        try self.validateOwnedState();
+
+        const original_typed_turns = self.typedTurnCount();
+        if (retained_typed_turns >= original_typed_turns) return error.InvalidTurnCount;
+        const first_removed = self.typedTurn(retained_typed_turns).?;
+        var retained_items = first_removed.item_index;
+        if (retained_items != 0 and self.record.items[retained_items - 1] == .turn_boundary) {
+            retained_items -= 1;
+        }
+
+        const retained = self.record.items[0..retained_items];
+        var retained_bytes: usize = 0;
+        for (retained) |item| retained_bytes += ai.Item.retainedBytes(item);
+        const old_context_floor = ai.Item.contextFloor(self.record.items);
+        return .{
+            .owner = self,
+            .generation = self.history_generation,
+            .original_items = self.record.items.len,
+            .retained_items = retained_items,
+            .original_typed_turns = original_typed_turns,
+            .retained_typed_turns = retained_typed_turns,
+            .retained_bytes = retained_bytes,
+            .retained_images = ai.Item.imageCount(retained),
+            .retained_image_base64_bytes = ai.Item.imageBase64Bytes(retained),
+            .first_removed_prompt = first_removed.text,
+            .effect = .{
+                .old_context_floor = old_context_floor,
+                .new_context_floor = ai.Item.contextFloor(retained),
+                .invalidates_context = true,
+            },
+        };
+    }
+
+    /// Publishes a prepared cut without allocator calls and consumes the
+    /// candidate. The returned token must be released before another history
+    /// mutation can reuse the session's spare capacity.
+    pub fn publishTypedCutRetired(self: *Session, prepared: *PreparedCut) RetiredCut {
+        std.debug.assert(prepared.active);
+        std.debug.assert(prepared.owner == self);
+        std.debug.assert(prepared.generation == self.history_generation);
+        std.debug.assert(prepared.original_items == self.record.items.len);
+        std.debug.assert(prepared.original_typed_turns == self.typedTurnCount());
+        std.debug.assert(prepared.retained_typed_turns < prepared.original_typed_turns);
+        std.debug.assert(prepared.retained_items < prepared.original_items);
+        std.debug.assert(self.run_state == .idle);
+
+        const removed = self.record.items[prepared.retained_items..];
+        self.record.items.len = prepared.retained_items;
+        self.retained_bytes = prepared.retained_bytes;
+        self.image_count = prepared.retained_images;
+        self.image_base64_bytes = prepared.retained_image_base64_bytes;
+        self.history_generation +%= 1;
+        prepared.active = false;
+        return .{ .allocator = self.allocator, .items = removed };
+    }
+
+    /// Publishes and immediately releases removed item payloads.
+    pub fn publishTypedCut(self: *Session, prepared: *PreparedCut) void {
+        var retired = self.publishTypedCutRetired(prepared);
+        retired.deinit();
     }
 
     /// Copies one borrowed item into the session allocator after bounded admission.
@@ -1825,4 +1966,177 @@ test "task note allocation failures leave the session unchanged" {
         exerciseTaskNoteAllocations,
         .{},
     );
+}
+
+test "typed turns include only external prompts regardless of text" {
+    const external: Item = .{ .user_message = .{
+        .text = @constCast("[continue]"),
+        .origin = .external,
+    } };
+    try std.testing.expect(isTypedTurn(external));
+    inline for (.{
+        ai.Item.UserOrigin.compact_seed,
+        ai.Item.UserOrigin.continuation,
+        ai.Item.UserOrigin.task_note,
+    }) |origin| {
+        const internal: Item = .{ .user_message = .{
+            .text = @constCast("ordinary-looking text"),
+            .origin = origin,
+        } };
+        try std.testing.expect(!isTypedTurn(internal));
+    }
+    const assistant: Item = .{ .assistant_message = .{ .text = @constCast("user-like") } };
+    try std.testing.expect(!isTypedTurn(assistant));
+
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try session.addCompactSeed("seed");
+    try session.addContinuation();
+    try session.addTaskNote("task");
+    try session.addUser("first");
+    try session.addUser("[continue]");
+
+    try std.testing.expectEqual(@as(usize, 2), session.typedTurnCount());
+    const first = session.typedTurn(0).?;
+    try std.testing.expectEqual(@as(usize, 0), first.ordinal);
+    try std.testing.expectEqualStrings("first", first.text);
+    try std.testing.expectEqualStrings("[continue]", session.typedTurn(1).?.text);
+    try std.testing.expect(session.typedTurn(2) == null);
+}
+
+test "typed cut retains the prefix boundary and precomputes complete suffix accounting" {
+    const allocator = std.testing.allocator;
+    var session = try Session.init(allocator, .{
+        .provider_id = "provider",
+        .model = "model",
+    });
+    defer session.deinit();
+
+    try session.addCompactSeed("old seed");
+    try session.addUser("first");
+    const answer: Item = .{ .assistant_message = .{ .text = @constCast("answer") } };
+    try session.appendCopy(&answer);
+    try session.addCompactSeed("retained seed");
+    try session.addContinuation();
+    try session.addTaskNote("task result");
+    try session.addBoundary();
+    const preserved_boundary = session.items().len - 1;
+    try session.addUser("[continue]");
+    const second = session.typedTurn(1).?;
+    try std.testing.expectEqual(preserved_boundary + 2, second.item_index);
+
+    const reasoning: Item = .{ .reasoning = .{
+        .opaque_json = @constCast("{\"opaque\":true}"),
+        .text = @constCast("reasoning"),
+    } };
+    try session.appendCopy(&reasoning);
+    const call: Item = .{ .tool_call = .{
+        .id = @constCast("call"),
+        .name = @constCast("read"),
+        .arguments_json = @constCast("{}"),
+    } };
+    try session.appendCopy(&call);
+    var image = [_]ai.Item.Image{.{
+        .mime = @constCast("image/png"),
+        .data_base64 = @constCast("AAAA"),
+        .width = 1,
+        .height = 1,
+    }};
+    const result: Item = .{ .tool_result = .{
+        .call_id = @constCast("call"),
+        .output = @constCast("output"),
+        .images = &image,
+    } };
+    try session.appendCopy(&result);
+    try session.addCompactSeed("removed seed");
+    _ = try session.addTurnUsage(.{
+        .stream = .{ .input_tokens = 3, .output_tokens = 2 },
+        .elapsed_ms = 4,
+        .provider_label = "Provider",
+    });
+
+    const original_items = session.items().len;
+    const original_generation = session.historyGeneration();
+    const selection_generation = session.selectionGeneration();
+    const old_floor = ai.Item.contextFloor(session.items());
+    var prepared = try session.prepareTypedCut(1);
+    defer prepared.deinit();
+
+    try std.testing.expectEqual(original_items, session.items().len);
+    try std.testing.expectEqual(original_generation, session.historyGeneration());
+    try std.testing.expectEqual(@as(usize, 2), prepared.original_typed_turns);
+    try std.testing.expectEqual(@as(usize, 1), prepared.retained_typed_turns);
+    try std.testing.expectEqual(preserved_boundary + 1, prepared.retained_items);
+    try std.testing.expectEqualStrings("[continue]", prepared.first_removed_prompt.?);
+    try std.testing.expectEqual(old_floor, prepared.effect.old_context_floor);
+    try std.testing.expectEqual(
+        ai.Item.contextFloor(session.items()[0..prepared.retained_items]),
+        prepared.effect.new_context_floor,
+    );
+    try std.testing.expect(prepared.effect.old_context_floor > prepared.effect.new_context_floor);
+    try std.testing.expect(prepared.effect.invalidates_context);
+
+    session.publishTypedCut(&prepared);
+    try std.testing.expectEqual(preserved_boundary + 1, session.items().len);
+    try std.testing.expect(session.items()[preserved_boundary] == .turn_boundary);
+    try std.testing.expectEqual(@as(usize, 1), session.typedTurnCount());
+    try std.testing.expectEqual(original_generation +% 1, session.historyGeneration());
+    try std.testing.expectEqual(selection_generation, session.selectionGeneration());
+
+    var retained_bytes: usize = 0;
+    for (session.items()) |item| retained_bytes += ai.Item.retainedBytes(item);
+    try std.testing.expectEqual(retained_bytes, session.retained_bytes);
+    try std.testing.expectEqual(ai.Item.imageCount(session.items()), session.image_count);
+    try std.testing.expectEqual(
+        ai.Item.imageBase64Bytes(session.items()),
+        session.image_base64_bytes,
+    );
+}
+
+test "typed cut rejects invalid and busy sessions and cancellation changes nothing" {
+    var empty = try Session.init(std.testing.allocator, .{});
+    defer empty.deinit();
+    try std.testing.expectError(error.InvalidTurnCount, empty.prepareTypedCut(0));
+
+    var session = try Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    try session.addUser("only");
+    try std.testing.expectError(error.InvalidTurnCount, session.prepareTypedCut(1));
+    try std.testing.expectError(error.InvalidTurnCount, session.prepareTypedCut(99));
+
+    try session.beginRun();
+    try std.testing.expectError(error.SessionBusy, session.prepareTypedCut(0));
+    session.endRun();
+
+    const generation = session.historyGeneration();
+    const count = session.items().len;
+    var cancelled = try session.prepareTypedCut(0);
+    cancelled.deinit();
+    try std.testing.expectEqual(count, session.items().len);
+    try std.testing.expectEqual(generation, session.historyGeneration());
+
+    var stale = try session.prepareTypedCut(0);
+    defer stale.deinit();
+    try session.addBoundary();
+    try std.testing.expect(stale.generation != session.historyGeneration());
+    try std.testing.expectEqual(count + 1, session.items().len);
+}
+
+test "typed cut publication performs no allocations" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var session = try Session.init(allocator, .{});
+    defer session.deinit();
+    try session.addUser("keep");
+    try session.addUser("remove");
+    var prepared = try session.prepareTypedCut(1);
+    defer prepared.deinit();
+
+    failing.fail_index = failing.alloc_index;
+    const allocations_before = failing.alloc_index;
+    session.publishTypedCut(&prepared);
+
+    try std.testing.expectEqual(allocations_before, failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 2), session.items().len);
 }
