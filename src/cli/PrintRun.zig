@@ -1559,6 +1559,7 @@ fn runRawInteractive(
             .search_no_match_style_close = theme.chrome_dim.close,
         },
     );
+    defer raw_input.deinit();
     var presentation: RawPresentation = .{
         .frame = &frame,
         .theme = theme,

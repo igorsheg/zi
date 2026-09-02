@@ -13,10 +13,12 @@ pub const DisplayPolicy = enum {
     managed,
 };
 
-pub const HandlerOutcome = enum {
+pub const HandlerOutcome = union(enum) {
     handled,
     history_changed,
     exit,
+    /// Borrowed only through synchronous command-outcome delivery.
+    preseed: []const u8,
 };
 
 pub const Call = struct {
@@ -272,7 +274,11 @@ const TestHandler = struct {
         self.calls += 1;
         self.argument = call_value.argument;
         if (self.fail) return error.HandlerFailed;
-        return if (call_value.argument != null) .history_changed else .handled;
+        if (call_value.argument) |argument| {
+            if (std.mem.eql(u8, argument, "seed")) return .{ .preseed = argument };
+            return .history_changed;
+        }
+        return .handled;
     }
 };
 
@@ -377,36 +383,46 @@ test "classification is exhaustive and has no callback side effects" {
     try std.testing.expect(output.bad_name == null);
 }
 
+fn expectHandlerOutcome(expected: std.meta.Tag(HandlerOutcome), actual: HandlerOutcome) !void {
+    try std.testing.expectEqual(expected, std.meta.activeTag(actual));
+}
+
 test "execution begins output and handles every usage" {
     var handler: TestHandler = .{};
     var output: TestOutput = .{};
     const sink = Output.from(&output);
 
-    try std.testing.expectEqual(
-        HandlerOutcome.handled,
+    try expectHandlerOutcome(
+        .handled,
         try execute(classify("/h", &test_specs).command, &test_specs, &handler, sink),
     );
     try std.testing.expectEqual(@as(usize, 1), handler.calls);
     try std.testing.expect(handler.argument == null);
 
-    try std.testing.expectEqual(
-        HandlerOutcome.history_changed,
+    try expectHandlerOutcome(
+        .history_changed,
         try execute(classify("/new focus", &test_specs).command, &test_specs, &handler, sink),
     );
     try std.testing.expectEqualStrings("focus", handler.argument.?);
 
-    try std.testing.expectEqual(
-        HandlerOutcome.handled,
+    try expectHandlerOutcome(
+        .handled,
         try execute(classify("/Help", &test_specs).command, &test_specs, &handler, sink),
     );
     try std.testing.expectEqualStrings("Help", output.unknown_name.?);
 
-    try std.testing.expectEqual(
-        HandlerOutcome.handled,
+    try expectHandlerOutcome(
+        .handled,
         try execute(classify("/help extra", &test_specs).command, &test_specs, &handler, sink),
     );
     try std.testing.expectEqualStrings("help", output.bad_name.?);
-    try std.testing.expectEqual(@as(usize, 4), output.began);
+
+    const seeded = try execute(classify("/new seed", &test_specs).command, &test_specs, &handler, sink);
+    switch (seeded) {
+        .preseed => |bytes| try std.testing.expectEqualStrings("seed", bytes),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 5), output.began);
 }
 
 test "handler failure occurs only during execution after output begins" {

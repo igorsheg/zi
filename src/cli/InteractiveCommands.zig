@@ -269,11 +269,7 @@ pub const Owner = struct {
             },
         }, &specs, self, Slash.Output.from(self));
         try self.flush();
-        return switch (outcome) {
-            .handled => .handled,
-            .history_changed => .history_changed,
-            .exit => .exit,
-        };
+        return mapSlashOutcome(outcome);
     }
 
     fn executeToken(
@@ -538,6 +534,15 @@ pub const Owner = struct {
         return self.writer.flush();
     }
 };
+
+fn mapSlashOutcome(outcome: Slash.HandlerOutcome) Interactive.CommandOutcome {
+    return switch (outcome) {
+        .handled => .handled,
+        .history_changed => .history_changed,
+        .exit => .exit,
+        .preseed => |bytes| .{ .preseed = bytes },
+    };
+}
 
 fn runNew(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
     const self: *Owner = @ptrCast(@alignCast(context));
@@ -1092,7 +1097,7 @@ fn runPresetSaveFlow(
     }
     const arguments = PresetSave.parse(argument) orelse {
         try self.writeNote("name it: /preset-save <name> [tint]");
-        return .handled;
+        return .{ .preseed = "/preset-save " };
     };
     if (!config.Preset.nameValid(arguments.name)) {
         try writePresetSaveEscaped(
@@ -1620,6 +1625,13 @@ fn executeTestCommand(owner: *Owner, line: []const u8) !Interactive.CommandOutco
     };
 }
 
+fn expectCommandOutcome(
+    expected: std.meta.Tag(Interactive.CommandOutcome),
+    actual: Interactive.CommandOutcome,
+) !void {
+    try std.testing.expectEqual(expected, std.meta.activeTag(actual));
+}
+
 const FakePresetSaveCurrent = struct {
     generation: u64 = 7,
     provider: []const u8 = "mock",
@@ -1628,6 +1640,14 @@ const FakePresetSaveCurrent = struct {
     preset: ?[]const u8 = null,
     model_discovered: bool = false,
 };
+
+test "command outcome mapping preserves borrowed preseed payload" {
+    const mapped = mapSlashOutcome(.{ .preseed = "/preset-save " });
+    switch (mapped) {
+        .preseed => |bytes| try std.testing.expectEqualStrings("/preset-save ", bytes),
+        else => return error.TestUnexpectedResult,
+    }
+}
 
 const FakePresetSaveLive = struct {
     allocator: std.mem.Allocator = std.testing.allocator,
@@ -1887,7 +1907,11 @@ test "preset save command validates preconditions arguments and escaped input be
     try std.testing.expectEqualStrings("no model resolved yet — use /model to pick one first\n", output.written());
     output.clearRetainingCapacity();
     live.facts.model = "mock-model";
-    _ = try runPresetSaveFlow(&owner, null, PresetSave.Source.from(&source), &live, &activator);
+    const missing = try runPresetSaveFlow(&owner, null, PresetSave.Source.from(&source), &live, &activator);
+    switch (missing) {
+        .preseed => |bytes| try std.testing.expectEqualStrings("/preset-save ", bytes),
+        else => return error.TestUnexpectedResult,
+    }
     try std.testing.expectEqualStrings("name it: /preset-save <name> [tint]\n", output.written());
     output.clearRetainingCapacity();
     _ = try runPresetSaveFlow(&owner, "bad\x1b rose", PresetSave.Source.from(&source), &live, &activator);
@@ -1992,8 +2016,8 @@ test "resume rejects arguments and cooked mode never invokes its runner" {
     var runner: FakeResumeRunner = .{ .outcome = .{ .unchanged = .canceled } };
     owner.setResumeConversation(ResumeConversation.Runner.from(&runner));
 
-    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/resume extra"));
-    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/resume"));
+    try expectCommandOutcome(.handled, try executeTestCommand(&owner, "/resume extra"));
+    try expectCommandOutcome(.handled, try executeTestCommand(&owner, "/resume"));
     try std.testing.expectEqual(@as(usize, 0), runner.calls);
     try std.testing.expectEqualStrings(
         "/resume takes no arguments.\n/resume requires an interactive terminal\n",
@@ -2019,7 +2043,7 @@ test "resume writes selection and recording warnings before advisory replay" {
     };
     owner.setResumeConversation(ResumeConversation.Runner.from(&runner));
 
-    try std.testing.expectEqual(.history_changed, try executeTestCommand(&owner, "/resume"));
+    try expectCommandOutcome(.history_changed, try executeTestCommand(&owner, "/resume"));
     try std.testing.expectEqual(@as(usize, 1), runner.calls);
     try std.testing.expectEqual(@as(usize, 1), runner.replay_calls);
     try std.testing.expectEqualStrings(
@@ -2037,14 +2061,14 @@ test "undo forwards optional numbers and maps only committed cuts to history cha
     var runner: FakeUndoRunner = .{ .outcome = .{ .unchanged = .needs_number } };
     owner.setUndoConversation(UndoConversation.Runner.from(&runner));
 
-    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/undo"));
+    try expectCommandOutcome(.handled, try executeTestCommand(&owner, "/undo"));
     try std.testing.expectEqualStrings(
         "/undo needs a number of turns when not interactive\n",
         output.written(),
     );
     output.clearRetainingCapacity();
     runner.outcome = .{ .unchanged = .{ .invalid_range = 3 } };
-    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/undo  2x"));
+    try expectCommandOutcome(.handled, try executeTestCommand(&owner, "/undo  2x"));
     try std.testing.expectEqualStrings("2x", runner.argument.?);
     try std.testing.expectEqualStrings(
         "/undo takes a number of turns between 1 and 3\n",
@@ -2061,14 +2085,14 @@ test "undo forwards optional numbers and maps only committed cuts to history cha
         .sync_failed = false,
     } };
     runner.replay_writer = &output.writer;
-    try std.testing.expectEqual(.history_changed, try executeTestCommand(&owner, "/undo 2"));
+    try expectCommandOutcome(.history_changed, try executeTestCommand(&owner, "/undo 2"));
     try std.testing.expectEqualStrings("2", runner.argument.?);
     try std.testing.expectEqualStrings("replay\n", output.written());
     try std.testing.expectEqual(@as(usize, 1), runner.replay_calls);
 
     output.clearRetainingCapacity();
     runner.outcome.changed.sync_failed = true;
-    try std.testing.expectEqual(.history_changed, try executeTestCommand(&owner, "/undo 1"));
+    try expectCommandOutcome(.history_changed, try executeTestCommand(&owner, "/undo 1"));
     try std.testing.expectEqualStrings(
         "the session file was truncated but could not be synchronized; recording is uncertain\n" ++
             "replay\n",
@@ -2086,7 +2110,7 @@ test "undo reports disk failure before any advisory replay" {
     };
     owner.setUndoConversation(UndoConversation.Runner.from(&runner));
 
-    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/undo 1"));
+    try expectCommandOutcome(.handled, try executeTestCommand(&owner, "/undo 1"));
     try std.testing.expectEqualStrings(UndoConversation.disk_failure ++ "\n", output.written());
     try std.testing.expectEqual(@as(usize, 0), runner.replay_calls);
 }
@@ -2108,11 +2132,11 @@ test "compact forwards optional focus and renders one exact product outcome" {
         var runner: FakeCompactRunner = .{ .result = compactResult(case[0]) };
         owner.setCompactConversation(CompactConversation.Runner.from(&runner));
 
-        const expected_outcome: Interactive.CommandOutcome = if (case[0] == .compacted) blk: {
+        const expected_outcome: std.meta.Tag(Interactive.CommandOutcome) = if (case[0] == .compacted) blk: {
             runner.result.mutation = .seed_committed;
             break :blk .history_changed;
         } else .handled;
-        try std.testing.expectEqual(expected_outcome, try executeTestCommand(&owner, "/compact keep paths"));
+        try expectCommandOutcome(expected_outcome, try executeTestCommand(&owner, "/compact keep paths"));
         try std.testing.expectEqualStrings("keep paths", runner.focus.?);
         try std.testing.expectEqualStrings(case[1], output.written());
     }
@@ -2128,7 +2152,7 @@ test "compact bounds oversized escaped provider diagnostics" {
     runner.result.diagnostic = &diagnostic;
     owner.setCompactConversation(CompactConversation.Runner.from(&runner));
 
-    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/compact"));
+    try expectCommandOutcome(.handled, try executeTestCommand(&owner, "/compact"));
     try std.testing.expectEqualStrings(
         "── compaction failed: stream failed ──\n",
         output.written(),
@@ -2144,7 +2168,7 @@ test "compact keeps seed success while rendering observer and durability warning
     runner.result.issue = .{ .usage_observer_failed = true, .durability = .indeterminate };
     owner.setCompactConversation(CompactConversation.Runner.from(&runner));
 
-    try std.testing.expectEqual(.history_changed, try executeTestCommand(&owner, "/compact"));
+    try expectCommandOutcome(.history_changed, try executeTestCommand(&owner, "/compact"));
     try std.testing.expectEqualStrings(
         "── conversation compacted ──\n" ++
             "compaction usage was recorded in history but could not be added to usage totals\n" ++
@@ -2160,10 +2184,10 @@ test "new and clear forward optional presets and map only changed history" {
     var runner: FakeNewRunner = .{ .outcome = .{ .changed = .{} } };
     owner.setNewConversation(NewConversation.Runner.from(&runner));
 
-    try std.testing.expectEqual(.history_changed, try executeTestCommand(&owner, "/clear review"));
+    try expectCommandOutcome(.history_changed, try executeTestCommand(&owner, "/clear review"));
     try std.testing.expectEqualStrings("review", runner.argument.?);
     runner.outcome = .{ .unchanged = .{ .preparation = error.OutOfMemory } };
-    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/new"));
+    try expectCommandOutcome(.handled, try executeTestCommand(&owner, "/new"));
     try std.testing.expect(runner.argument == null);
     try std.testing.expectEqual(@as(usize, 2), runner.calls);
 }
@@ -2175,7 +2199,7 @@ test "new preset diagnostics escape names and report committed partial state" {
     var runner: FakeNewRunner = .{ .outcome = .{ .unchanged = .{ .preset = .missing } } };
     owner.setNewConversation(NewConversation.Runner.from(&runner));
 
-    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/new bad\x1b[2J"));
+    try expectCommandOutcome(.handled, try executeTestCommand(&owner, "/new bad\x1b[2J"));
     try std.testing.expectEqualStrings("unknown preset 'bad\\x1b[2J'\n", output.written());
     output.clearRetainingCapacity();
     runner.outcome = .{ .partial = .{
@@ -2184,7 +2208,7 @@ test "new preset diagnostics escape names and report committed partial state" {
         .preset_persistence = .run_only,
         .selection_restore = .{ .retryable = .io_retryable },
     } };
-    try std.testing.expectEqual(.handled, try executeTestCommand(&owner, "/new review"));
+    try expectCommandOutcome(.handled, try executeTestCommand(&owner, "/new review"));
     try std.testing.expectEqualStrings(
         "couldn't save to state.json — this preset applies to this run only\n" ++
             "preset 'review' was applied, but the current conversation was not cleared\n" ++
@@ -2224,7 +2248,7 @@ test "help lists only implemented commands and supported shortcuts" {
     defer output.deinit();
     var owner = Owner.init(&output.writer, try testTheme(), false, 80);
 
-    try std.testing.expectEqual(Interactive.CommandOutcome.handled, try executeTestCommand(&owner, "/help"));
+    try expectCommandOutcome(.handled, try executeTestCommand(&owner, "/help"));
     try std.testing.expectEqualStrings(
         "commands\n" ++
             "  /new          start a fresh conversation (optional: preset)\n" ++

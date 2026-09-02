@@ -112,6 +112,7 @@ pub const PromptInput = struct {
     context: *anyopaque,
     read_fn: *const fn (*anyopaque) anyerror!terminal.Result,
     set_empty_submit_fn: *const fn (*anyopaque, bool) void,
+    queue_preseed_fn: *const fn (*anyopaque, []const u8) anyerror!void,
 
     pub fn read(self: PromptInput) !terminal.Result {
         return self.read_fn(self.context);
@@ -119,6 +120,11 @@ pub const PromptInput = struct {
 
     pub fn setEmptySubmit(self: PromptInput, resumable: bool) void {
         self.set_empty_submit_fn(self.context, resumable);
+    }
+
+    /// Copies borrowed command bytes synchronously when the input supports preseeding.
+    pub fn queuePreseed(self: PromptInput, bytes: []const u8) !void {
+        return self.queue_preseed_fn(self.context, bytes);
     }
 
     pub fn from(implementation: anytype) PromptInput {
@@ -140,11 +146,19 @@ pub const PromptInput = struct {
                     self.setEmptySubmit(resumable);
                 }
             }
+
+            fn queuePreseed(context: *anyopaque, bytes: []const u8) anyerror!void {
+                if (comptime @hasDecl(Implementation, "queuePreseed")) {
+                    const self: *Implementation = @ptrCast(@alignCast(context));
+                    return self.queuePreseed(bytes);
+                }
+            }
         };
         return .{
             .context = implementation,
             .read_fn = Adapter.read,
             .set_empty_submit_fn = Adapter.setEmptySubmit,
+            .queue_preseed_fn = Adapter.queuePreseed,
         };
     }
 };
@@ -186,10 +200,12 @@ pub const PromptRecall = struct {
     }
 };
 
-pub const CommandOutcome = enum {
+pub const CommandOutcome = union(enum) {
     handled,
     history_changed,
     exit,
+    /// Borrowed only until the synchronous PromptInput queue call returns.
+    preseed: []const u8,
 };
 
 pub const CommandUsage = enum {
@@ -593,6 +609,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
                             continue;
                         },
                         .exit => return 0,
+                        .preseed => |bytes| {
+                            if (inputs.prompt_input) |prompt_input| try prompt_input.queuePreseed(bytes);
+                            continue;
+                        },
                     }
                 },
                 .prompt => {
@@ -735,6 +755,7 @@ test "interactive terminal adapters preserve prompt and generation ownership" {
     var prompt: Prompt = .{};
     const prompt_input = PromptInput.from(&prompt);
     prompt_input.setEmptySubmit(true);
+    try prompt_input.queuePreseed("ignored by optional adapter");
     var result = try prompt_input.read();
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), prompt.calls);
@@ -971,6 +992,127 @@ test "commands are classified before recall and bypass session provider flow" {
     try std.testing.expect(provider.valid);
     try std.testing.expectEqual(@as(usize, 1), seam.prompts);
     try std.testing.expectEqualStrings("answer\n", stdout.written());
+}
+
+test "command preseed is recalled then copied before borrowed sanitized input is released" {
+    const State = struct {
+        const Self = @This();
+        stage: u8 = 0,
+        reads: usize = 0,
+        queue_calls: usize = 0,
+        queued: [32]u8 = undefined,
+        queued_len: usize = 0,
+
+        pub fn read(self: *Self) !terminal.Result {
+            self.reads += 1;
+            if (self.reads == 1) {
+                const bytes = try std.testing.allocator.dupe(u8, "/seed borrowed");
+                return .{ .submit = .{ .bytes = bytes, .capacity = bytes.len } };
+            }
+            try std.testing.expectEqual(@as(u8, 3), self.stage);
+            try std.testing.expectEqualStrings("borrowed", self.queued[0..self.queued_len]);
+            return .eof;
+        }
+
+        pub fn queuePreseed(self: *Self, bytes: []const u8) !void {
+            try std.testing.expectEqual(@as(u8, 2), self.stage);
+            self.stage = 3;
+            self.queue_calls += 1;
+            @memcpy(self.queued[0..bytes.len], bytes);
+            self.queued_len = bytes.len;
+        }
+
+        pub fn admitSession(self: *Self, line: []const u8) !void {
+            try std.testing.expectEqual(@as(u8, 0), self.stage);
+            try std.testing.expectEqualStrings("/seed borrowed", line);
+            self.stage = 1;
+        }
+
+        pub fn admitPersistent(_: *Self, _: []const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+
+        pub fn classifyCommand(self: *Self, line: []const u8) CommandClassification {
+            return .{ .command = .{
+                .context = self,
+                .execute_fn = execute,
+                .registry_index = 0,
+                .name = line[1..5],
+                .argument = line[6..],
+                .usage = .valid,
+            } };
+        }
+
+        fn execute(context: *anyopaque, token: CommandToken) anyerror!CommandOutcome {
+            const self: *Self = @ptrCast(@alignCast(context));
+            try std.testing.expectEqual(@as(u8, 1), self.stage);
+            self.stage = 2;
+            return .{ .preseed = token.argument.? };
+        }
+    };
+
+    var state: State = .{};
+    var session = try agent.Session.Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var reader = std.Io.Reader.fixed("");
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+    try std.testing.expectEqual(@as(u8, 0), try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = undefined,
+        .model = "",
+        .system_prompt = "",
+        .reader = &reader,
+        .prompt_input = PromptInput.from(&state),
+        .prompt_recall = PromptRecall.from(&state),
+        .command_gateway = CommandGateway.from(&state),
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .show_prompt = false,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), state.queue_calls);
+    try std.testing.expectEqual(@as(usize, 0), session.items().len);
+}
+
+test "cooked command preseed is discarded synchronously" {
+    const Gateway = struct {
+        pub fn classifyCommand(self: *@This(), line: []const u8) CommandClassification {
+            return .{ .command = .{
+                .context = self,
+                .execute_fn = execute,
+                .registry_index = 0,
+                .name = line[1..5],
+                .argument = line[6..],
+                .usage = .valid,
+            } };
+        }
+
+        fn execute(_: *anyopaque, token: CommandToken) anyerror!CommandOutcome {
+            return .{ .preseed = token.argument.? };
+        }
+    };
+    var gateway: Gateway = .{};
+    var session = try agent.Session.Session.init(std.testing.allocator, .{});
+    defer session.deinit();
+    var reader = std.Io.Reader.fixed("/seed discarded\n");
+    var stdout: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr.deinit();
+    try std.testing.expectEqual(@as(u8, 0), try run(std.testing.allocator, std.testing.io, .{
+        .session = &session,
+        .provider = undefined,
+        .model = "",
+        .system_prompt = "",
+        .reader = &reader,
+        .command_gateway = CommandGateway.from(&gateway),
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .show_prompt = false,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), session.items().len);
 }
 
 test "history-changing command clears resume state without rerunning first-send hook" {

@@ -1,6 +1,6 @@
 # Preset save program design
 
-Status: approved; Slice 2 accepted; Slice 3 pending
+Status: implemented through Slice 3; ready gate blocked by the known Zig filesystem test baseline
 
 References:
 
@@ -1058,12 +1058,10 @@ Verification:
 - `ziglint` when available;
 - the full project ready gate.
 
-After every slice, update this document's implementation ledger before continuing. One
-final coherent commit admits the complete capability:
-
-```text
-feat(cli): save current selection as preset
-```
+After every slice, update this document's implementation ledger before continuing. At the
+user's requested checkpoint, Slices 1 and 2 were committed as `ae797c55`
+(`feat(cli): save current selection as preset`). Slice 3 remains a separate reviewable
+preseed commit.
 
 ## Implementation ledger
 
@@ -1125,6 +1123,31 @@ feat(cli): save current selection as preset
   regression behavior.
 - Final read-only review — no P1/P2 blockers.
 
+### Slice 3 — complete
+
+- Converted Slash and Interactive command outcomes to tagged unions with a synchronously
+  borrowed preseed payload, including exhaustive mapping and active-tag tests.
+- Added optional `PromptInput.queuePreseed`; adapters without that method remain no-ops,
+  and cooked mode discards payloads immediately.
+- Added bounded atomic preseed replacement to `RawLineInput`, moved ownership before every
+  read attempt, seeded `LineEditor` at cursor end, and released unused or consumed bytes.
+- Added production `RawLineInput.deinit` and installed it immediately after initialization.
+- Bare `/preset-save` now prints the name hint and seeds `/preset-save ` once in TTY mode.
+
+### Slice 3 verification
+
+- Focused preseed, Slash, Interactive, InteractiveCommands, and RawLineInput suites pass.
+- Tests cover recall-before-execute-before-copy ordering, borrowed payload lifetime,
+  adapter fallback, cooked discard, bounds, replacement OOM, editor setup OOM, terminal
+  entry failure, cursor position, one-shot ownership, and unused-seed teardown.
+- The built PTY probe completed a save by typing only the tail after the preloaded text and
+  proved the following prompt was clean. All prior cooked and PTY preset-save probes pass.
+- `zig fmt --check src/`, `zig build`, `./zig-out/bin/zi --help`, and
+  `./zig-out/bin/zi --version` pass. `ziglint` is unavailable.
+- `zig build test` records 1620 of 1728 tests passing, with 9 failures, 99 crashes, and 6
+  leaks in the documented Zig filesystem/BADF baseline. The feature-focused tests pass.
+- Final read-only review found no P1/P2 blockers.
+
 ## Acceptance ledger
 
 - [x] Shared atomic helper preserves StateWriter behavior.
@@ -1137,8 +1160,8 @@ feat(cli): save current selection as preset
 - [x] `/preset-save` diagnostics and help order are exact and control-byte safe.
 - [x] Saved/updated announcement precedes shared preset activation.
 - [x] Activation failure leaves config/cache saved and live selection unchanged.
-- [ ] Bare command seeds the next TTY editor exactly once; cooked mode discards it.
+- [x] Bare command seeds the next TTY editor exactly once; cooked mode discards it.
 - [x] Prompt facts, tint, banner, transcript, and state stance refresh immediately.
-- [ ] Allocation failures leak nothing and publish nothing before rename.
-- [ ] Built-binary probes use only this checkout's `./zig-out/bin/zi`.
-- [ ] Required ready gate result is recorded without weakening baseline failures.
+- [x] Allocation failures in preset-save paths leak nothing and publish nothing before rename.
+- [x] Built-binary probes use only this checkout's `./zig-out/bin/zi`.
+- [x] Required ready gate result is recorded without weakening baseline failures.

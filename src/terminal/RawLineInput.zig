@@ -50,6 +50,7 @@ geometry_valid: bool = false,
 paste_enabled: bool = false,
 flush_input_on_cleanup: bool = false,
 active: bool = false,
+pending_preseed: ?[]u8 = null,
 
 pub const Options = struct {
     empty_submit: bool = false,
@@ -96,6 +97,29 @@ pub fn init(
     };
 }
 
+/// Releases an unused preseed. The input must not be inside `read`.
+pub fn deinit(input: *RawLineInput) void {
+    std.debug.assert(!input.active);
+    if (input.pending_preseed) |bytes| input.allocator.free(bytes);
+    input.* = undefined;
+}
+
+/// Atomically replaces the bounded one-shot editor seed.
+pub fn queuePreseed(
+    input: *RawLineInput,
+    bytes: []const u8,
+) error{ OutOfMemory, PromptTooLarge }!void {
+    if (bytes.len > max_prompt_bytes) return error.PromptTooLarge;
+    if (bytes.len == 0) {
+        if (input.pending_preseed) |previous| input.allocator.free(previous);
+        input.pending_preseed = null;
+        return;
+    }
+    const replacement = input.allocator.dupe(u8, bytes) catch return error.OutOfMemory;
+    if (input.pending_preseed) |previous| input.allocator.free(previous);
+    input.pending_preseed = replacement;
+}
+
 /// Controls whether bare Enter can submit an empty line for a resumable turn.
 pub fn setEmptySubmit(input: *RawLineInput, enabled: bool) void {
     input.empty_submit = enabled;
@@ -114,7 +138,10 @@ pub fn admitPersistent(input: *RawLineInput, line: []const u8) error{OutOfMemory
 /// Reads directly from the stdin descriptor. A submitted result owns its bytes.
 /// EOF owns no storage. All terminal state is restored before this function returns.
 pub fn read(input: *RawLineInput) !Result {
-    var editor = LineEditor.init(input.allocator, input.empty_submit);
+    const preseed = input.pending_preseed;
+    input.pending_preseed = null;
+    defer if (preseed) |bytes| input.allocator.free(bytes);
+    var editor = try initializeEditor(input, preseed);
     defer editor.deinit();
 
     if (input.history) |history| history.beginRead();
@@ -215,6 +242,13 @@ fn handleEditorByte(
         }
     }
     return editor.handleByte(byte);
+}
+
+fn initializeEditor(input: *RawLineInput, preseed: ?[]const u8) !LineEditor {
+    var editor = LineEditor.init(input.allocator, input.empty_submit);
+    errdefer editor.deinit();
+    if (preseed) |bytes| try editor.setBuffer(bytes);
+    return editor;
 }
 
 fn navigateHistory(
@@ -1075,6 +1109,90 @@ fn flushInput(fd: std.posix.fd_t) !void {
 }
 
 extern "c" fn tcflush(fd: c_int, queue: c_int) c_int;
+
+fn invalidRawInput(allocator: std.mem.Allocator, writer: *std.Io.Writer) RawLineInput {
+    const invalid_file: std.Io.File = .{
+        .handle = -1,
+        .flags = .{ .nonblocking = false },
+    };
+    return init(
+        allocator,
+        std.testing.io,
+        invalid_file,
+        invalid_file,
+        writer,
+        "> ",
+        .{},
+    );
+}
+
+test "raw preseed replacement clear bounds and deinit are atomic" {
+    var output: [0]u8 = .{};
+    var writer = std.Io.Writer.fixed(&output);
+    var input = invalidRawInput(std.testing.allocator, &writer);
+    defer input.deinit();
+    try input.queuePreseed("first");
+    try std.testing.expectEqualStrings("first", input.pending_preseed.?);
+    try input.queuePreseed("second");
+    try std.testing.expectEqualStrings("second", input.pending_preseed.?);
+
+    var oversized: [max_prompt_bytes + 1]u8 = undefined;
+    @memset(&oversized, 'x');
+    try std.testing.expectError(error.PromptTooLarge, input.queuePreseed(&oversized));
+    try std.testing.expectEqualStrings("second", input.pending_preseed.?);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    input.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, input.queuePreseed("replacement"));
+    input.allocator = std.testing.allocator;
+    try std.testing.expectEqualStrings("second", input.pending_preseed.?);
+    try input.queuePreseed("");
+    try std.testing.expect(input.pending_preseed == null);
+    // The deferred deinit owns a seed which was never consumed by read.
+    try input.queuePreseed("unused");
+}
+
+test "raw preseed editor starts at end and moved seed is freed on setup OOM" {
+    var output: [0]u8 = .{};
+    var writer = std.Io.Writer.fixed(&output);
+    var input = invalidRawInput(std.testing.allocator, &writer);
+    defer input.deinit();
+    var editor = try initializeEditor(&input, "/preset-save ");
+    defer editor.deinit();
+    try std.testing.expectEqualStrings("/preset-save ", editor.bytes());
+    try std.testing.expectEqual(editor.bytes().len, editor.cursorOffset());
+
+    try input.queuePreseed("owned seed");
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    input.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, input.read());
+    input.allocator = std.testing.allocator;
+    try std.testing.expect(input.pending_preseed == null);
+}
+
+test "raw preseed is consumed before terminal entry failure" {
+    var descriptors: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&descriptors));
+    const read_end: std.Io.File = .{ .handle = descriptors[0], .flags = .{ .nonblocking = false } };
+    defer read_end.close(std.testing.io);
+    const write_end: std.Io.File = .{ .handle = descriptors[1], .flags = .{ .nonblocking = false } };
+    defer write_end.close(std.testing.io);
+    var output: [0]u8 = .{};
+    var writer = std.Io.Writer.fixed(&output);
+    var input = init(
+        std.testing.allocator,
+        std.testing.io,
+        read_end,
+        write_end,
+        &writer,
+        "> ",
+        .{},
+    );
+    defer input.deinit();
+    try input.queuePreseed("one shot");
+    try std.testing.expectError(error.NotATerminal, input.read());
+    try std.testing.expect(input.pending_preseed == null);
+}
 
 test "input display policy bounds editor columns independently of physical fallback" {
     var output: [1]u8 = undefined;
