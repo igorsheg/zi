@@ -1,4 +1,7 @@
+const AtomicReplace = @import("AtomicReplace.zig");
+
 pub const ApiKey = @import("ApiKey.zig");
+pub const ConfigWriter = @import("ConfigWriter.zig");
 pub const Document = @import("Document.zig");
 pub const Loader = @import("Loader.zig");
 pub const Preset = @import("Preset.zig");
@@ -11,7 +14,9 @@ pub const StateWriter = @import("StateWriter.zig");
 pub const Store = @import("Store.zig");
 
 test {
+    _ = AtomicReplace;
     _ = ApiKey;
+    _ = ConfigWriter;
     _ = Document;
     _ = Loader;
     _ = Preset;

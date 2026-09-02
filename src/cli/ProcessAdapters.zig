@@ -286,6 +286,10 @@ pub const Random = struct {
         return .{ .context = self, .fill_fn = fillState };
     }
 
+    pub fn configNonceSource(self: *Random) config.ConfigWriter.NonceSource {
+        return .{ .context = self, .fill_fn = fillState };
+    }
+
     fn fillState(context: *anyopaque, bytes: []u8) config.StateWriter.NonceError!void {
         const self: *Random = @ptrCast(@alignCast(context));
         std.Io.randomSecure(self.io, bytes) catch |err| switch (err) {

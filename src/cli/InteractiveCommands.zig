@@ -7,6 +7,7 @@ const DiagnosticText = @import("DiagnosticText.zig");
 const CompactConversation = @import("CompactConversation.zig");
 const Interactive = @import("Interactive.zig");
 const NewConversation = @import("NewConversation.zig");
+const PresetSave = @import("PresetSave.zig");
 const ResumeConversation = @import("ResumeConversation.zig");
 const UndoConversation = @import("UndoConversation.zig");
 const ProviderConfig = @import("../ProviderConfig.zig");
@@ -106,6 +107,13 @@ const specs = [_]Slash.Spec{
         .handler_fn = runPreset,
     },
     .{
+        .name = "preset-save",
+        .summary = "save the current selection as a preset (name, optional tint)",
+        .arguments = .optional,
+        .display = .managed,
+        .handler_fn = runPresetSave,
+    },
+    .{
         .name = "compact",
         .summary = "summarize history to free up context (optional: focus instructions)",
         .arguments = .optional,
@@ -134,6 +142,7 @@ pub const Owner = struct {
     width_source: ?WidthSource = null,
     frame: ?*render.Frame = null,
     run_selection: ?*RunSelection.Owner = null,
+    preset_save_source: ?PresetSave.Source = null,
     run_log_seam: ?*RunLogSeam.Owner = null,
     io: ?std.Io = null,
     listing_generation: ?Interactive.Generation = null,
@@ -179,6 +188,10 @@ pub const Owner = struct {
 
     pub fn setRunSelection(self: *Owner, run_selection: *RunSelection.Owner) void {
         self.run_selection = run_selection;
+    }
+
+    pub fn setPresetSaveSource(self: *Owner, source: PresetSave.Source) void {
+        self.preset_save_source = source;
     }
 
     pub fn setRunLogSeam(self: *Owner, run_log_seam: *RunLogSeam.Owner) void {
@@ -298,6 +311,32 @@ pub const Owner = struct {
 
     fn columnsNow(self: *const Owner) usize {
         return @max(if (self.width_source) |source| source.resolve() else self.columns, 1);
+    }
+
+    fn activateNamedPreset(self: *Owner, name: []const u8) !void {
+        const live = self.run_selection orelse return;
+        if (!try presetReferenceValid(self, live, name, null)) return;
+        var candidate = live.preparePreset(name, .coordinated) catch |err| {
+            switch (err) {
+                error.PresetMissing => try writeNamedPresetError(self, "unknown preset '", name, "'"),
+                error.PresetInvalid => try writeNamedPresetError(self, "invalid preset '", name, "'"),
+                else => try writeNamedPresetError(self, "couldn't apply preset '", name, "' — keeping the current selection"),
+            }
+            return;
+        };
+        defer if (candidate.active) candidate.deinit();
+        var retired: RunSelection.RetiredPreset = undefined;
+        const persistence = live.commitPreset(&candidate, &retired);
+        retired.deinit();
+        if (self.run_log_seam) |seam| seam.rebuildTranscript(.selection, live.session);
+
+        const current = live.current();
+        if (live.session.items().len == 0) {
+            try self.renderNewBanner(current);
+        } else {
+            try writePresetNotice(self, current);
+        }
+        try writePresetPersistenceWarning(self, persistence);
     }
 
     fn renderNewBanner(self: *Owner, current: RunSelection.CurrentSelection) !void {
@@ -1014,6 +1053,180 @@ fn runEffort(context: *anyopaque, _: Slash.Call) anyerror!Slash.HandlerOutcome {
     return .handled;
 }
 
+fn runPresetSave(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
+    const self: *Owner = @ptrCast(@alignCast(context));
+    const source = self.preset_save_source orelse {
+        try self.writeNote("no provider selected — use /provider to choose one first");
+        return .handled;
+    };
+    const live = self.run_selection orelse {
+        try self.writeNote("no provider selected — use /provider to choose one first");
+        return .handled;
+    };
+    return runPresetSaveFlow(self, call.argument, source, live, OwnerPresetActivator{ .owner = self });
+}
+
+const OwnerPresetActivator = struct {
+    owner: *Owner,
+
+    fn activate(self: OwnerPresetActivator, name: []const u8) !void {
+        try self.owner.activateNamedPreset(name);
+    }
+};
+
+fn runPresetSaveFlow(
+    self: *Owner,
+    argument: ?[]const u8,
+    source: PresetSave.Source,
+    live: anytype,
+    activator: anytype,
+) !Slash.HandlerOutcome {
+    const before = live.current();
+    if (before.provider.len == 0) {
+        try self.writeNote("no provider selected — use /provider to choose one first");
+        return .handled;
+    }
+    if (before.model.len == 0) {
+        try self.writeNote("no model resolved yet — use /model to pick one first");
+        return .handled;
+    }
+    const arguments = PresetSave.parse(argument) orelse {
+        try self.writeNote("name it: /preset-save <name> [tint]");
+        return .handled;
+    };
+    if (!config.Preset.nameValid(arguments.name)) {
+        try writePresetSaveEscaped(
+            self,
+            .error_style,
+            "'",
+            arguments.name,
+            "' can't be a preset name — use letters, digits, '.', '-' or '_', starting with a letter or digit",
+        );
+        return .handled;
+    }
+    const explicit_tint = if (arguments.tint_text) |value|
+        PresetSave.parseTint(value) orelse {
+            try writePresetSaveEscaped(
+                self,
+                .error_style,
+                "unknown tint '",
+                value,
+                "' (expected teal|violet|rose|sage)",
+            );
+            return .handled;
+        }
+    else
+        null;
+
+    var inspection = try source.inspect(live.allocator, arguments.name, before.preset);
+    defer inspection.deinit(live.allocator);
+    if (inspection.exists) {
+        const choice = if (self.selection_picker) |picker|
+            try SelectionPicker.presetOverwrite(
+                live.allocator,
+                picker,
+                arguments.name,
+                inspection.detail,
+            )
+        else
+            .keep;
+        switch (choice) {
+            .overwrite => {},
+            .keep, .canceled => {
+                try writePresetSaveEscaped(self, .note, "left preset '", arguments.name, "' unchanged");
+                return .handled;
+            },
+        }
+    }
+
+    const tint = if (explicit_tint) |value|
+        value
+    else tint: {
+        const picker = self.selection_picker orelse return .handled;
+        const choice = try SelectionPicker.presetTint(picker, self.preset_base_theme, inspection.initial_tint);
+        break :tint switch (choice) {
+            .canceled => return .handled,
+            .selected => |value| value,
+        };
+    };
+    if (live.current().generation != before.generation) {
+        try self.writeError("selection changed while choosing preset options — run /preset-save again");
+        return .handled;
+    }
+
+    var outcome = try source.save(live.allocator, .{
+        .name = arguments.name,
+        .tint = tint,
+        .selection = .{
+            .generation = before.generation,
+            .provider = before.provider,
+            .model = before.model,
+            .effort = before.effort,
+            .active_preset = before.preset,
+            .model_discovered = before.model_discovered,
+        },
+    });
+    defer outcome.deinit(live.allocator);
+    switch (outcome) {
+        .written => |kind| {
+            try writePresetSaveEscaped(
+                self,
+                .note,
+                if (kind == .saved) "saved preset '" else "updated preset '",
+                arguments.name,
+                "' in config.json",
+            );
+            try self.flush();
+            try activator.activate(arguments.name);
+        },
+        .state_shadow => try writePresetSaveEscaped(
+            self,
+            .error_style,
+            "preset '",
+            arguments.name,
+            "' is defined in state.json, which outranks the config file — remove it there first",
+        ),
+        .no_path => try self.writeError("couldn't locate the config directory"),
+        .unusable => try writePresetSaveEscaped(
+            self,
+            .error_style,
+            "couldn't read ",
+            inspection.path orelse "config.json",
+            " — fix or remove it first",
+        ),
+        .malformed_presets => try writePresetSaveEscaped(
+            self,
+            .error_style,
+            "\"presets\" in ",
+            inspection.path orelse "config.json",
+            " is not a block of presets — fix it first",
+        ),
+        .conflict => try writePresetSaveEscaped(
+            self,
+            .error_style,
+            "",
+            inspection.path orelse "config.json",
+            " changed since zi started — restart before saving a preset",
+        ),
+        .too_large => try writePresetSaveEscaped(
+            self,
+            .error_style,
+            "couldn't save preset '",
+            arguments.name,
+            "' — configuration data exceeds a safe limit",
+        ),
+        .invalid => |*invalid| try writeInvalidPreset(self, invalid),
+        .failed => try writePresetSaveEscaped(
+            self,
+            .error_style,
+            "couldn't write ",
+            inspection.path orelse "config.json",
+            "",
+        ),
+    }
+    return .handled;
+}
+
 fn runPreset(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
     const self: *Owner = @ptrCast(@alignCast(context));
     const live = self.run_selection orelse return .handled;
@@ -1053,30 +1266,7 @@ fn runPreset(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcom
         break :name plans[selected].name;
     };
 
-    const known_choices = if (provider_choices) |choices| choices.values else null;
-    if (!try presetReferenceValid(self, live, name, known_choices)) return .handled;
-
-    var candidate = live.preparePreset(name, .coordinated) catch |err| {
-        switch (err) {
-            error.PresetMissing => try writeNamedPresetError(self, "unknown preset '", name, "'"),
-            error.PresetInvalid => try writeNamedPresetError(self, "invalid preset '", name, "'"),
-            else => try writeNamedPresetError(self, "couldn't apply preset '", name, "' — keeping the current selection"),
-        }
-        return .handled;
-    };
-    defer if (candidate.active) candidate.deinit();
-    var retired: RunSelection.RetiredPreset = undefined;
-    const persistence = live.commitPreset(&candidate, &retired);
-    retired.deinit();
-    if (self.run_log_seam) |seam| seam.rebuildTranscript(.selection, live.session);
-
-    const current = live.current();
-    if (live.session.items().len == 0) {
-        try self.renderNewBanner(current);
-    } else {
-        try writePresetNotice(self, current);
-    }
-    try writePresetPersistenceWarning(self, persistence);
+    try self.activateNamedPreset(name);
     return .handled;
 }
 
@@ -1241,6 +1431,28 @@ fn writeNewPartial(
             "the preset is active, but the current conversation is now unrecordable",
         ),
     };
+}
+
+const PresetSaveLineStyle = enum { note, error_style };
+
+fn writePresetSaveEscaped(
+    self: *Owner,
+    style: PresetSaveLineStyle,
+    prefix: []const u8,
+    value: []const u8,
+    suffix: []const u8,
+) !void {
+    const open, const close = switch (style) {
+        .note => .{ self.theme.chrome_dim.open, self.theme.chrome_dim.close },
+        .error_style => .{ self.theme.error_style.open, self.theme.error_style.close },
+    };
+    if (self.styled) try self.writer.writeAll(open);
+    try self.writer.writeAll(prefix);
+    try DiagnosticText.write(self.writer, value);
+    try self.writer.writeAll(suffix);
+    if (self.styled) try self.writer.writeAll(close);
+    try self.writer.writeByte('\n');
+    if (self.frame) |frame| frame.syncExternal(1);
 }
 
 fn writeNamedPresetError(
@@ -1408,6 +1620,191 @@ fn executeTestCommand(owner: *Owner, line: []const u8) !Interactive.CommandOutco
     };
 }
 
+const FakePresetSaveCurrent = struct {
+    generation: u64 = 7,
+    provider: []const u8 = "mock",
+    model: []const u8 = "mock-model",
+    effort: ?[]const u8 = "high",
+    preset: ?[]const u8 = null,
+    model_discovered: bool = false,
+};
+
+const FakePresetSaveLive = struct {
+    allocator: std.mem.Allocator = std.testing.allocator,
+    facts: FakePresetSaveCurrent = .{},
+
+    pub fn current(self: *const FakePresetSaveLive) FakePresetSaveCurrent {
+        return self.facts;
+    }
+};
+
+const FakePresetSaveKind = enum {
+    saved,
+    updated,
+    state_shadow,
+    no_path,
+    unusable,
+    conflict,
+    malformed_presets,
+    too_large,
+    invalid,
+    failed,
+};
+
+const FakePresetSaveSource = struct {
+    exists: bool = false,
+    detail: ?[]const u8 = null,
+    path: []const u8 = "config.json",
+    initial_tint: PresetSave.InitialTint = .none,
+    outcome: FakePresetSaveKind = .saved,
+    inspect_calls: usize = 0,
+    save_calls: usize = 0,
+    request: ?PresetSave.Request = null,
+
+    pub fn inspectPresetSave(
+        self: *FakePresetSaveSource,
+        allocator: std.mem.Allocator,
+        _: []const u8,
+        _: ?[]const u8,
+    ) !PresetSave.Inspection {
+        self.inspect_calls += 1;
+        const path = try allocator.dupe(u8, self.path);
+        errdefer allocator.free(path);
+        const detail = if (self.detail) |value| try allocator.dupe(u8, value) else null;
+        return .{
+            .path = path,
+            .exists = self.exists,
+            .detail = detail,
+            .initial_tint = self.initial_tint,
+        };
+    }
+
+    pub fn savePreset(
+        self: *FakePresetSaveSource,
+        allocator: std.mem.Allocator,
+        request: PresetSave.Request,
+    ) !config.ConfigWriter.SaveOutcome {
+        self.save_calls += 1;
+        self.request = request;
+        return switch (self.outcome) {
+            .saved => .{ .written = .saved },
+            .updated => .{ .written = .updated },
+            .state_shadow => .state_shadow,
+            .no_path => .no_path,
+            .unusable => .unusable,
+            .conflict => .conflict,
+            .malformed_presets => .malformed_presets,
+            .too_large => .too_large,
+            .failed => .failed,
+            .invalid => invalid: {
+                const name = try allocator.dupe(u8, request.name);
+                errdefer allocator.free(name);
+                const field = try allocator.dupe(u8, "tint");
+                break :invalid .{ .invalid = .{
+                    .name = name,
+                    .field = field,
+                    .reason = .invalid_tint,
+                } };
+            },
+        };
+    }
+};
+
+const FlushObservingWriter = struct {
+    writer: std.Io.Writer,
+    buffer: [512]u8,
+    sink: [512]u8,
+    sink_len: usize = 0,
+    flushes: usize = 0,
+
+    fn init(self: *FlushObservingWriter) void {
+        self.* = .{
+            .writer = .{ .vtable = &.{ .drain = drain, .flush = flush }, .buffer = &self.buffer },
+            .buffer = undefined,
+            .sink = undefined,
+        };
+    }
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *FlushObservingWriter = @fieldParentPtr("writer", writer);
+        if (writer.end != 0) {
+            @memcpy(self.sink[self.sink_len..][0..writer.end], writer.buffer[0..writer.end]);
+            self.sink_len += writer.end;
+            writer.end = 0;
+        }
+        var consumed: usize = 0;
+        for (data, 0..) |bytes, index| {
+            const repeats = if (index + 1 == data.len) splat else 1;
+            for (0..repeats) |_| {
+                @memcpy(self.sink[self.sink_len..][0..bytes.len], bytes);
+                self.sink_len += bytes.len;
+                consumed += bytes.len;
+            }
+        }
+        return consumed;
+    }
+
+    fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *FlushObservingWriter = @fieldParentPtr("writer", writer);
+        self.flushes += 1;
+        try std.Io.Writer.defaultFlush(writer);
+    }
+
+    fn written(self: *const FlushObservingWriter) []const u8 {
+        return self.sink[0..self.sink_len];
+    }
+};
+
+const FlushCheckingActivator = struct {
+    output: *FlushObservingWriter,
+    calls: usize = 0,
+    fail: bool = false,
+    announcement_flushed: bool = false,
+
+    pub fn activate(self: *FlushCheckingActivator, _: []const u8) !void {
+        self.calls += 1;
+        self.announcement_flushed = self.output.flushes != 0 and std.mem.indexOf(
+            u8,
+            self.output.written(),
+            "saved preset 'review' in config.json\n",
+        ) != null;
+        if (self.fail) return error.ActivationFailed;
+    }
+};
+
+const FakePresetSaveActivator = struct {
+    output: *std.Io.Writer.Allocating,
+    calls: usize = 0,
+    fail: bool = false,
+    announcement_seen: bool = false,
+
+    pub fn activate(self: *FakePresetSaveActivator, _: []const u8) !void {
+        self.calls += 1;
+        self.announcement_seen = std.mem.indexOf(u8, self.output.written(), "preset 'review' in config.json\n") != null;
+        if (self.fail) return error.ActivationFailed;
+    }
+};
+
+const FakePresetSavePicker = struct {
+    choices: [2]?usize = .{ null, null },
+    calls: usize = 0,
+    fail: bool = false,
+    mutate_live: ?*FakePresetSaveLive = null,
+
+    pub fn run(
+        self: *FakePresetSavePicker,
+        _: []const u8,
+        _: []const @import("../terminal/root.zig").Picker.Item,
+        _: usize,
+    ) !?usize {
+        if (self.fail) return error.PickerFailed;
+        const index = self.calls;
+        self.calls += 1;
+        if (self.mutate_live) |live| live.facts.generation +%= 1;
+        return self.choices[index];
+    }
+};
+
 const FakeResumeRunner = struct {
     outcome: ResumeConversation.Outcome,
     calls: usize = 0,
@@ -1470,6 +1867,122 @@ const FakeCompactRunner = struct {
 
 fn compactResult(outcome: CompactConversation.Outcome) CompactConversation.Result {
     return .{ .allocator = std.testing.allocator, .outcome = outcome };
+}
+
+test "preset save command validates preconditions arguments and escaped input before inspection" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+    var source: FakePresetSaveSource = .{};
+    var live: FakePresetSaveLive = .{};
+    var activator: FakePresetSaveActivator = .{ .output = &output };
+
+    live.facts.provider = "";
+    _ = try runPresetSaveFlow(&owner, "review rose", PresetSave.Source.from(&source), &live, &activator);
+    try std.testing.expectEqualStrings("no provider selected — use /provider to choose one first\n", output.written());
+    output.clearRetainingCapacity();
+    live.facts.provider = "mock";
+    live.facts.model = "";
+    _ = try runPresetSaveFlow(&owner, "review rose", PresetSave.Source.from(&source), &live, &activator);
+    try std.testing.expectEqualStrings("no model resolved yet — use /model to pick one first\n", output.written());
+    output.clearRetainingCapacity();
+    live.facts.model = "mock-model";
+    _ = try runPresetSaveFlow(&owner, null, PresetSave.Source.from(&source), &live, &activator);
+    try std.testing.expectEqualStrings("name it: /preset-save <name> [tint]\n", output.written());
+    output.clearRetainingCapacity();
+    _ = try runPresetSaveFlow(&owner, "bad\x1b rose", PresetSave.Source.from(&source), &live, &activator);
+    try std.testing.expectEqualStrings(
+        "'bad\\x1b' can't be a preset name — use letters, digits, '.', '-' or '_', starting with a letter or digit\n",
+        output.written(),
+    );
+    output.clearRetainingCapacity();
+    _ = try runPresetSaveFlow(&owner, "review rose\x1b", PresetSave.Source.from(&source), &live, &activator);
+    try std.testing.expectEqualStrings("unknown tint 'rose\\x1b' (expected teal|violet|rose|sage)\n", output.written());
+    try std.testing.expectEqual(@as(usize, 0), source.inspect_calls);
+}
+
+test "preset save command maps keep tint cancellation picker errors and generation changes" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+    var source: FakePresetSaveSource = .{ .exists = true, .detail = "old · model" };
+    var live: FakePresetSaveLive = .{};
+    var activator: FakePresetSaveActivator = .{ .output = &output };
+    var picker: FakePresetSavePicker = .{ .choices = .{ 0, null } };
+    owner.setSelectionPicker(std.testing.io, SelectionPicker.Runner.from(&picker));
+
+    _ = try runPresetSaveFlow(&owner, "review", PresetSave.Source.from(&source), &live, &activator);
+    try std.testing.expectEqualStrings("left preset 'review' unchanged\n", output.written());
+    try std.testing.expectEqual(@as(usize, 0), source.save_calls);
+
+    output.clearRetainingCapacity();
+    picker.calls = 0;
+    picker.choices = .{ 1, null };
+    _ = try runPresetSaveFlow(&owner, "review", PresetSave.Source.from(&source), &live, &activator);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    try std.testing.expectEqual(@as(usize, 0), source.save_calls);
+
+    picker.calls = 0;
+    picker.fail = true;
+    try std.testing.expectError(
+        error.PickerFailed,
+        runPresetSaveFlow(&owner, "review", PresetSave.Source.from(&source), &live, &activator),
+    );
+    picker.fail = false;
+
+    source.exists = false;
+    picker.calls = 0;
+    picker.choices = .{ 1, null };
+    picker.mutate_live = &live;
+    _ = try runPresetSaveFlow(&owner, "review", PresetSave.Source.from(&source), &live, &activator);
+    try std.testing.expectEqualStrings(
+        "selection changed while choosing preset options — run /preset-save again\n",
+        output.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), source.save_calls);
+}
+
+test "preset save command renders every non-written save outcome safely" {
+    const cases = [_]struct { kind: FakePresetSaveKind, expected: []const u8 }{
+        .{ .kind = .state_shadow, .expected = "preset 'review' is defined in state.json, which outranks the config file — remove it there first\n" },
+        .{ .kind = .no_path, .expected = "couldn't locate the config directory\n" },
+        .{ .kind = .unusable, .expected = "couldn't read bad\\x1b — fix or remove it first\n" },
+        .{ .kind = .conflict, .expected = "bad\\x1b changed since zi started — restart before saving a preset\n" },
+        .{ .kind = .malformed_presets, .expected = "\"presets\" in bad\\x1b is not a block of presets — fix it first\n" },
+        .{ .kind = .too_large, .expected = "couldn't save preset 'review' — configuration data exceeds a safe limit\n" },
+        .{ .kind = .invalid, .expected = "invalid preset 'review' field 'tint': invalid tint\n" },
+        .{ .kind = .failed, .expected = "couldn't write bad\\x1b\n" },
+    };
+    for (cases) |case| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+        var source: FakePresetSaveSource = .{ .path = "bad\x1b", .outcome = case.kind };
+        var live: FakePresetSaveLive = .{};
+        var activator: FakePresetSaveActivator = .{ .output = &output };
+        _ = try runPresetSaveFlow(&owner, "review rose", PresetSave.Source.from(&source), &live, &activator);
+        try std.testing.expectEqualStrings(case.expected, output.written());
+        try std.testing.expectEqual(@as(usize, 0), activator.calls);
+    }
+}
+
+test "preset save command announces and flushes before activation failure" {
+    var output: FlushObservingWriter = undefined;
+    output.init();
+    var owner = Owner.init(&output.writer, try testTheme(), false, 80);
+    var source: FakePresetSaveSource = .{ .outcome = .saved };
+    var live: FakePresetSaveLive = .{};
+    var activator: FlushCheckingActivator = .{ .output = &output, .fail = true };
+    try std.testing.expectError(
+        error.ActivationFailed,
+        runPresetSaveFlow(&owner, "review SAGE", PresetSave.Source.from(&source), &live, &activator),
+    );
+    try std.testing.expectEqual(@as(usize, 1), source.save_calls);
+    try std.testing.expectEqual(@as(usize, 1), activator.calls);
+    try std.testing.expect(activator.announcement_flushed);
+    try std.testing.expectEqualStrings("saved preset 'review' in config.json\n", output.written());
+    try std.testing.expectEqual(PresetSave.Tint.sage, source.request.?.tint.?);
+    try std.testing.expectEqualStrings("mock", source.request.?.selection.provider);
 }
 
 test "resume rejects arguments and cooked mode never invokes its runner" {
@@ -1714,26 +2227,27 @@ test "help lists only implemented commands and supported shortcuts" {
     try std.testing.expectEqual(Interactive.CommandOutcome.handled, try executeTestCommand(&owner, "/help"));
     try std.testing.expectEqualStrings(
         "commands\n" ++
-            "  /new         start a fresh conversation (optional: preset)\n" ++
-            "  /clear       alias for /new\n" ++
-            "  /resume      resume a previous conversation\n" ++
-            "  /undo        revert conversation to before an earlier message (optional: turns\n" ++
-            "               back)\n" ++
-            "  /provider    switch provider, then model and effort\n" ++
-            "  /model       switch model, then effort\n" ++
-            "  /effort      set reasoning effort\n" ++
-            "  /preset      switch to a config-defined preset (optional: name)\n" ++
-            "  /compact     summarize history to free up context (optional: focus\n" ++
-            "               instructions)\n" ++
-            "  /help        show this help\n" ++
+            "  /new          start a fresh conversation (optional: preset)\n" ++
+            "  /clear        alias for /new\n" ++
+            "  /resume       resume a previous conversation\n" ++
+            "  /undo         revert conversation to before an earlier message (optional:\n" ++
+            "                turns back)\n" ++
+            "  /provider     switch provider, then model and effort\n" ++
+            "  /model        switch model, then effort\n" ++
+            "  /effort       set reasoning effort\n" ++
+            "  /preset       switch to a config-defined preset (optional: name)\n" ++
+            "  /preset-save  save the current selection as a preset (name, optional tint)\n" ++
+            "  /compact      summarize history to free up context (optional: focus\n" ++
+            "                instructions)\n" ++
+            "  /help         show this help\n" ++
             "\nshortcuts\n" ++
-            "  enter        submit prompt\n" ++
-            "  shift-enter  insert newline (terminal must be configured to send LF)\n" ++
-            "  esc          pause after the current step to steer the model\n" ++
-            "  esc esc      interrupt model or running tool immediately\n" ++
-            "  ctrl-c       cancel current prompt line\n" ++
-            "  ctrl-d       quit (on empty prompt)\n" ++
-            "  ctrl-l       clear screen and redraw prompt\n",
+            "  enter         submit prompt\n" ++
+            "  shift-enter   insert newline (terminal must be configured to send LF)\n" ++
+            "  esc           pause after the current step to steer the model\n" ++
+            "  esc esc       interrupt model or running tool immediately\n" ++
+            "  ctrl-c        cancel current prompt line\n" ++
+            "  ctrl-d        quit (on empty prompt)\n" ++
+            "  ctrl-l        clear screen and redraw prompt\n",
         output.written(),
     );
 }

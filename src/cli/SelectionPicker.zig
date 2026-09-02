@@ -5,6 +5,7 @@ const render = @import("../render/root.zig");
 const ProviderConfig = @import("../ProviderConfig.zig");
 const terminal = @import("../terminal/root.zig");
 const ModelOrder = @import("ModelOrder.zig");
+const PresetSave = @import("PresetSave.zig");
 
 pub const EffortOutcome = union(enum) {
     canceled,
@@ -24,6 +25,17 @@ pub const ProviderOutcome = union(enum) {
 pub const PresetOutcome = union(enum) {
     canceled,
     selected: usize,
+};
+
+pub const PresetOverwriteOutcome = enum {
+    canceled,
+    keep,
+    overwrite,
+};
+
+pub const PresetTintOutcome = union(enum) {
+    canceled,
+    selected: ?PresetSave.Tint,
 };
 
 pub const Runner = struct {
@@ -148,6 +160,68 @@ fn lessProviderIndex(choices: []const ProviderConfig.ProviderChoice, left: usize
     const label_order = std.mem.order(u8, choices[left].label, choices[right].label);
     if (label_order != .eq) return label_order == .lt;
     return std.mem.lessThan(u8, choices[left].id, choices[right].id);
+}
+
+pub fn presetOverwrite(
+    allocator: std.mem.Allocator,
+    runner: Runner,
+    name: []const u8,
+    detail: ?[]const u8,
+) !PresetOverwriteOutcome {
+    const title = try std.fmt.allocPrint(allocator, "preset '{s}' already exists", .{name});
+    defer allocator.free(title);
+    const rows = [_]terminal.Picker.Item{
+        .{
+            .label = "keep it",
+            .description = "Leave the existing definition alone",
+            .current = true,
+        },
+        .{
+            .label = "overwrite",
+            .detail = detail,
+            .description = "Replace it with the current selection",
+        },
+    };
+    const selected = try runner.run(title, &rows, 0) orelse return .canceled;
+    std.debug.assert(selected < rows.len);
+    return if (selected == 0) .keep else .overwrite;
+}
+
+pub fn presetTint(
+    runner: Runner,
+    base_theme: render.Theme,
+    initial: PresetSave.InitialTint,
+) !PresetTintOutcome {
+    var rows = [_]terminal.Picker.Item{
+        .{
+            .label = "none",
+            .description = "Carry no tint of its own: your tint setting applies",
+        },
+        .{ .label = "teal" },
+        .{ .label = "violet" },
+        .{ .label = "rose" },
+        .{ .label = "sage" },
+    };
+    const tints = [_]PresetSave.Tint{ .teal, .violet, .rose, .sage };
+    for (tints, 1..) |tint, index| {
+        const preview = base_theme.withTint(tint.canonical()) catch unreachable;
+        rows[index].label_color = if (preview.stance.open.len == 0) null else preview.stance.open;
+    }
+    const initial_index: usize = switch (initial) {
+        .none => index: {
+            rows[0].current = true;
+            break :index 0;
+        },
+        .unsupported => 0,
+        .selected => |selected| index: {
+            const value = @intFromEnum(selected) + 1;
+            rows[value].current = true;
+            break :index value;
+        },
+    };
+    const selected = try runner.run("tint for this preset", &rows, initial_index) orelse return .canceled;
+    std.debug.assert(selected < rows.len);
+    return .{ .selected = if (selected == 0) null else tints[selected - 1] };
 }
 
 /// Builds bounded preset rows and returns an index into the cached plan slice.
@@ -675,6 +749,108 @@ fn exercisePresetRows(allocator: std.mem.Allocator) !void {
     );
     try std.testing.expect(runner.valid);
     try std.testing.expectEqual(@as(usize, 0), selected.selected);
+}
+
+const PresetSavePickerRunner = struct {
+    selection: ?usize,
+    overwrite_valid: bool = false,
+    tint_valid: bool = false,
+    expected_initial: usize = 0,
+    expected_current: ?usize = null,
+    expected_colors: [4]?[]const u8 = @splat(null),
+
+    pub fn run(
+        self: *PresetSavePickerRunner,
+        title: []const u8,
+        items: []const terminal.Picker.Item,
+        initial_index: usize,
+    ) !?usize {
+        if (std.mem.startsWith(u8, title, "preset '")) {
+            self.overwrite_valid = std.mem.eql(u8, title, "preset 'review' already exists") and
+                items.len == 2 and initial_index == 0 and
+                std.mem.eql(u8, items[0].label, "keep it") and items[0].current and
+                std.mem.eql(u8, items[0].description.?, "Leave the existing definition alone") and
+                std.mem.eql(u8, items[1].label, "overwrite") and
+                std.mem.eql(u8, items[1].detail.?, "mock · model · high") and
+                std.mem.eql(u8, items[1].description.?, "Replace it with the current selection");
+        } else {
+            self.tint_valid = std.mem.eql(u8, title, "tint for this preset") and items.len == 5 and
+                initial_index == self.expected_initial and
+                std.mem.eql(u8, items[0].label, "none") and
+                std.mem.eql(u8, items[0].description.?, "Carry no tint of its own: your tint setting applies");
+            for (items, 0..) |item, index| {
+                const should_be_current = if (self.expected_current) |current| current == index else false;
+                self.tint_valid = self.tint_valid and item.current == should_be_current;
+                if (index != 0) self.tint_valid = self.tint_valid and
+                    std.mem.eql(u8, item.label_color.?, self.expected_colors[index - 1].?);
+            }
+        }
+        return self.selection;
+    }
+};
+
+test "preset save picker renders exact overwrite rows and maps all outcomes" {
+    var runner: PresetSavePickerRunner = .{ .selection = 0 };
+    try std.testing.expectEqual(PresetOverwriteOutcome.keep, try presetOverwrite(
+        std.testing.allocator,
+        Runner.from(&runner),
+        "review",
+        "mock · model · high",
+    ));
+    try std.testing.expect(runner.overwrite_valid);
+    runner.selection = 1;
+    try std.testing.expectEqual(PresetOverwriteOutcome.overwrite, try presetOverwrite(
+        std.testing.allocator,
+        Runner.from(&runner),
+        "review",
+        "mock · model · high",
+    ));
+    runner.selection = null;
+    try std.testing.expectEqual(PresetOverwriteOutcome.canceled, try presetOverwrite(
+        std.testing.allocator,
+        Runner.from(&runner),
+        "review",
+        "mock · model · high",
+    ));
+}
+
+test "preset save picker renders tint previews defaults and typed selections" {
+    const base = try render.Theme.resolve(.{ .configured_theme = "dark", .configured_tint = "teal" });
+    var runner: PresetSavePickerRunner = .{ .selection = 3, .expected_initial = 3, .expected_current = 3 };
+    const tint_values = [_]PresetSave.Tint{ .teal, .violet, .rose, .sage };
+    for (tint_values, 0..) |tint, index| {
+        runner.expected_colors[index] = (try base.withTint(tint.canonical())).stance.open;
+    }
+    const rose = try presetTint(Runner.from(&runner), base, .{ .selected = .rose });
+    try std.testing.expect(runner.tint_valid);
+    try std.testing.expectEqual(PresetSave.Tint.rose, rose.selected.?);
+
+    runner.tint_valid = false;
+    runner.selection = 0;
+    runner.expected_initial = 0;
+    runner.expected_current = null;
+    const unsupported = try presetTint(Runner.from(&runner), base, .unsupported);
+    try std.testing.expect(runner.tint_valid);
+    try std.testing.expect(unsupported.selected == null);
+
+    runner.tint_valid = false;
+    runner.selection = null;
+    runner.expected_current = 0;
+    try std.testing.expect((try presetTint(Runner.from(&runner), base, .none)) == .canceled);
+    try std.testing.expect(runner.tint_valid);
+}
+
+fn exercisePresetSaveOverwriteOom(allocator: std.mem.Allocator) !void {
+    var runner: PresetSavePickerRunner = .{ .selection = 0 };
+    _ = try presetOverwrite(allocator, Runner.from(&runner), "review", "mock · model · high");
+}
+
+test "preset save picker overwrite releases every allocation on OOM" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exercisePresetSaveOverwriteOom,
+        .{},
+    );
 }
 
 test "preset picker renders hax rows and maps sorted indexes" {

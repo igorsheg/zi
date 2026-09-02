@@ -1,4 +1,5 @@
 const std = @import("std");
+const AtomicReplace = @import("AtomicReplace.zig");
 const Document = @import("Document.zig");
 const Loader = @import("Loader.zig");
 const SecureOpen = @import("SecureOpen.zig");
@@ -7,7 +8,6 @@ const Store = @import("Store.zig");
 const StateWriter = @This();
 
 pub const maximum_file_bytes: usize = Loader.maximum_file_bytes;
-const maximum_temp_attempts: usize = 32;
 const temp_prefix = ".zi-state.tmp.";
 
 pub const Selection = struct {
@@ -30,52 +30,11 @@ pub const Writer = struct {
     }
 };
 
-pub const NonceError = error{ OutOfMemory, Failed };
-
-pub const NonceSource = struct {
-    context: *anyopaque,
-    fill_fn: *const fn (*anyopaque, []u8) NonceError!void,
-
-    pub fn fill(self: NonceSource, bytes: []u8) NonceError!void {
-        return self.fill_fn(self.context, bytes);
-    }
-
-    pub fn from(implementation: anytype) NonceSource {
-        const Pointer = @TypeOf(implementation);
-        const pointer = @typeInfo(Pointer);
-        if (pointer != .pointer or pointer.pointer.size != .one or pointer.pointer.is_const) {
-            @compileError("NonceSource.from expects a mutable single-item pointer");
-        }
-        const Implementation = pointer.pointer.child;
-        const Adapter = struct {
-            fn fill(context: *anyopaque, bytes: []u8) NonceError!void {
-                const self: *Implementation = @ptrCast(@alignCast(context));
-                return self.fillBytes(bytes);
-            }
-        };
-        return .{ .context = implementation, .fill_fn = Adapter.fill };
-    }
-};
-
-pub const OpsError = error{Failed};
-pub const CreateTempError = error{ Collision, Failed };
-
-/// Commit operations are injectable at the points where a completed candidate
-/// can still fail. Implementations must not retain borrowed paths or bytes.
-pub const CommitOps = struct {
-    context: ?*anyopaque = null,
-    make_parent_fn: *const fn (std.Io, ?*anyopaque, []const u8) OpsError!void = standardMakeParent,
-    open_parent_fn: *const fn (std.Io, ?*anyopaque, []const u8) OpsError!std.Io.Dir = standardOpenParent,
-    create_temp_fn: *const fn (std.Io, ?*anyopaque, std.Io.Dir, []const u8) CreateTempError!std.Io.File =
-        standardCreateTemp,
-    write_fn: *const fn (std.Io, ?*anyopaque, std.Io.File, []const u8) OpsError!void = standardWrite,
-    sync_fn: *const fn (std.Io, ?*anyopaque, std.Io.File) OpsError!void = standardSync,
-    rename_fn: *const fn (std.Io, ?*anyopaque, std.Io.Dir, []const u8, []const u8) OpsError!void =
-        standardRename,
-    cleanup_fn: *const fn (std.Io, ?*anyopaque, std.Io.Dir, []const u8) void = standardCleanup,
-
-    pub const standard: CommitOps = .{};
-};
+pub const NonceError = AtomicReplace.NonceError;
+pub const NonceSource = AtomicReplace.NonceSource;
+pub const OpsError = AtomicReplace.OpsError;
+pub const CreateTempError = AtomicReplace.CreateTempError;
+pub const CommitOps = AtomicReplace.CommitOps;
 
 pub const Options = struct {
     secure_open: SecureOpen.Capability,
@@ -224,85 +183,32 @@ pub const Owner = struct {
     }
 
     fn commit(self: *Owner, bytes: []const u8) error{OutOfMemory}!Outcome {
-        const parent = std.fs.path.dirname(self.path) orelse return .unavailable;
-        const target_name = std.fs.path.basename(self.path);
-        if (target_name.len == 0 or std.mem.indexOfScalar(u8, target_name, 0) != null) return .unavailable;
-        const ops = self.commit_ops;
-        ops.make_parent_fn(self.io, ops.context, parent) catch return .unavailable;
-        const directory = ops.open_parent_fn(self.io, ops.context, parent) catch return .unavailable;
-        defer directory.close(self.io);
-        const parent_stat = directory.stat(self.io) catch return .unavailable;
-        if (parent_stat.kind != .directory or parent_stat.permissions.toMode() & 0o022 != 0) return .unavailable;
-
-        var nonce: [16]u8 = undefined;
-        var name_buffer: [temp_prefix.len + nonce.len * 2]u8 = undefined;
-        var attempt: usize = 0;
-        while (attempt < maximum_temp_attempts) : (attempt += 1) {
-            if (self.nonce_source) |source| {
-                source.fill(&nonce) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.Failed => return .unavailable,
-                };
-            } else std.Io.random(self.io, &nonce);
-            const temp_name = std.fmt.bufPrint(&name_buffer, temp_prefix ++ "{x}", .{nonce}) catch unreachable;
-            const temp = ops.create_temp_fn(self.io, ops.context, directory, temp_name) catch |err| switch (err) {
-                error.Collision => continue,
-                error.Failed => return .failed,
-            };
-            var renamed = false;
-            defer {
-                temp.close(self.io);
-                if (!renamed) ops.cleanup_fn(self.io, ops.context, directory, temp_name);
-            }
-
-            ops.write_fn(self.io, ops.context, temp, bytes) catch return .failed;
-            ops.sync_fn(self.io, ops.context, temp) catch return .failed;
-            const temp_stat = temp.stat(self.io) catch return .failed;
-            if (temp_stat.kind != .file or temp_stat.nlink != 1 or temp_stat.size != bytes.len) return .failed;
-            if (!(try self.targetUnchangedAt(directory, target_name))) return .failed;
-            const named_temp = directory.statFile(
-                self.io,
-                temp_name,
-                .{ .follow_symlinks = false },
-            ) catch return .failed;
-            if (!sameDescriptorState(temp_stat, named_temp)) return .failed;
-            ops.rename_fn(self.io, ops.context, directory, temp_name, target_name) catch return .failed;
-            renamed = true;
-            self.expected = fingerprint(temp_stat, bytes);
-            return .written;
-        }
-        return .failed;
+        const result = try AtomicReplace.commit(self.atomicInputs(), bytes);
+        return switch (result) {
+            .written => |fingerprint_value| outcome: {
+                self.expected = fingerprint_value;
+                break :outcome .written;
+            },
+            .unavailable => .unavailable,
+            .conflict, .target_unavailable, .failed => .failed,
+        };
     }
 
     fn targetUnchanged(self: *Owner) error{OutOfMemory}!bool {
-        if (self.expected) |expected| {
-            const observed = try inspectTarget(self.allocator, self.io, self.secure_open, self.path);
-            return switch (observed) {
-                .fingerprint => |value| expected.eql(value),
-                else => false,
-            };
-        }
-        _ = self.secure_open.statFile(self.io, self.path) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.FileNotFound => return true,
-            else => return false,
-        };
-        return false;
+        return (try AtomicReplace.checkTarget(self.atomicInputs())) == .unchanged;
     }
 
-    fn targetUnchangedAt(self: *Owner, directory: std.Io.Dir, target_name: []const u8) error{OutOfMemory}!bool {
-        if (self.expected) |expected| {
-            const observed = try inspectTargetAt(self.allocator, self.io, directory, target_name);
-            return switch (observed) {
-                .fingerprint => |value| expected.eql(value),
-                else => false,
-            };
-        }
-        _ = directory.statFile(self.io, target_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => return true,
-            else => return false,
+    fn atomicInputs(self: *Owner) AtomicReplace.Inputs {
+        return .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .secure_open = self.secure_open,
+            .nonce_source = self.nonce_source,
+            .commit_ops = self.commit_ops,
+            .path = self.path,
+            .expected = self.expected,
+            .temp_prefix = temp_prefix,
         };
-        return false;
     }
 };
 
@@ -363,157 +269,6 @@ fn setString(document: *Document, key: []const u8, value: []const u8) error{OutO
 
 fn removeMember(document: *Document, key: []const u8) bool {
     return document.parsed.value.object.swapRemove(key);
-}
-
-const Inspection = union(enum) {
-    missing,
-    unsafe,
-    unreadable,
-    fingerprint: Loader.Fingerprint,
-};
-
-fn inspectTarget(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    secure_open: SecureOpen.Capability,
-    path: []const u8,
-) error{OutOfMemory}!Inspection {
-    const named = secure_open.statFile(io, path) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.FileNotFound => return .missing,
-        else => return .unreadable,
-    };
-    if (named.kind != .file or named.nlink == 0 or named.size > maximum_file_bytes) return .unsafe;
-    const file = secure_open.openFile(io, path) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.FileNotFound => return .missing,
-        else => return .unreadable,
-    };
-    defer file.close(io);
-    const before = file.stat(io) catch return .unreadable;
-    if (before.kind != .file or before.nlink == 0 or before.inode != named.inode or
-        before.size > maximum_file_bytes) return .unsafe;
-    var wiping_allocator: Document.WipingAllocator = .{ .backing = allocator };
-    const read_allocator = wiping_allocator.allocator();
-    const buffer = read_allocator.alloc(u8, maximum_file_bytes + 1) catch return error.OutOfMemory;
-    defer read_allocator.free(buffer);
-    const count = file.readPositionalAll(io, buffer, 0) catch return .unreadable;
-    if (count > maximum_file_bytes or count != before.size) return .unsafe;
-    const after = file.stat(io) catch return .unreadable;
-    if (!sameDescriptorState(before, after)) return .unreadable;
-    return .{ .fingerprint = fingerprint(before, buffer[0..count]) };
-}
-
-fn inspectTargetAt(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    directory: std.Io.Dir,
-    target_name: []const u8,
-) error{OutOfMemory}!Inspection {
-    const named = directory.statFile(io, target_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return .missing,
-        else => return .unreadable,
-    };
-    if (named.kind != .file or named.nlink == 0 or named.size > maximum_file_bytes) return .unsafe;
-    const file = directory.openFile(io, target_name, .{
-        .mode = .read_only,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return .missing,
-        else => return .unreadable,
-    };
-    defer file.close(io);
-    const before = file.stat(io) catch return .unreadable;
-    if (before.kind != .file or before.nlink == 0 or before.inode != named.inode or
-        before.size > maximum_file_bytes) return .unsafe;
-    var wiping_allocator: Document.WipingAllocator = .{ .backing = allocator };
-    const read_allocator = wiping_allocator.allocator();
-    const buffer = read_allocator.alloc(u8, maximum_file_bytes + 1) catch return error.OutOfMemory;
-    defer read_allocator.free(buffer);
-    const count = file.readPositionalAll(io, buffer, 0) catch return .unreadable;
-    if (count > maximum_file_bytes or count != before.size) return .unsafe;
-    const after = file.stat(io) catch return .unreadable;
-    if (!sameDescriptorState(before, after)) return .unreadable;
-    return .{ .fingerprint = fingerprint(before, buffer[0..count]) };
-}
-
-fn fingerprint(stat: std.Io.File.Stat, bytes: []const u8) Loader.Fingerprint {
-    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
-    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
-    return .{
-        .inode = stat.inode,
-        .nlink = stat.nlink,
-        .size = stat.size,
-        .mtime_ns = stat.mtime.nanoseconds,
-        .ctime_ns = stat.ctime.nanoseconds,
-        .digest = digest,
-    };
-}
-
-fn sameDescriptorState(left: std.Io.File.Stat, right: std.Io.File.Stat) bool {
-    return left.kind == .file and right.kind == .file and left.inode == right.inode and
-        left.nlink == right.nlink and left.size == right.size and
-        left.mtime.nanoseconds == right.mtime.nanoseconds and
-        left.ctime.nanoseconds == right.ctime.nanoseconds;
-}
-
-fn standardMakeParent(io: std.Io, _: ?*anyopaque, parent: []const u8) OpsError!void {
-    _ = std.Io.Dir.createDirPathStatus(.cwd(), io, parent, .fromMode(0o700)) catch return error.Failed;
-}
-
-fn standardOpenParent(io: std.Io, _: ?*anyopaque, parent: []const u8) OpsError!std.Io.Dir {
-    return std.Io.Dir.openDir(.cwd(), io, parent, .{ .follow_symlinks = false }) catch return error.Failed;
-}
-
-fn standardCreateTemp(
-    io: std.Io,
-    _: ?*anyopaque,
-    directory: std.Io.Dir,
-    name: []const u8,
-) CreateTempError!std.Io.File {
-    const file = directory.createFile(io, name, .{
-        .read = true,
-        .truncate = false,
-        .exclusive = true,
-        .permissions = .fromMode(0o600),
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
-        error.PathAlreadyExists => return error.Collision,
-        else => return error.Failed,
-    };
-    var transferred = false;
-    defer if (!transferred) {
-        file.close(io);
-        standardCleanup(io, null, directory, name);
-    };
-    const stat = file.stat(io) catch return error.Failed;
-    if (stat.kind != .file or stat.nlink != 1) return error.Failed;
-    file.setPermissions(io, .fromMode(0o600)) catch return error.Failed;
-    transferred = true;
-    return file;
-}
-
-fn standardWrite(io: std.Io, _: ?*anyopaque, file: std.Io.File, bytes: []const u8) OpsError!void {
-    file.writeStreamingAll(io, bytes) catch return error.Failed;
-}
-
-fn standardSync(io: std.Io, _: ?*anyopaque, file: std.Io.File) OpsError!void {
-    file.sync(io) catch return error.Failed;
-}
-
-fn standardRename(
-    io: std.Io,
-    _: ?*anyopaque,
-    directory: std.Io.Dir,
-    old_name: []const u8,
-    new_name: []const u8,
-) OpsError!void {
-    directory.rename(old_name, directory, new_name, io) catch return error.Failed;
-}
-
-fn standardCleanup(io: std.Io, _: ?*anyopaque, directory: std.Io.Dir, name: []const u8) void {
-    directory.deleteFile(io, name) catch return;
 }
 
 const TestSecureOpen = struct {

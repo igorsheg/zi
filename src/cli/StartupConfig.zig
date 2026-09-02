@@ -1,6 +1,7 @@
 const std = @import("std");
 const Args = @import("Args.zig");
 const ProcessAdapters = @import("ProcessAdapters.zig");
+const PresetSave = @import("PresetSave.zig");
 const config = @import("../config/root.zig");
 
 const StartupConfig = @This();
@@ -33,6 +34,7 @@ pub const PrepareInputs = struct {
     /// until Owner.deinit and across every Store call.
     provider_canonicalizer: ?config.Store.ProviderCanonicalizer = null,
     state_nonce_source: ?config.StateWriter.NonceSource = null,
+    config_nonce_source: ?config.ConfigWriter.NonceSource = null,
 };
 
 pub const Inputs = struct {
@@ -46,6 +48,7 @@ pub const Inputs = struct {
     strict_one_shot: bool = false,
     provider_canonicalizer: ?config.Store.ProviderCanonicalizer = null,
     state_nonce_source: ?config.StateWriter.NonceSource = null,
+    config_nonce_source: ?config.ConfigWriter.NonceSource = null,
 };
 
 pub const DiagnosticContext = enum { explicit, recorded };
@@ -127,10 +130,10 @@ const State = struct {
     allocator: std.mem.Allocator,
     tiers: config.Loader.InitialTiers,
     state_writer: ?*config.StateWriter.Owner,
+    config_writer: *config.ConfigWriter.Owner,
     base: config.Store.Options,
     facts: StartupFacts,
     selection: config.Selection,
-    presets: config.Preset.Enumeration,
     providers: config.ProviderDefinitions.Enumeration,
     warnings: []Warning,
 };
@@ -140,8 +143,8 @@ fn deinitState(state: *State) void {
     for (state.warnings) |*warning| warning.deinit(allocator);
     allocator.free(state.warnings);
     state.providers.deinit();
-    state.presets.deinit(allocator);
     state.selection.deinit();
+    state.config_writer.deinit();
     if (state.state_writer) |writer| writer.deinit();
     deinitTiersSecure(allocator, &state.tiers);
     state.* = undefined;
@@ -201,7 +204,7 @@ pub const Owner = struct {
     /// Returns a bounded borrowed view into the cached preset enumeration.
     /// The result is valid until Owner mutation or deinit and must not be deinitialized.
     pub fn lookupPreset(self: *const Owner, name: []const u8) config.Preset.BorrowedLookup {
-        return borrowedCachedLookup(&self.state.presets, name);
+        return self.state.config_writer.lookup(name);
     }
 
     pub fn preparePreset(
@@ -234,11 +237,11 @@ pub const Owner = struct {
     }
 
     pub fn presetPlans(self: *const Owner) []const config.Preset.Plan {
-        return self.state.presets.plans;
+        return self.state.config_writer.plans();
     }
 
     pub fn invalidPresets(self: *const Owner) []const config.Preset.Invalid {
-        return self.state.presets.invalid;
+        return self.state.config_writer.invalid();
     }
 
     pub fn providerDefinitions(self: *const Owner) []const config.ProviderDefinitions.Definition {
@@ -253,8 +256,85 @@ pub const Owner = struct {
         return self.state.warnings;
     }
 
-    pub fn configResult(self: *const Owner) ?*const config.Loader.Result {
-        return if (self.state.tiers.config) |*result| result else null;
+    pub fn inspectPresetSave(
+        self: *const Owner,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        active_preset: ?[]const u8,
+    ) error{OutOfMemory}!PresetSave.Inspection {
+        var target = try self.state.config_writer.inspect(allocator, name);
+        defer target.deinit(allocator);
+        const path = if (self.state.config_writer.configPath()) |value|
+            allocator.dupe(u8, value) catch return error.OutOfMemory
+        else
+            null;
+        errdefer if (path) |value| allocator.free(value);
+        const detail = if (target.exists)
+            try makePresetSaveDetail(allocator, &target)
+        else
+            null;
+        errdefer if (detail) |value| allocator.free(value);
+
+        var initial_tint: PresetSave.InitialTint = .none;
+        var effective_tint = self.store().read(allocator, "tint") catch return error.OutOfMemory;
+        defer effective_tint.deinit(allocator);
+        if (effective_tint.source == .run) {
+            initial_tint = classifyPresetSaveTint(effective_tint.value);
+        } else {
+            var found_active = false;
+            if (active_preset) |active_name| if (active_name.len != 0) {
+                if (std.mem.eql(u8, active_name, name)) {
+                    if (target.tint) |value| {
+                        initial_tint = classifyPresetSaveTint(value);
+                        found_active = true;
+                    }
+                } else {
+                    var active = try self.state.config_writer.inspect(allocator, active_name);
+                    defer active.deinit(allocator);
+                    if (active.tint) |value| {
+                        initial_tint = classifyPresetSaveTint(value);
+                        found_active = true;
+                    }
+                }
+            };
+            if (!found_active) initial_tint = classifyPresetSaveTint(target.tint);
+        }
+        return .{
+            .path = path,
+            .exists = target.exists,
+            .detail = detail,
+            .initial_tint = initial_tint,
+        };
+    }
+
+    pub fn savePreset(
+        self: *Owner,
+        outcome_allocator: std.mem.Allocator,
+        request: PresetSave.Request,
+    ) error{OutOfMemory}!config.ConfigWriter.SaveOutcome {
+        if (request.selection.provider.len == 0 or request.selection.model.len == 0) return .failed;
+        var system_prompt = self.store().read(self.state.allocator, "system_prompt") catch
+            return error.OutOfMemory;
+        defer system_prompt.deinit(self.state.allocator);
+        var system_prompt_append = self.store().read(self.state.allocator, "system_prompt_append") catch
+            return error.OutOfMemory;
+        defer system_prompt_append.deinit(self.state.allocator);
+        return self.state.config_writer.savePreset(outcome_allocator, request.name, .{
+            .provider = request.selection.provider,
+            .model = if (request.selection.model_discovered) null else request.selection.model,
+            .effort = request.selection.effort,
+            .system_prompt = capturablePrompt(&system_prompt),
+            .system_prompt_append = capturablePrompt(&system_prompt_append),
+            .tint = if (request.tint) |value| value.canonical() else null,
+        });
+    }
+
+    pub fn configPath(self: *const Owner) ?[]const u8 {
+        return self.state.config_writer.configPath();
+    }
+
+    pub fn configRoot(self: *const Owner) ?[]const u8 {
+        return self.state.config_writer.configRoot();
     }
 
     pub fn stateWriter(self: *Owner) ?config.StateWriter.Writer {
@@ -269,6 +349,45 @@ pub const Owner = struct {
         return self.state.selection.presetTint();
     }
 };
+
+fn classifyPresetSaveTint(value: ?[]const u8) PresetSave.InitialTint {
+    const bytes = value orelse return .none;
+    return if (PresetSave.parseTint(bytes)) |tint| .{ .selected = tint } else .unsupported;
+}
+
+fn capturablePrompt(result: *const config.Store.Result) ?[]const u8 {
+    return switch (result.source) {
+        .run, .conversation, .env, .state => result.value,
+        .config, .default => null,
+    };
+}
+
+fn makePresetSaveDetail(
+    allocator: std.mem.Allocator,
+    inspection: *const config.Preset.SaveInspection,
+) error{OutOfMemory}![]u8 {
+    const provider = if (inspection.provider) |value|
+        if (value.len != 0) value else "no provider"
+    else
+        "no provider";
+    const model = if (inspection.model) |value| if (value.len != 0) value else null else null;
+    const effort = if (inspection.effort) |value| if (value.len != 0) value else null else null;
+    var total = provider.len;
+    if (model) |value| total = std.math.add(usize, total, 4 + value.len) catch return error.OutOfMemory;
+    if (effort) |value| total = std.math.add(usize, total, 4 + value.len) catch return error.OutOfMemory;
+    const detail = allocator.alloc(u8, total) catch return error.OutOfMemory;
+    var cursor: usize = 0;
+    for ([_]?[]const u8{ provider, model, effort }) |segment| if (segment) |value| {
+        if (cursor != 0) {
+            @memcpy(detail[cursor..][0..4], " · ");
+            cursor += 4;
+        }
+        @memcpy(detail[cursor..][0..value.len], value);
+        cursor += value.len;
+    };
+    std.debug.assert(cursor == detail.len);
+    return detail;
+}
 
 pub const InitResult = union(enum) {
     owner: Owner,
@@ -394,15 +513,31 @@ pub fn prepare(inputs: PrepareInputs) Error!Prepared {
         .cwd = inputs.file_access.cwd,
     };
     var presets = try config.Preset.enumerate(inputs.allocator, inputs.io, documents, prompt_roots);
-    errdefer presets.deinit(inputs.allocator);
+    var presets_owned = true;
+    errdefer if (presets_owned) presets.deinit(inputs.allocator);
     var providers = try config.ProviderDefinitions.enumerate(inputs.allocator, .{
         .config = documents.config,
         .state = documents.state,
     });
     errdefer providers.deinit();
+    const config_writer = try config.ConfigWriter.Owner.init(
+        inputs.allocator,
+        inputs.io,
+        &state.tiers.config,
+        &presets,
+        documents.state,
+        .{
+            .secure_open = inputs.file_access.secure_open,
+            .nonce_source = inputs.config_nonce_source,
+            .home = inputs.file_access.home,
+            .cwd = inputs.file_access.cwd,
+        },
+    );
+    presets_owned = false;
+    errdefer config_writer.deinit();
 
     const base: config.Store.Options = .{
-        .file = documents.config,
+        .file = config_writer.document(),
         .state = documents.state,
         .registry = config.Settings.storeRegistry(),
         .environment = inputs.environment.store(),
@@ -419,20 +554,19 @@ pub fn prepare(inputs: PrepareInputs) Error!Prepared {
     };
     var selection = config.Selection.init(inputs.allocator, base);
     errdefer selection.deinit();
-    try composeProvisional(inputs.allocator, facts, &presets, &selection);
+    try composeProvisional(inputs.allocator, facts, config_writer, &selection);
     const warnings = try warning_builder.items.toOwnedSlice(inputs.allocator);
 
     state.state_writer = state_writer;
+    state.config_writer = config_writer;
     state.base = base;
     state.facts = facts;
     state.selection = selection;
-    state.presets = presets;
     state.providers = providers;
     state.warnings = warnings;
     warning_builder = .{};
     tiers_owned = false;
     selection = undefined;
-    presets = undefined;
     providers = undefined;
     state_writer = null;
     return .{ .state = state };
@@ -453,7 +587,7 @@ pub fn finish(
     defer warnings.deinit(allocator);
     try cloneWarnings(allocator, &warnings, state.warnings);
 
-    if (try composeFinal(allocator, state.facts, &state.presets, resumed, &selection, &warnings)) |diagnostic| {
+    if (try composeFinal(allocator, state.facts, state.config_writer, resumed, &selection, &warnings)) |diagnostic| {
         selection.deinit();
         deinitState(state);
         prepared.* = undefined;
@@ -487,6 +621,7 @@ pub fn init(inputs: Inputs) Error!InitResult {
         .strict_one_shot = inputs.strict_one_shot,
         .provider_canonicalizer = inputs.provider_canonicalizer,
         .state_nonce_source = inputs.state_nonce_source,
+        .config_nonce_source = inputs.config_nonce_source,
     });
     return finish(&prepared, inputs.resumed) catch |err| {
         prepared.deinit();
@@ -513,7 +648,7 @@ fn startupDecision(facts: StartupFacts, effective: ?config.Store.Result) config.
 fn composeProvisional(
     allocator: std.mem.Allocator,
     facts: StartupFacts,
-    presets: *const config.Preset.Enumeration,
+    presets: *const config.ConfigWriter.Owner,
     selection: *config.Selection,
 ) Error!void {
     var effective = try selection.store().read(allocator, "preset");
@@ -540,7 +675,7 @@ fn composeProvisional(
 fn composeFinal(
     allocator: std.mem.Allocator,
     facts: StartupFacts,
-    presets: *const config.Preset.Enumeration,
+    presets: *const config.ConfigWriter.Owner,
     resumed: ?config.Selection.RestoreMetadata,
     selection: *config.Selection,
     warnings: *WarningBuilder,
@@ -619,36 +754,21 @@ fn cloneWarnings(
     };
 }
 
-fn borrowedCachedLookup(
-    presets: *const config.Preset.Enumeration,
-    name: []const u8,
-) config.Preset.BorrowedLookup {
-    for (presets.plans) |*plan| {
-        if (std.mem.eql(u8, plan.name, name)) return .{ .plan = plan };
-    }
-    for (presets.invalid) |*invalid| {
-        if (std.mem.eql(u8, invalid.name, name)) return .{ .invalid = invalid };
-    }
-    return .missing;
-}
-
 /// Returns a shallow borrowed compatibility value. It must never be deinitialized.
 fn cachedLookup(
-    presets: *const config.Preset.Enumeration,
+    presets: *const config.ConfigWriter.Owner,
     name: []const u8,
 ) config.Preset.Lookup {
-    for (presets.plans) |plan| {
-        if (std.mem.eql(u8, plan.name, name)) return .{ .plan = plan };
-    }
-    for (presets.invalid) |invalid| {
-        if (std.mem.eql(u8, invalid.name, name)) return .{ .invalid = invalid };
-    }
-    return .missing;
+    return switch (presets.lookup(name)) {
+        .missing => .missing,
+        .plan => |plan| .{ .plan = plan.* },
+        .invalid => |invalid| .{ .invalid = invalid.* },
+    };
 }
 
 fn applyCachedProvisional(
     selection: *config.Selection,
-    presets: *const config.Preset.Enumeration,
+    presets: *const config.ConfigWriter.Owner,
     name: []const u8,
     explicit: bool,
 ) Error!void {
@@ -661,7 +781,7 @@ fn applyCachedProvisional(
 
 fn applyCachedPreset(
     allocator: std.mem.Allocator,
-    presets: *const config.Preset.Enumeration,
+    presets: *const config.ConfigWriter.Owner,
     selection: *config.Selection,
     name: []const u8,
     explicit: bool,
@@ -939,7 +1059,7 @@ fn testInputs(
 }
 
 fn writeTiers(tmp: *std.testing.TmpDir, config_bytes: []const u8, state_bytes: []const u8) !void {
-    try tmp.dir.createDir(std.testing.io, "zi", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "zi", .fromMode(0o700));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "zi/config.json", .data = config_bytes });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "zi/state.json", .data = state_bytes });
 }
@@ -962,6 +1082,132 @@ test "explicit preset is atomic and CLI selection overrides it last" {
     try expectSetting(&owner, "model", "cli-m", .run);
     try std.testing.expectEqualStrings("rose", owner.tint().?);
     try std.testing.expectEqual(@as(usize, 1), owner.presetPlans().len);
+}
+
+test "startup config writer publication reaches retained store and preset views" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTiers(&tmp, "{\"unknown\":42}", "{}");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    var secure: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    var environment = ProcessAdapters.Environment.init(testEnviron(&.{}));
+    var owner = try initOwner(testInputs(
+        std.testing.allocator,
+        base,
+        config.SecureOpen.Capability.from(&secure),
+        &environment,
+    ));
+    defer owner.deinit();
+    const stable_document = owner.state.config_writer.document();
+    const retained_store = owner.store();
+
+    var outcome = try owner.state.config_writer.savePreset(std.testing.allocator, "review", .{
+        .provider = "mock",
+        .model = "mock-model",
+    });
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expectEqual(config.ConfigWriter.SaveKind.saved, outcome.written);
+    try std.testing.expect(stable_document == owner.state.config_writer.document());
+    try std.testing.expect(owner.lookupPreset("review") == .plan);
+    var provider = try retained_store.read(std.testing.allocator, "presets.review.provider");
+    defer provider.deinit(std.testing.allocator);
+    try std.testing.expectEqual(config.Store.Source.config, provider.source);
+    try std.testing.expectEqualStrings("mock", provider.value.?);
+}
+
+test "startup preset save capture policy accepts only non-reproducible sources" {
+    var bytes = [_]u8{'x'};
+    inline for (.{
+        config.Store.Source.run,
+        config.Store.Source.conversation,
+        config.Store.Source.env,
+        config.Store.Source.state,
+    }) |source| {
+        const result: config.Store.Result = .{ .value = &bytes, .source = source };
+        try std.testing.expectEqualStrings("x", capturablePrompt(&result).?);
+    }
+    inline for (.{ config.Store.Source.config, config.Store.Source.default }) |source| {
+        const result: config.Store.Result = .{ .value = &bytes, .source = source };
+        try std.testing.expect(capturablePrompt(&result) == null);
+    }
+    var empty: [0]u8 = .{};
+    const explicit_empty: config.Store.Result = .{ .value = &empty, .source = .env };
+    try std.testing.expectEqual(@as(usize, 0), capturablePrompt(&explicit_empty).?.len);
+}
+
+test "startup preset save inspection owns detail and applies active then target tint precedence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTiers(
+        &tmp,
+        "{\"presets\":{\"active\":{\"provider\":\"mock\",\"tint\":\"rose\"}," ++
+            "\"target\":{\"provider\":\"old\",\"model\":7,\"effort\":true,\"tint\":\"wrong\"}}}",
+        "{}",
+    );
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    var environment = ProcessAdapters.Environment.init(testEnviron(&.{}));
+    var owner = try initOwner(testInputs(
+        std.testing.allocator,
+        base,
+        config.SecureOpen.Capability.from(&access),
+        &environment,
+    ));
+    defer owner.deinit();
+
+    var active = try owner.inspectPresetSave(std.testing.allocator, "target", "active");
+    defer active.deinit(std.testing.allocator);
+    try std.testing.expect(active.exists);
+    try std.testing.expectEqualStrings("old · 7 · 1", active.detail.?);
+    try std.testing.expectEqual(PresetSave.Tint.rose, active.initial_tint.selected);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ base, "zi/config.json" });
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings(path, active.path.?);
+
+    var target = try owner.inspectPresetSave(std.testing.allocator, "target", null);
+    defer target.deinit(std.testing.allocator);
+    try std.testing.expect(target.initial_tint == .unsupported);
+}
+
+test "startup preset save captures env and state prompts and omits discovered model" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTiers(&tmp, "{\"system_prompt\":\"config prompt\"}", "{\"system_prompt_append\":\"state append\"}");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    const entries = [_][*:0]const u8{"ZI_SYSTEM_PROMPT="};
+    var environment = ProcessAdapters.Environment.init(testEnviron(&entries));
+    var owner = try initOwner(testInputs(
+        std.testing.allocator,
+        base,
+        config.SecureOpen.Capability.from(&access),
+        &environment,
+    ));
+    defer owner.deinit();
+
+    var outcome = try owner.savePreset(std.testing.allocator, .{
+        .name = "captured",
+        .tint = .sage,
+        .selection = .{
+            .generation = 1,
+            .provider = "mock",
+            .model = "server-model",
+            .effort = "high",
+            .active_preset = null,
+            .model_discovered = true,
+        },
+    });
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expectEqual(config.ConfigWriter.SaveKind.saved, outcome.written);
+    const plan = owner.lookupPreset("captured").plan;
+    try std.testing.expect(plan.model.value == null);
+    try std.testing.expectEqualStrings("high", plan.effort.value.?);
+    try std.testing.expectEqual(@as(usize, 0), plan.system_prompt.value.?.len);
+    try std.testing.expectEqualStrings("state append", plan.system_prompt_append.value.?);
+    try std.testing.expectEqualStrings("sage", plan.tint.value.?);
 }
 
 test "owner forwards prospective run preparation and publication" {

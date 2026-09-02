@@ -27,6 +27,7 @@ const RunLogSeam = @import("RunLogSeam.zig");
 const SelectionPicker = @import("SelectionPicker.zig");
 const ProcessAdapters = @import("ProcessAdapters.zig");
 const ProcessFacts = @import("ProcessFacts.zig");
+const PresetSave = @import("PresetSave.zig");
 const CodexFiles = @import("CodexFiles.zig");
 const SessionPicker = @import("SessionPicker.zig");
 const SessionStartup = @import("SessionStartup.zig");
@@ -88,6 +89,7 @@ pub fn run(
         .strict_one_shot = options.mode == .print,
         .provider_canonicalizer = config.Store.ProviderCanonicalizer.from(&canonicalizer),
         .state_nonce_source = random.stateNonceSource(),
+        .config_nonce_source = random.configNonceSource(),
     });
     var prepared_owned = true;
     defer if (prepared_owned) prepared.deinit();
@@ -237,6 +239,7 @@ pub fn run(
         },
     };
     defer startup.deinit();
+    const preset_save_source = PresetSave.Source.from(&startup);
     try renderWarnings(stderr, startup.warnings());
     try renderProviderWarnings(stderr, startup.providerWarnings());
 
@@ -627,7 +630,7 @@ pub fn run(
     defer if (resolved_base) |*value| value.deinit(allocator);
     var resolved_append: ?config.PromptValue.Value = null;
     defer if (resolved_append) |*value| value.deinit(allocator);
-    const config_root = if (startup.configResult()) |result| std.fs.path.dirname(result.path) else null;
+    const config_root = startup.configRoot();
     if (base_prompt.value) |value| resolved_base = try config.PromptValue.resolve(
         allocator,
         io,
@@ -979,6 +982,7 @@ pub fn run(
                 );
                 commands.setPresetBaseTheme(live_views.base_theme);
                 commands.setRunSelection(&live);
+                commands.setPresetSaveSource(preset_save_source);
                 commands.setRunLogSeam(run_log_seam);
                 commands.setNewConversation(new_conversation_runner);
                 commands.setResumeConversation(resume_conversation_runner);
@@ -1009,6 +1013,7 @@ pub fn run(
                 &compaction,
                 &terminal,
                 &live,
+                preset_save_source,
                 run_log_seam,
                 conversation,
                 new_conversation_runner,
@@ -1446,6 +1451,7 @@ fn runRawInteractive(
     compaction: *AutoCompact,
     terminal_owner: *Terminal,
     live: *RunSelection.Owner,
+    preset_save_source: PresetSave.Source,
     run_log_seam: *RunLogSeam.Owner,
     conversation: *ConversationRuntime.Owner,
     new_conversation: NewConversation.Runner,
@@ -1576,6 +1582,7 @@ fn runRawInteractive(
     commands.setWidthSource(.from(&markdown_width));
     commands.setFrame(&frame);
     commands.setRunSelection(live);
+    commands.setPresetSaveSource(preset_save_source);
     commands.setRunLogSeam(run_log_seam);
     commands.setNewConversation(new_conversation);
     commands.setResumeConversation(resume_conversation);

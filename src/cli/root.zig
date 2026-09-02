@@ -25,11 +25,13 @@ pub const Stats = @import("Stats.zig");
 pub const SubagentDepth = @import("SubagentDepth.zig");
 
 const InteractiveCommands = @import("InteractiveCommands.zig");
+const PresetSave = @import("PresetSave.zig");
 const SelectionPicker = @import("SelectionPicker.zig");
 const Slash = @import("Slash.zig");
 
 test {
     _ = InteractiveCommands;
+    _ = PresetSave;
     _ = SelectionPicker;
     _ = Slash;
 }

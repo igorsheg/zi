@@ -23,6 +23,51 @@ pub const Documents = struct {
     config: ?*const Document = null,
 };
 
+/// Owned scalar-coerced fields used only by preset-save interaction and mutation.
+pub const SaveInspection = struct {
+    exists: bool = false,
+    state_shadow: bool = false,
+    provider: ?[]u8 = null,
+    model: ?[]u8 = null,
+    effort: ?[]u8 = null,
+    description: ?[]u8 = null,
+    tint: ?[]u8 = null,
+
+    pub fn deinit(self: *SaveInspection, allocator: std.mem.Allocator) void {
+        if (self.provider) |value| wipeFree(allocator, value);
+        if (self.model) |value| wipeFree(allocator, value);
+        if (self.effort) |value| wipeFree(allocator, value);
+        if (self.description) |value| wipeFree(allocator, value);
+        if (self.tint) |value| wipeFree(allocator, value);
+        self.* = undefined;
+    }
+};
+
+/// Inspects any same-name definition while preserving Hax's nested/flat masking.
+pub fn inspectForSave(
+    allocator: std.mem.Allocator,
+    documents: Documents,
+    name: []const u8,
+) error{OutOfMemory}!SaveInspection {
+    var result: SaveInspection = .{
+        .exists = try presetExists(allocator, documents, name),
+        .state_shadow = if (documents.state) |state|
+            if (nestedNode(state, name)) |node| node.* == .object else false
+        else
+            false,
+    };
+    errdefer result.deinit(allocator);
+    const selected = try selectNodeForSave(allocator, documents, name) orelse return result;
+    if (selected.* != .object) return result;
+    const object = &selected.object;
+    result.provider = try scalarMember(allocator, object, "provider");
+    result.model = try scalarMember(allocator, object, "model");
+    result.effort = try scalarMember(allocator, object, "effort");
+    result.description = try scalarMember(allocator, object, "description");
+    result.tint = try scalarMember(allocator, object, "tint");
+    return result;
+}
+
 /// Preset names are 1..63 bytes. The first byte is an ASCII letter or digit;
 /// later bytes may additionally be '.', '-', or '_'. Non-ASCII is rejected.
 pub fn nameValid(name: []const u8) bool {
@@ -387,6 +432,39 @@ fn selectNode(
     if (documents.state) |state| if (state.lookup(flat)) |node| return node;
     if (documents.config) |config| if (config.lookup(flat)) |node| return node;
     return null;
+}
+
+fn selectNodeForSave(
+    allocator: std.mem.Allocator,
+    documents: Documents,
+    name: []const u8,
+) error{OutOfMemory}!?*const std.json.Value {
+    if (documents.state) |state| if (nestedObject(state, name)) |node| return node;
+    if (documents.config) |config| if (nestedObject(config, name)) |node| return node;
+    const flat = std.mem.concat(allocator, u8, &.{ "presets.", name }) catch return error.OutOfMemory;
+    defer allocator.free(flat);
+    if (documents.state) |state| if (state.lookup(flat)) |node| return node;
+    if (documents.config) |config| if (config.lookup(flat)) |node| return node;
+    return null;
+}
+
+fn presetExists(allocator: std.mem.Allocator, documents: Documents, name: []const u8) error{OutOfMemory}!bool {
+    if (documents.state) |state| if (nestedNode(state, name) != null) return true;
+    if (documents.config) |config| if (nestedNode(config, name) != null) return true;
+    const flat = std.mem.concat(allocator, u8, &.{ "presets.", name }) catch return error.OutOfMemory;
+    defer allocator.free(flat);
+    if (documents.state) |state| if (state.lookup(flat) != null) return true;
+    if (documents.config) |config| if (config.lookup(flat) != null) return true;
+    return false;
+}
+
+fn nestedNode(document: *const Document, name: []const u8) ?*const std.json.Value {
+    const presets = document.parsed.value.object.getPtr("presets") orelse return null;
+    const object = switch (presets.*) {
+        .object => |*value| value,
+        else => return null,
+    };
+    return object.getPtr(name);
 }
 
 fn nestedObject(document: *const Document, name: []const u8) ?*const std.json.Value {
@@ -784,6 +862,63 @@ test "resource bounds accept exact limits and reject one over" {
     try std.testing.expectError(
         error.TooManyPresets,
         appendName(std.testing.allocator, &names, &seen, "over"),
+    );
+}
+
+test "preset save inspection coerces scalars and preserves malformed masking" {
+    var state = try Document.parse(
+        std.testing.allocator,
+        "{\"presets\":{\"work\":\"draft\",\"shadow\":{\"provider\":\"state\"}}}",
+        .{},
+    );
+    defer state.deinit();
+    var file = try Document.parse(
+        std.testing.allocator,
+        "{\"presets.work\":{\"provider\":7,\"description\":false}," ++
+            "\"presets\":{\"scalar\":{\"provider\":7,\"model\":true," ++
+            "\"effort\":2.5,\"description\":false,\"tint\":\"magenta\"}}}",
+        .{},
+    );
+    defer file.deinit();
+
+    var masked = try inspectForSave(std.testing.allocator, .{ .state = &state, .config = &file }, "work");
+    defer masked.deinit(std.testing.allocator);
+    try std.testing.expect(masked.exists);
+    try std.testing.expect(!masked.state_shadow);
+    try std.testing.expect(masked.provider == null);
+
+    var shadow = try inspectForSave(std.testing.allocator, .{ .state = &state, .config = &file }, "shadow");
+    defer shadow.deinit(std.testing.allocator);
+    try std.testing.expect(shadow.exists);
+    try std.testing.expect(shadow.state_shadow);
+    try std.testing.expectEqualStrings("state", shadow.provider.?);
+
+    var scalar = try inspectForSave(std.testing.allocator, .{ .config = &file }, "scalar");
+    defer scalar.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("7", scalar.provider.?);
+    try std.testing.expectEqualStrings("1", scalar.model.?);
+    try std.testing.expectEqualStrings("2.5", scalar.effort.?);
+    try std.testing.expectEqualStrings("0", scalar.description.?);
+    try std.testing.expectEqualStrings("magenta", scalar.tint.?);
+}
+
+fn exerciseSaveInspectionAllocationFailures(allocator: std.mem.Allocator) !void {
+    var file = try Document.parse(
+        allocator,
+        "{\"presets\":{\"work\":{\"provider\":7,\"model\":true," ++
+            "\"effort\":2.5,\"description\":false,\"tint\":\"rose\"}}}",
+        .{},
+    );
+    defer file.deinit();
+    var inspection = try inspectForSave(allocator, .{ .config = &file }, "work");
+    inspection.deinit(allocator);
+}
+
+test "preset save inspection releases every scalar allocation on OOM" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseSaveInspectionAllocationFailures,
+        .{},
     );
 }
 
