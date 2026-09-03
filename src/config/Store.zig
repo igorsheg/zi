@@ -119,6 +119,34 @@ pub const Result = struct {
     }
 };
 
+pub const Classification = struct {
+    display: ?[]const u8,
+    invalid: bool = false,
+};
+
+pub const Inspector = struct {
+    context: *const anyopaque,
+    classify_fn: *const fn (*const anyopaque, ?[]const u8) Classification,
+    secret: bool = false,
+
+    pub fn classify(self: Inspector, value: ?[]const u8) Classification {
+        return self.classify_fn(self.context, value);
+    }
+};
+
+pub const BoundedResult = struct {
+    value: []u8,
+    source: Source,
+    invalid: bool,
+    clipped: bool,
+
+    pub fn deinit(self: *BoundedResult, allocator: std.mem.Allocator) void {
+        @memset(self.value, 0);
+        allocator.free(self.value);
+        self.* = undefined;
+    }
+};
+
 pub const Options = struct {
     file: ?*const Document = null,
     state: ?*const Document = null,
@@ -239,6 +267,24 @@ const ResolveOptions = struct {
     skip_empty: bool,
     skip_run: bool = false,
     active_provider: ?[]const u8 = null,
+    no_format: bool = false,
+};
+
+const Scalar = union(enum) {
+    text: []const u8,
+    node: *const std.json.Value,
+
+    fn bytes(self: Scalar, buffer: *[64]u8) ?[]const u8 {
+        return switch (self) {
+            .text => |text| text,
+            .node => |node| Document.scalarText(node, buffer),
+        };
+    }
+};
+
+const ResolvedScalar = struct {
+    value: ?Scalar,
+    source: Source,
 };
 
 fn resolve(
@@ -247,6 +293,21 @@ fn resolve(
     key: []const u8,
     options: ResolveOptions,
 ) error{OutOfMemory}!Result {
+    const resolved = try self.resolveScalar(allocator, key, options);
+    var buffer: [64]u8 = undefined;
+    const bytes = if (resolved.value) |value| value.bytes(&buffer) else null;
+    return .{
+        .value = if (bytes) |text| try allocator.dupe(u8, text) else null,
+        .source = resolved.source,
+    };
+}
+
+fn resolveScalar(
+    self: Store,
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    options: ResolveOptions,
+) error{OutOfMemory}!ResolvedScalar {
     const setting = self.registry.find(key);
 
     if (!options.skip_run) {
@@ -257,9 +318,8 @@ fn resolve(
             options.skip_empty,
             false,
             options.active_provider,
-        )) |value| {
-            return self.finish(allocator, value, .run, setting);
-        }
+            options.no_format,
+        )) |value| return finishScalar(value, .run, setting, options.no_format);
     }
     if (try self.documentCandidate(
         allocator,
@@ -268,13 +328,13 @@ fn resolve(
         options.skip_empty,
         true,
         options.active_provider,
-    )) |value| return self.finish(allocator, value, .conversation, setting);
+        options.no_format,
+    )) |value| return finishScalar(value, .conversation, setting, options.no_format);
 
     if (setting) |row| if (row.env_var) |name| {
         if (self.environment.get(name)) |borrowed| {
             if (!options.skip_empty or borrowed.len != 0) {
-                const value = try allocator.dupe(u8, borrowed);
-                return self.finish(allocator, value, .env, setting);
+                return finishScalar(.{ .text = borrowed }, .env, setting, options.no_format);
             }
         }
     };
@@ -286,9 +346,8 @@ fn resolve(
         options.skip_empty,
         true,
         options.active_provider,
-    )) |value| {
-        return self.finish(allocator, value, .state, setting);
-    }
+        options.no_format,
+    )) |value| return finishScalar(value, .state, setting, options.no_format);
     if (try self.documentCandidate(
         allocator,
         self.file,
@@ -296,10 +355,15 @@ fn resolve(
         options.skip_empty,
         true,
         options.active_provider,
-    )) |value| {
-        return self.finish(allocator, value, .config, setting);
-    }
-    return defaultResult(allocator, setting);
+        options.no_format,
+    )) |value| return finishScalar(value, .config, setting, options.no_format);
+    return .{
+        .value = if (setting) |row|
+            if (row.default_value) |text| Scalar{ .text = text } else null
+        else
+            null,
+        .source = .default,
+    };
 }
 
 fn documentCandidate(
@@ -310,20 +374,22 @@ fn documentCandidate(
     skip_empty: bool,
     check_binding: bool,
     active_provider: ?[]const u8,
-) error{OutOfMemory}!?[]u8 {
+    no_format: bool,
+) error{OutOfMemory}!?Scalar {
     const tier = document orelse return null;
-    const value = try tier.getString(allocator, key) orelse return null;
-    errdefer allocator.free(value);
-    if (skip_empty and value.len == 0) {
-        allocator.free(value);
-        return null;
+    const node = tier.getRaw(key) orelse return null;
+    const value: Scalar = switch (node.*) {
+        .string => |text| .{ .text = text },
+        .integer, .float, .bool => .{ .node = node },
+        else => return null,
+    };
+    if (skip_empty and value == .text and value.text.len == 0) return null;
+    if (!no_format) {
+        var buffer: [64]u8 = undefined;
+        _ = value.bytes(&buffer) orelse return null;
     }
     if (check_binding and isProviderBoundKey(key) and
-        !try self.providerBindingAllows(allocator, tier, active_provider))
-    {
-        allocator.free(value);
-        return null;
-    }
+        !try self.providerBindingAllows(allocator, tier, active_provider)) return null;
     return value;
 }
 
@@ -333,20 +399,26 @@ fn providerBindingAllows(
     tier: *const Document,
     active_provider: ?[]const u8,
 ) error{OutOfMemory}!bool {
-    const bound = try tier.getString(allocator, "provider") orelse return true;
-    defer allocator.free(bound);
+    const bound_node = tier.getRaw("provider") orelse return true;
+    const bound_scalar: Scalar = switch (bound_node.*) {
+        .string => |text| .{ .text = text },
+        else => .{ .node = bound_node },
+    };
+    var bound_buffer: [64]u8 = undefined;
+    const bound = bound_scalar.bytes(&bound_buffer) orelse return true;
     if (bound.len == 0) return true;
 
-    var resolved_active: ?Result = null;
-    defer if (resolved_active) |*value| value.deinit(allocator);
-    const active_value = active_provider orelse blk: {
-        resolved_active = try self.resolve(allocator, "provider", .{ .skip_empty = false });
-        break :blk resolved_active.?.value orelse return false;
+    var active_buffer: [64]u8 = undefined;
+    const active_value = if (active_provider) |value| value else blk: {
+        const resolved = try self.resolveScalar(allocator, "provider", .{ .skip_empty = false });
+        const scalar = resolved.value orelse return false;
+        break :blk scalar.bytes(&active_buffer) orelse return false;
     };
     if (active_value.len == 0) return false;
 
     if (self.provider_canonicalizer) |canonicalizer| {
         const left_borrowed = canonicalizer.canonical(active_value);
+        if (left_borrowed.len > Document.maximum_string_bytes) return false;
         const left = try allocator.dupe(u8, left_borrowed);
         defer allocator.free(left);
         const right = canonicalizer.canonical(bound);
@@ -355,29 +427,69 @@ fn providerBindingAllows(
     return std.mem.eql(u8, active_value, bound);
 }
 
-fn finish(
-    self: Store,
-    allocator: std.mem.Allocator,
-    value: []u8,
+fn finishScalar(
+    value: Scalar,
     source: Source,
     setting: ?Setting,
-) !Result {
-    _ = self;
-    if (!std.mem.eql(u8, value, default_sentinel)) return .{ .value = value, .source = source };
-    allocator.free(value);
-    const default_value = if (setting) |row| row.default_value else null;
+    no_format: bool,
+) ResolvedScalar {
+    if (no_format and value == .node) return .{ .value = value, .source = source };
+    var buffer: [64]u8 = undefined;
+    const bytes = value.bytes(&buffer) orelse return .{ .value = null, .source = source };
+    if (!std.mem.eql(u8, bytes, default_sentinel)) return .{ .value = value, .source = source };
     return .{
-        .value = if (default_value) |text| try allocator.dupe(u8, text) else null,
+        .value = if (setting) |row|
+            if (row.default_value) |text| Scalar{ .text = text } else null
+        else
+            null,
         .source = source,
     };
 }
 
-fn defaultResult(allocator: std.mem.Allocator, setting: ?Setting) !Result {
-    const value = if (setting) |row| row.default_value else null;
-    return .{
-        .value = if (value) |text| try allocator.dupe(u8, text) else null,
-        .source = .default,
+pub fn inspectBounded(
+    self: Store,
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    maximum_display_bytes: usize,
+    inspector: Inspector,
+) error{OutOfMemory}!BoundedResult {
+    const setting = self.registry.find(key);
+    const resolved = try self.resolveScalar(allocator, key, .{
+        .skip_empty = if (setting) |row| !row.keep_empty else false,
+        .no_format = inspector.secret,
+    });
+    const classified: Classification = if (inspector.secret)
+        .{ .display = if (resolved.value == null) "unset" else "set" }
+    else classified: {
+        var scalar_buffer: [64]u8 = undefined;
+        const raw = if (resolved.value) |value| value.bytes(&scalar_buffer) else null;
+        break :classified inspector.classify(raw);
     };
+    const display = classified.display orelse "unset";
+    const copied = try copyClipped(allocator, display, maximum_display_bytes);
+    return .{
+        .value = copied.bytes,
+        .source = resolved.source,
+        .invalid = classified.invalid,
+        .clipped = copied.clipped,
+    };
+}
+
+const ClippedCopy = struct { bytes: []u8, clipped: bool };
+
+fn copyClipped(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    maximum: usize,
+) error{OutOfMemory}!ClippedCopy {
+    if (input.len <= maximum) return .{ .bytes = try allocator.dupe(u8, input), .clipped = false };
+    if (maximum <= 3) return .{ .bytes = try allocator.dupe(u8, "..."[0..maximum]), .clipped = true };
+    var prefix = maximum - 3;
+    while (prefix > 0 and prefix < input.len and input[prefix] & 0xc0 == 0x80) prefix -= 1;
+    const output = try allocator.alloc(u8, prefix + 3);
+    @memcpy(output[0..prefix], input[0..prefix]);
+    @memcpy(output[prefix..], "...");
+    return .{ .bytes = output, .clipped = true };
 }
 
 fn isProviderBoundKey(key: []const u8) bool {
@@ -674,4 +786,50 @@ test "provider canonicalization copies callback scratch before the next call" {
         .provider_canonicalizer = .from(&canonicalizer),
     });
     try expectRead(store, "model", "default", .default);
+}
+
+fn inspectRaw(_: *const anyopaque, value: ?[]const u8) Classification {
+    return .{ .display = value };
+}
+
+test "bounded inspection clips an unbounded environment value before copying" {
+    const large = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(large);
+    @memset(large, 'x');
+    const registry_impl: TestRegistry = .{ .rows = &.{.{
+        .key = "x",
+        .setting = .{ .env_var = "X" },
+    }} };
+    const environment_impl: TestEnvironment = .{ .entries = &.{.{ .name = "X", .value = large }} };
+    const store = Store.init(.{
+        .registry = .from(&registry_impl),
+        .environment = .from(&environment_impl),
+    });
+    var result = try store.inspectBounded(std.testing.allocator, "x", 16, .{
+        .context = &registry_impl,
+        .classify_fn = inspectRaw,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Source.env, result.source);
+    try std.testing.expect(result.clipped);
+    try std.testing.expectEqualStrings("xxxxxxxxxxxxx...", result.value);
+}
+
+test "bounded inspection redacts a secret before classification" {
+    const registry_impl: TestRegistry = .{ .rows = &.{.{
+        .key = "secret",
+        .setting = .{ .env_var = "SECRET" },
+    }} };
+    const environment_impl: TestEnvironment = .{ .entries = &.{.{ .name = "SECRET", .value = "do-not-copy" }} };
+    const store = Store.init(.{
+        .registry = .from(&registry_impl),
+        .environment = .from(&environment_impl),
+    });
+    var result = try store.inspectBounded(std.testing.allocator, "secret", 16, .{
+        .context = &registry_impl,
+        .classify_fn = inspectRaw,
+        .secret = true,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("set", result.value);
 }

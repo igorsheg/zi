@@ -80,6 +80,7 @@ pub const TurnSnapshot = struct {
     effort: ?[]const u8,
     image_input: ai.Provider.ImageInput,
     image_input_source: ?agent.ImageInputSource.ImageInputSource,
+    max_turns: usize,
 };
 
 /// Supplies one coherent borrowed snapshot per interactive turn.
@@ -515,6 +516,7 @@ fn fixedTurnSnapshot(inputs: Inputs) TurnSnapshot {
         .effort = if (inputs.effort_source) |source| source.resolve() else inputs.effort,
         .image_input = inputs.image_input,
         .image_input_source = inputs.image_input_source,
+        .max_turns = inputs.max_turns,
     };
 }
 
@@ -655,7 +657,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
             .effort = turn.effort,
             .image_input = turn.image_input,
             .image_input_source = turn.image_input_source,
-            .max_turns = inputs.max_turns,
+            .max_turns = turn.max_turns,
             .continued = continuing,
             .checkpoint = inputs.checkpoint,
             .observer = observer,
@@ -696,7 +698,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !u8 {
                 if (inputs.presentation == null) {
                     try inputs.stderr.print(
                         "zi: max turns ({d}) exceeded; submit an empty prompt to continue\n",
-                        .{inputs.max_turns},
+                        .{turn.max_turns},
                     );
                     try inputs.stderr.flush();
                 }
@@ -1797,6 +1799,7 @@ test "turn source supplies one coherent snapshot for each loop run" {
                 .effort = efforts[index],
                 .image_input = .unknown,
                 .image_input_source = null,
+                .max_turns = agent.Loop.maximum_max_turns,
             };
         }
     };

@@ -173,7 +173,10 @@ const Picker = struct {
         if (size.columns != self.terminal_columns or size.rows != self.terminal_rows) self.layout(size);
         const columns = self.contentColumns(size.columns);
         var output: std.Io.Writer.Allocating = .init(self.allocator);
-        defer output.deinit();
+        defer {
+            std.crypto.secureZero(u8, output.written());
+            output.deinit();
+        }
         var frame: Frame = .{
             .writer = &output.writer,
             .columns = columns,

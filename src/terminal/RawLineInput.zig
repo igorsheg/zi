@@ -120,6 +120,31 @@ pub fn queuePreseed(
     input.pending_preseed = replacement;
 }
 
+/// Replaces value-only prompt styling between reads.
+pub fn setPresentation(
+    input: *RawLineInput,
+    prompt: []const u8,
+    theme: ThemeStyles,
+    display_columns: DisplayColumns.Policy,
+) void {
+    std.debug.assert(!input.active);
+    input.prompt = prompt;
+    input.submission_style_open = theme.accent_open;
+    input.submission_style_close = theme.accent_close;
+    input.search_style_open = theme.accent_open;
+    input.search_style_close = theme.accent_close;
+    input.search_no_match_style_open = theme.dim_open;
+    input.search_no_match_style_close = theme.dim_close;
+    input.display_columns = display_columns;
+}
+
+pub const ThemeStyles = struct {
+    accent_open: []const u8,
+    accent_close: []const u8,
+    dim_open: []const u8,
+    dim_close: []const u8,
+};
+
 /// Controls whether bare Enter can submit an empty line for a resumable turn.
 pub fn setEmptySubmit(input: *RawLineInput, enabled: bool) void {
     input.empty_submit = enabled;

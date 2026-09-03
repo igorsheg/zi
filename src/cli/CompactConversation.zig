@@ -258,6 +258,7 @@ const FakeSelection = struct {
             .effort = null,
             .image_input = .unknown,
             .image_input_source = null,
+            .max_turns = agent.Loop.maximum_max_turns,
         };
     }
 };

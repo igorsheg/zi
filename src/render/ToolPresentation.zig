@@ -62,6 +62,12 @@ pub fn resetTurn(self: *ToolPresentation, width: usize) void {
     self.needs_separator = false;
 }
 
+/// Replaces value-only styling between turns.
+pub fn setTheme(self: *ToolPresentation, theme: Theme) void {
+    std.debug.assert(self.active == null);
+    self.theme = theme;
+}
+
 pub fn setSpinner(self: *ToolPresentation, spinner: ?*Spinner) void {
     self.spinner = spinner;
 }

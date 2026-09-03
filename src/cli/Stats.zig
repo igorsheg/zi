@@ -13,9 +13,35 @@ const separator = " · ";
 const value_len: usize = 48;
 const maximum_value_bytes: usize = value_len - 1;
 
+pub const ContextLimitSource = struct {
+    context: *const anyopaque,
+    resolve_fn: *const fn (*const anyopaque) ?u64,
+
+    pub fn resolve(self: ContextLimitSource) ?u64 {
+        return self.resolve_fn(self.context);
+    }
+
+    pub fn from(implementation: anytype) ContextLimitSource {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("Stats.ContextLimitSource.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn resolve(context: *const anyopaque) ?u64 {
+                const self: *const Implementation = @ptrCast(@alignCast(context));
+                return self.resolveContextLimit();
+            }
+        };
+        return .{ .context = implementation, .resolve_fn = Adapter.resolve };
+    }
+};
+
 /// Synchronously renders final one-shot statistics without allocation.
 pub const Renderer = struct {
     context_limit: ?u64 = null,
+    context_limit_source: ?ContextLimitSource = null,
 
     pub fn renderer(self: *Renderer) OneShot.StatsRenderer {
         return OneShot.StatsRenderer.from(self);
@@ -60,7 +86,11 @@ pub const Renderer = struct {
         var segments: Segments = .{};
         segments.addDuration(elapsed_ms);
         if (latest_context_tokens) |context_tokens| {
-            segments.addContext(context_tokens, self.context_limit);
+            const context_limit = if (self.context_limit_source) |source|
+                source.resolve()
+            else
+                self.context_limit;
+            segments.addContext(context_tokens, context_limit);
         }
         const spend = sanitizeSpend(stats.spend_usd);
         if (spend > 0) {

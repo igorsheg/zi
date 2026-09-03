@@ -6,6 +6,8 @@ const ProviderConfig = @import("../ProviderConfig.zig");
 const terminal = @import("../terminal/root.zig");
 const ModelOrder = @import("ModelOrder.zig");
 const PresetSave = @import("PresetSave.zig");
+const ConfigCommand = @import("ConfigCommand.zig");
+const DiagnosticText = @import("DiagnosticText.zig");
 
 pub const EffortOutcome = union(enum) {
     canceled,
@@ -25,6 +27,18 @@ pub const ProviderOutcome = union(enum) {
 pub const PresetOutcome = union(enum) {
     canceled,
     selected: usize,
+};
+
+pub const ConfigSettingOutcome = union(enum) {
+    canceled,
+    budget_exceeded,
+    selected: usize,
+};
+
+pub const ConfigValueOutcome = union(enum) {
+    canceled,
+    selected: config.Settings.Update,
+    exact: []const u8,
 };
 
 pub const PresetOverwriteOutcome = enum {
@@ -117,6 +131,131 @@ pub const TerminalRunner = struct {
         };
     }
 };
+
+const config_picker_bytes: usize = 256 * 1024;
+
+pub fn configSetting(
+    allocator: std.mem.Allocator,
+    runner: Runner,
+    source: ConfigCommand.Source,
+) !ConfigSettingOutcome {
+    const storage = try allocator.alloc(u8, config_picker_bytes);
+    defer {
+        std.crypto.secureZero(u8, storage);
+        allocator.free(storage);
+    }
+    var fixed = std.heap.FixedBufferAllocator.init(storage);
+    const temporary = fixed.allocator();
+    const settings = config.Settings.list();
+    const rows = temporary.alloc(terminal.Picker.Item, settings.len) catch
+        return .budget_exceeded;
+    const indexes = temporary.alloc(usize, settings.len) catch
+        return .budget_exceeded;
+    var count: usize = 0;
+    for (settings, 0..) |*setting, index| {
+        if (std.mem.startsWith(u8, setting.key, "providers.")) continue;
+        var inspection = try source.inspect(allocator, setting, ConfigCommand.maximum_subject_bytes);
+        defer inspection.deinit(allocator);
+
+        var detail: std.Io.Writer.Allocating = .init(temporary);
+        _ = DiagnosticText.writeBounded(
+            &detail.writer,
+            inspection.display,
+            ConfigCommand.maximum_subject_bytes,
+        ) catch return .budget_exceeded;
+        detail.writer.print(
+            " ({s}{s})",
+            .{
+                inspection.source.label(),
+                if (inspection.invalid) ", invalid" else "",
+            },
+        ) catch return .budget_exceeded;
+
+        var hint_buffer: [160]u8 = undefined;
+        const description = if (setting.editable)
+            std.fmt.allocPrint(
+                temporary,
+                "{s}; expected {s} or default",
+                .{ setting.description, config.Settings.expectedHint(setting, &hint_buffer) },
+            ) catch return .budget_exceeded
+        else
+            setting.description;
+        rows[count] = .{
+            .label = setting.key,
+            .detail = detail.written(),
+            .dim = !setting.editable,
+            .description = description,
+        };
+        indexes[count] = index;
+        count += 1;
+    }
+    const selected = try runner.run("configuration", rows[0..count], 0) orelse return .canceled;
+    if (selected >= count) return .canceled;
+    return .{ .selected = indexes[selected] };
+}
+
+pub fn configValue(
+    allocator: std.mem.Allocator,
+    runner: Runner,
+    source: ConfigCommand.Source,
+    setting: *const config.Settings.Setting,
+    preseed_buffer: []u8,
+) !ConfigValueOutcome {
+    var inspection = try source.inspect(allocator, setting, ConfigCommand.maximum_subject_bytes);
+    defer inspection.deinit(allocator);
+    const extra: usize = @intFromBool(setting.example != null);
+    const rows = try allocator.alloc(terminal.Picker.Item, setting.choices.len + 1 + extra);
+    defer allocator.free(rows);
+    rows[0] = .{
+        .label = "default",
+        .description = "Clear the runtime override and use the environment, saved configuration, or built-in default",
+    };
+    var initial_index: usize = 0;
+    for (setting.choices, 0..) |value, index| {
+        const current = std.ascii.eqlIgnoreCase(inspection.display, value);
+        rows[index + 1] = .{
+            .label = value,
+            .current = current,
+            .label_color = if (std.mem.eql(u8, setting.key, "tint"))
+                (source.theme().withTint(value) catch source.theme()).stance.open
+            else
+                null,
+        };
+        if (current) initial_index = index + 1;
+    }
+    var exact_description: ?[]u8 = null;
+    defer if (exact_description) |bytes| allocator.free(bytes);
+    const validated = config.Settings.validateUpdate(setting, inspection.display) catch null;
+    const exact_valid = if (validated) |update| update == .set else false;
+    const exact_value_valid = exact_valid and initial_index == 0;
+    if (setting.example) |example| {
+        exact_description = try std.fmt.allocPrint(
+            allocator,
+            "Enter an exact value such as {s}",
+            .{example},
+        );
+        rows[rows.len - 1] = .{
+            .label = "exact value...",
+            .description = exact_description.?,
+            .current = exact_value_valid,
+        };
+        if (exact_value_valid) initial_index = rows.len - 1;
+    }
+    const title = try std.fmt.allocPrint(allocator, "{s} — {s}", .{ setting.key, setting.description });
+    defer allocator.free(title);
+    const selected = try runner.run(title, rows, initial_index) orelse return .canceled;
+    if (selected >= rows.len) return .canceled;
+    if (selected == 0) return .{ .selected = .clear };
+    if (selected <= setting.choices.len)
+        return .{ .selected = .{ .set = setting.choices[selected - 1] } };
+
+    const exact = if (!inspection.invalid and exact_value_valid)
+        inspection.display
+    else
+        setting.example orelse "";
+    const seed = try std.fmt.bufPrint(preseed_buffer, "/config {s} {s}", .{ setting.key, exact });
+    return .{ .exact = seed };
+}
 
 /// Sorts by display label while returning an index into registry-priority
 /// choices. Dimmed unavailable rows remain selectable.
@@ -651,6 +790,71 @@ const ProviderRowRunner = struct {
         return 0;
     }
 };
+
+const ConfigBudgetSource = struct {
+    value: []const u8,
+
+    pub fn inspect(
+        self: *ConfigBudgetSource,
+        allocator: std.mem.Allocator,
+        _: *const config.Settings.Setting,
+        _: usize,
+    ) !config.Settings.Inspection {
+        return .{
+            .display = try allocator.dupe(u8, self.value),
+            .source = .env,
+            .invalid = false,
+            .clipped = false,
+        };
+    }
+
+    pub fn apply(
+        _: *ConfigBudgetSource,
+        _: std.mem.Allocator,
+        _: *const config.Settings.Setting,
+        _: config.Settings.Update,
+        _: usize,
+    ) !ConfigCommand.ApplyResult {
+        return .failed;
+    }
+
+    pub fn theme(_: *const ConfigBudgetSource) render.Theme {
+        return render.Theme.resolve(.{ .configured_theme = "off", .configured_tint = "teal" }) catch unreachable;
+    }
+};
+
+const ConfigBudgetRunner = struct {
+    saw_escaped_control: bool = false,
+
+    pub fn run(
+        self: *ConfigBudgetRunner,
+        _: []const u8,
+        items: []const terminal.Picker.Item,
+        _: usize,
+    ) !?usize {
+        try std.testing.expectEqual(@as(usize, 38), items.len);
+        for (items) |item| {
+            const detail = item.detail orelse continue;
+            try std.testing.expect(std.mem.indexOfScalar(u8, detail, 0x1b) == null);
+            if (std.mem.indexOf(u8, detail, "\\x1b") != null) self.saw_escaped_control = true;
+        }
+        return null;
+    }
+};
+
+test "config rows retain worst-case bounded details and visibly escape controls" {
+    var large: [ConfigCommand.maximum_subject_bytes]u8 = @splat('x');
+    large[0] = 0x1b;
+    var source: ConfigBudgetSource = .{ .value = &large };
+    var runner: ConfigBudgetRunner = .{};
+    const outcome = try configSetting(
+        std.testing.allocator,
+        Runner.from(&runner),
+        ConfigCommand.Source.from(&source),
+    );
+    try std.testing.expect(outcome == .canceled);
+    try std.testing.expect(runner.saw_escaped_control);
+}
 
 fn exerciseProviderRows(allocator: std.mem.Allocator) !void {
     const choices = [_]ProviderConfig.ProviderChoice{

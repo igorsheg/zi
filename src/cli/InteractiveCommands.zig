@@ -5,6 +5,7 @@ const render = @import("../render/root.zig");
 const text = @import("../text/root.zig");
 const DiagnosticText = @import("DiagnosticText.zig");
 const CompactConversation = @import("CompactConversation.zig");
+const ConfigCommand = @import("ConfigCommand.zig");
 const Interactive = @import("Interactive.zig");
 const NewConversation = @import("NewConversation.zig");
 const PresetSave = @import("PresetSave.zig");
@@ -114,6 +115,13 @@ const specs = [_]Slash.Spec{
         .handler_fn = runPresetSave,
     },
     .{
+        .name = "config",
+        .summary = "view or change settings (optional: key value)",
+        .arguments = .optional,
+        .display = .managed,
+        .handler_fn = runConfig,
+    },
+    .{
         .name = "compact",
         .summary = "summarize history to free up context (optional: focus instructions)",
         .arguments = .optional,
@@ -143,6 +151,8 @@ pub const Owner = struct {
     frame: ?*render.Frame = null,
     run_selection: ?*RunSelection.Owner = null,
     preset_save_source: ?PresetSave.Source = null,
+    config_source: ?ConfigCommand.Source = null,
+    config_preseed: [ConfigCommand.maximum_subject_bytes + 128]u8 = undefined,
     run_log_seam: ?*RunLogSeam.Owner = null,
     io: ?std.Io = null,
     listing_generation: ?Interactive.Generation = null,
@@ -192,6 +202,10 @@ pub const Owner = struct {
 
     pub fn setPresetSaveSource(self: *Owner, source: PresetSave.Source) void {
         self.preset_save_source = source;
+    }
+
+    pub fn setConfigSource(self: *Owner, source: ConfigCommand.Source) void {
+        self.config_source = source;
     }
 
     pub fn setRunLogSeam(self: *Owner, run_log_seam: *RunLogSeam.Owner) void {
@@ -540,6 +554,25 @@ fn mapSlashOutcome(outcome: Slash.HandlerOutcome) Interactive.CommandOutcome {
         .handled => .handled,
         .history_changed => .history_changed,
         .exit => .exit,
+        .preseed => |bytes| .{ .preseed = bytes },
+    };
+}
+
+fn runConfig(context: *anyopaque, call: Slash.Call) anyerror!Slash.HandlerOutcome {
+    const self: *Owner = @ptrCast(@alignCast(context));
+    const source = self.config_source orelse return .handled;
+    const live = self.run_selection orelse return .handled;
+    const outcome = try ConfigCommand.run(.{
+        .allocator = live.allocator,
+        .writer = self.writer,
+        .styled = self.styled,
+        .source = source,
+        .picker = self.selection_picker,
+        .preseed_buffer = &self.config_preseed,
+    }, call.argument);
+    if (self.frame) |frame| frame.syncExternal(1);
+    return switch (outcome) {
+        .handled => .handled,
         .preseed => |bytes| .{ .preseed = bytes },
     };
 }
@@ -2261,6 +2294,7 @@ test "help lists only implemented commands and supported shortcuts" {
             "  /effort       set reasoning effort\n" ++
             "  /preset       switch to a config-defined preset (optional: name)\n" ++
             "  /preset-save  save the current selection as a preset (name, optional tint)\n" ++
+            "  /config       view or change settings (optional: key value)\n" ++
             "  /compact      summarize history to free up context (optional: focus\n" ++
             "                instructions)\n" ++
             "  /help         show this help\n" ++

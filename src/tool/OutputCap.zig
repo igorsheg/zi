@@ -56,7 +56,45 @@ pub fn capAndSanitize(
 ) Error![]u8 {
     const capped = try capLineLengths(allocator, input, line_bytes, result_bytes);
     defer allocator.free(capped);
-    return text.Utf8.sanitize(allocator, capped, result_bytes);
+    return sanitizeClipped(allocator, capped, result_bytes);
+}
+
+fn sanitizeClipped(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    maximum: usize,
+) Error![]u8 {
+    return text.Utf8.sanitize(allocator, input, maximum) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ResultTooLarge => clipped: {
+            if (maximum <= 3) break :clipped allocator.dupe(u8, "..."[0..maximum]);
+            const budget = maximum - 3;
+            var low: usize = 0;
+            var high: usize = input.len;
+            while (low < high) {
+                const middle = low + (high - low + 1) / 2;
+                const candidate = text.Utf8.sanitize(
+                    allocator,
+                    input[0..middle],
+                    budget,
+                ) catch |candidate_error| switch (candidate_error) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ResultTooLarge => {
+                        high = middle - 1;
+                        continue;
+                    },
+                };
+                allocator.free(candidate);
+                low = middle;
+            }
+            const prefix = try text.Utf8.sanitize(allocator, input[0..low], budget);
+            defer allocator.free(prefix);
+            const output = try allocator.alloc(u8, prefix.len + 3);
+            @memcpy(output[0..prefix.len], prefix);
+            @memcpy(output[prefix.len..], "...");
+            break :clipped output;
+        },
+    };
 }
 
 fn appendBounded(
@@ -117,6 +155,15 @@ test "marker growth obeys final result bound" {
         error.ResultTooLarge,
         capLineLengths(std.testing.allocator, "12345", 4, 4),
     );
+}
+
+test "sanitation expansion clips within the model byte budget" {
+    const allocator = std.testing.allocator;
+    const input: [10]u8 = @splat(0xff);
+    const output = try capAndSanitize(allocator, &input, maximum_line_bytes, 10);
+    defer allocator.free(output);
+    try std.testing.expect(output.len <= 10);
+    try std.testing.expectEqualStrings("...", output[output.len - 3 ..]);
 }
 
 test "byte cap may split UTF-8 before sanitizer repairs it" {

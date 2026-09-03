@@ -72,6 +72,7 @@ pub const Spinner = struct {
     writer: *std.Io.Writer,
     theme: Theme,
     width_source: WidthSource,
+    width: ?usize = null,
     thread: std.Thread,
     mutex: std.Io.Mutex = .init,
     wake: std.Io.Condition = .init,
@@ -102,6 +103,21 @@ pub const Spinner = struct {
     tool_row_count: usize = 0,
     tool_view_dirty: bool = false,
     painted_frame: ToolFrame = .{},
+
+    /// Replaces value-only styling while serializing with the paint thread.
+    pub fn setWidth(self: *Spinner, width: usize) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.width = @max(width, 1);
+        self.tool_view_dirty = true;
+    }
+
+    pub fn setTheme(self: *Spinner, theme: Theme) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.theme = theme;
+        self.tool_view_dirty = true;
+    }
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -323,7 +339,9 @@ pub const Spinner = struct {
     }
 
     pub fn columns(self: *Spinner) usize {
-        return self.width_source.resolve();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.resolveWidthLocked();
     }
 
     pub fn check(self: *Spinner) std.Io.Writer.Error!void {
@@ -375,9 +393,13 @@ pub const Spinner = struct {
         self.freeToolRows();
     }
 
+    fn resolveWidthLocked(self: *const Spinner) usize {
+        return self.width orelse self.width_source.resolve();
+    }
+
     fn eraseLocked(self: *Spinner) void {
         if (self.painted_frame.row_count != 0) {
-            const terminal_columns = self.width_source.resolve();
+            const terminal_columns = self.resolveWidthLocked();
             const climb = physicalRows(
                 self.painted_frame.row_widths[0 .. self.painted_frame.row_count - 1],
                 terminal_columns,
@@ -406,7 +428,7 @@ pub const Spinner = struct {
     }
 
     fn drawLabelLocked(self: *Spinner, glyph: []const u8) void {
-        const terminal_columns = self.width_source.resolve();
+        const terminal_columns = self.resolveWidthLocked();
         var budget = terminal_columns -| 3;
         var retry_buffer: [96]u8 = undefined;
         const label = if (self.retry_deadline_ms != 0 and std.mem.eql(u8, self.displayed_key, "retry"))
@@ -470,7 +492,7 @@ pub const Spinner = struct {
             rows[0..self.tool_row_count],
             glyph,
             self.theme.chrome_dim.open,
-            self.width_source.resolve(),
+            self.resolveWidthLocked(),
             if (self.painted_frame.row_count != 0) &self.painted_frame else null,
             &self.painted_frame,
         ) catch |err| self.recordWriteError(err);

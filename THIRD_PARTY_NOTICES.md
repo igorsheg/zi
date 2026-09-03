@@ -9,8 +9,9 @@ UTF-8 sanitation, unified-diff, atomic-write, write, edit, synchronous bash, bac
 task lifecycle and environment propagation, agent-context discovery and rendering, one-shot startup,
 execution and output ordering, interactive session lifecycle and selection, raw normal-buffer prompt editing, bounded prompt-history navigation and erasedups, normal-buffer incremental prompt search, private prompt-history loading, append, and compaction, prompt admission, interactive slash parsing and help dispatch, transactional reasoning-effort selection, provider model listing and pagination, model metadata parsing and ordering, interactive model selection, provider switching, persistent selection behavior, config-defined preset selection, preset picker presentation, prompt-reference re-expansion, preset tint publication, preset-save capture and overwrite interaction, atomic config replacement, and picker rendering, generation interrupt handling, interactive theming, banner and committed-user-message presentation, per-turn summaries, normal-buffer stream and reasoning rendering, live spinner and tool-status repainting, resumed-turn replay, interactive tool-call headers and bounded output previews, and streaming Markdown parsing, wrapping, and table layout,
 session resume and retention matching, catalog refresh and routing,
-compaction cadence, usage pricing and statistics, prompt-file expansion, configuration registry and typed
-parsing, Codex CLI credential behavior, configured provider-header resolution, local-provider
+compaction cadence, usage pricing and statistics, prompt-file expansion, configuration registry, typed
+parsing, runtime configuration inspection, source labeling, process-local overrides, setting and value
+pickers, live activation timing, Codex CLI credential behavior, configured provider-header resolution, local-provider
 reachability and llama.cpp model reconciliation, and libcurl HTTP, CA discovery, SSE, and retry behavior
 are adapted from hax sources at that revision.
 

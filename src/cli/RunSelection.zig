@@ -439,6 +439,31 @@ pub const Views = struct {
     }
 };
 
+pub const SortSource = struct {
+    context: *const anyopaque,
+    resolve_fn: *const fn (*const anyopaque, bool) bool,
+
+    pub fn resolve(self: SortSource, keep_provider_order: bool) bool {
+        return self.resolve_fn(self.context, keep_provider_order);
+    }
+
+    pub fn from(implementation: anytype) SortSource {
+        const Pointer = @TypeOf(implementation);
+        const pointer_info = @typeInfo(Pointer);
+        if (pointer_info != .pointer or pointer_info.pointer.size != .one) {
+            @compileError("RunSelection.SortSource.from expects a single-item pointer");
+        }
+        const Implementation = pointer_info.pointer.child;
+        const Adapter = struct {
+            fn resolve(context: *const anyopaque, keep_provider_order: bool) bool {
+                const self: *const Implementation = @ptrCast(@alignCast(context));
+                return self.resolveSortModels(keep_provider_order);
+            }
+        };
+        return .{ .context = implementation, .resolve_fn = Adapter.resolve };
+    }
+};
+
 pub const Candidate = struct {
     allocator: std.mem.Allocator,
     config_run: config.Selection.PreparedRun,
@@ -691,6 +716,7 @@ pub const Owner = struct {
     model_hints_source: ?ProviderConfig.ModelHintsSource = null,
     reported_metadata: ?ai.ModelMeta.Metadata = null,
     sort_models: bool = true,
+    sort_source: ?SortSource = null,
     model_provenance: ModelProvenance = .inherited,
     state_writer: ?config.StateWriter.Writer = null,
     views: ?Views = null,
@@ -728,7 +754,10 @@ pub const Owner = struct {
             .provider_efforts = self.runtime.metadata.provider_efforts,
             .efforts = self.runtime.metadata.efforts,
             .model_metadata = self.runtime.metadata.model,
-            .sort_models = self.sort_models,
+            .sort_models = if (self.sort_source) |source|
+                source.resolve(self.runtime.keep_model_order)
+            else
+                self.sort_models,
             .model_provenance = self.model_provenance,
             .model_discovered = self.runtime.model_discovered,
         };
@@ -782,11 +811,14 @@ pub const Owner = struct {
         errdefer config_run.deinit(self.allocator);
         var runtime = try source.listing(config_run.store());
         errdefer runtime.deinit();
-        const sort_models = try resolveSortModels(
-            self.allocator,
-            config_run.store(),
-            runtime.keepModelOrder(),
-        );
+        const sort_models = if (self.sort_source) |sort_source|
+            sort_source.resolve(runtime.keepModelOrder())
+        else
+            try resolveSortModels(
+                self.allocator,
+                config_run.store(),
+                runtime.keepModelOrder(),
+            );
         return .{
             .allocator = self.allocator,
             .config_run = config_run,
@@ -870,6 +902,7 @@ pub const Owner = struct {
             .effort = self.runtime.effort,
             .image_input = self.image_input,
             .image_input_source = self.image_input_source,
+            .max_turns = agent.Loop.maximum_max_turns,
         };
     }
 

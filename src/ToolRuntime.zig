@@ -196,6 +196,32 @@ pub const Owner = struct {
         try self.bash.updateRunEffort(effort);
     }
 
+    /// Replaces allocation-free policy for later tool operations. The caller
+    /// invokes this synchronously between model turns; active callbacks reject
+    /// publication before any child is changed.
+    pub fn publishRuntimePolicy(
+        self: *Owner,
+        policy: tool.RuntimePolicy.Policy,
+    ) void {
+        std.debug.assert(tool.RuntimePolicy.isValid(policy));
+        if (self.task_notes) |state| std.debug.assert(!state.active);
+        if (self.registry) |registry| std.debug.assert(!registry.callback_active);
+
+        self.read.config.output_bytes = policy.output_bytes;
+        self.bash.timeout_ms = policy.bash_timeout_ms;
+        self.bash.maximum_timeout_ms = policy.bash_maximum_timeout_ms;
+        self.bash.termination_grace_ms = policy.bash_termination_grace_ms;
+        self.bash.output_options.model_bytes = policy.output_bytes;
+        self.bash.output_options.result_bytes = tool.RuntimePolicy.bashResultBytes(policy);
+        self.bash.background_yield_ms = policy.bash_background_yield_ms;
+        if (self.registry) |registry| {
+            registry.config.max_running = policy.task_maximum_running;
+            registry.config.wait_timeout_ms = policy.task_wait_timeout_ms;
+            registry.config.termination_grace_ms = policy.bash_termination_grace_ms;
+            registry.config.model_bytes = policy.output_bytes;
+        }
+    }
+
     /// Returns a borrowed registry for observation and job adoption. The caller
     /// must not call `deinit`; this Owner retains shutdown and destruction rights.
     pub fn taskRegistry(self: *Owner) ?*TaskRegistry {
@@ -641,6 +667,36 @@ test "task mode appends task wait and owner moves without invalidating erased ad
     try std.testing.expectEqual(@intFromPtr(shell_address), @intFromPtr(moved.commandShell().ptr));
     try std.testing.expectEqual(@intFromPtr(registry_address), @intFromPtr(moved.taskRegistry().?));
     try std.testing.expectEqual(@as(usize, 4), moved.tools()[3].definition.parameters.len);
+}
+
+test "owner publishes complete runtime tool policy after validation" {
+    var clock: TestClock = .{};
+    var poller: TestPoller = .{};
+    var inputs = testInputs(std.testing.allocator);
+    inputs.enable_tasks = true;
+    inputs.clock = tool.TaskRegistry.Clock.from(&clock);
+    inputs.poller = tool.TaskRegistry.Poller.from(&poller);
+    var owner = try init(inputs);
+    defer owner.deinit();
+
+    owner.publishRuntimePolicy(.{
+        .output_bytes = 4096,
+        .bash_timeout_ms = 11,
+        .bash_maximum_timeout_ms = 22,
+        .bash_termination_grace_ms = 33,
+        .bash_background_yield_ms = 44,
+        .task_wait_timeout_ms = 55,
+        .task_maximum_running = 6,
+    });
+    try std.testing.expectEqual(@as(usize, 4096), owner.read.config.output_bytes);
+    try std.testing.expectEqual(@as(u64, 11), owner.bash.timeout_ms);
+    try std.testing.expectEqual(@as(u64, 22), owner.bash.maximum_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 33), owner.bash.termination_grace_ms);
+    try std.testing.expectEqual(@as(usize, 4096), owner.bash.output_options.model_bytes);
+    try std.testing.expectEqual(@as(usize, 4096 * 3 + 64 * 1024), owner.bash.output_options.result_bytes);
+    try std.testing.expectEqual(@as(u64, 44), owner.bash.background_yield_ms);
+    try std.testing.expectEqual(@as(u64, 55), owner.registry.?.config.wait_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 6), owner.registry.?.config.max_running);
 }
 
 test "owner validates and atomically forwards full Bash selection updates" {

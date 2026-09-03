@@ -6,6 +6,7 @@ pub const Provider = @import("Provider.zig");
 pub const Usage = @import("Usage.zig");
 pub const UsagePricing = @import("UsagePricing.zig");
 pub const Transport = @import("Transport.zig");
+pub const RequestPolicy = @import("RequestPolicy.zig");
 pub const JsonTransport = @import("JsonTransport.zig");
 pub const LocalDiscovery = @import("LocalDiscovery.zig");
 pub const HttpTransport = @import("HttpTransport.zig");
@@ -55,6 +56,7 @@ test {
     _ = Usage;
     _ = UsagePricing;
     _ = Transport;
+    _ = RequestPolicy;
     _ = Sse;
     _ = Retry;
     _ = ApiError;

@@ -1,5 +1,6 @@
 pub const Tool = @import("Tool.zig");
 pub const OutputCap = @import("OutputCap.zig");
+pub const RuntimePolicy = @import("RuntimePolicy.zig");
 pub const Read = @import("Read.zig");
 pub const Write = @import("Write.zig");
 pub const Edit = @import("Edit.zig");
@@ -17,6 +18,7 @@ const BashCdStrip = @import("BashCdStrip.zig");
 test {
     _ = Tool;
     _ = OutputCap;
+    _ = RuntimePolicy;
     _ = Read;
     _ = Write;
     _ = Edit;

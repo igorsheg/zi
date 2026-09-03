@@ -2,6 +2,7 @@ const std = @import("std");
 const Args = @import("Args.zig");
 const ProcessAdapters = @import("ProcessAdapters.zig");
 const PresetSave = @import("PresetSave.zig");
+const RuntimeConfig = @import("RuntimeConfig.zig");
 const config = @import("../config/root.zig");
 
 const StartupConfig = @This();
@@ -199,6 +200,21 @@ pub const Owner = struct {
         prepared: *config.Selection.PreparedRun,
     ) config.Selection.RetiredOverlay {
         return self.state.selection.publishRunRetired(prepared);
+    }
+
+    pub fn prepareRunOverride(
+        self: *const Owner,
+        key: []const u8,
+        value: ?[]const u8,
+    ) config.Selection.Error!config.Selection.PreparedOverride {
+        return self.state.selection.prepareRunOverride(key, value);
+    }
+
+    pub fn publishRunOverrideRetired(
+        self: *Owner,
+        prepared: *config.Selection.PreparedOverride,
+    ) config.Selection.RetiredOverlay {
+        return self.state.selection.publishRunOverrideRetired(prepared);
     }
 
     /// Returns a bounded borrowed view into the cached preset enumeration.
@@ -1082,6 +1098,68 @@ test "explicit preset is atomic and CLI selection overrides it last" {
     try expectSetting(&owner, "model", "cli-m", .run);
     try std.testing.expectEqualStrings("rose", owner.tint().?);
     try std.testing.expectEqual(@as(usize, 1), owner.presetPlans().len);
+}
+
+test "runtime config candidate rollback and confirmation precede publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTiers(&tmp, "{\"compact.threshold\":70}", "{}");
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    var access: TestSecureOpen = .{ .directory = tmp.dir, .base = base };
+    var environment = ProcessAdapters.Environment.init(testEnviron(&.{}));
+    var owner = try initOwner(testInputs(
+        std.testing.allocator,
+        base,
+        config.SecureOpen.Capability.from(&access),
+        &environment,
+    ));
+    defer owner.deinit();
+    var runtime = try RuntimeConfig.Owner.init(std.testing.allocator, &owner, .{});
+    defer runtime.deinit();
+    const setting = config.Settings.find("compact.threshold").?;
+
+    var candidate = try runtime.prepare(setting, .{ .set = "75" });
+    try std.testing.expectEqual(@as(u8, 75), candidate.snapshot.compact_threshold);
+    try expectSetting(&owner, "compact.threshold", "70", .config);
+    candidate.deinit();
+    try std.testing.expectEqual(@as(u8, 70), runtime.snapshot.compact_threshold);
+
+    const applied = try runtime.apply(
+        std.testing.allocator,
+        setting,
+        .{ .set = "75" },
+        4096,
+    );
+    switch (applied) {
+        .failed => return error.TestUnexpectedResult,
+        .changed => |value| {
+            var inspection = value;
+            defer inspection.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("75", inspection.display);
+            try std.testing.expectEqual(config.Store.Source.run, inspection.source);
+        },
+    }
+    try expectSetting(&owner, "compact.threshold", "75", .run);
+    try std.testing.expectEqual(@as(u8, 75), runtime.snapshot.compact_threshold);
+
+    const cleared = try runtime.apply(
+        std.testing.allocator,
+        setting,
+        .clear,
+        4096,
+    );
+    switch (cleared) {
+        .failed => return error.TestUnexpectedResult,
+        .changed => |value| {
+            var inspection = value;
+            defer inspection.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("70", inspection.display);
+            try std.testing.expectEqual(config.Store.Source.config, inspection.source);
+        },
+    }
+    try expectSetting(&owner, "compact.threshold", "70", .config);
+    try std.testing.expectEqual(@as(u8, 70), runtime.snapshot.compact_threshold);
 }
 
 test "startup config writer publication reaches retained store and preset views" {

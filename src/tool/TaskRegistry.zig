@@ -6,7 +6,7 @@ const ai = @import("../ai/root.zig");
 const text = @import("../text/root.zig");
 
 pub const hard_output_bytes: usize = 16 * 1024 * 1024;
-pub const maximum_running: usize = 32;
+pub const maximum_running: usize = 64;
 pub const poll_interval_ms: u64 = 20;
 
 pub const Status = union(enum) {
@@ -160,7 +160,7 @@ pub const Poller = struct {
 };
 
 pub const Config = struct {
-    max_running: usize = maximum_running,
+    max_running: usize = 32,
     wait_timeout_ms: u64 = 10 * 60 * 1000,
     termination_grace_ms: u64 = 2 * 1000,
     model_bytes: usize = OutputCap.default_output_bytes,
@@ -202,6 +202,8 @@ const Entry = struct {
     command: []u8,
     job: Job,
     started_ms: i64,
+    model_bytes: usize = OutputCap.default_output_bytes,
+    termination_grace_ms: u64 = 2 * 1000,
     finished_ms: i64 = 0,
     status: Status = .running,
     terminal_status: ?Status = null,
@@ -377,6 +379,8 @@ pub const TaskRegistry = struct {
             .command = owned_command,
             .job = job.*,
             .started_ms = started_ms,
+            .model_bytes = self.config.model_bytes,
+            .termination_grace_ms = self.config.termination_grace_ms,
         });
         job.* = undefined;
         self.next_number += 1;
@@ -592,7 +596,7 @@ pub const TaskRegistry = struct {
         var advertised_log = false;
         if (stored_pending == 0) {
             body = try result_allocator.alloc(u8, 0);
-        } else if (stored_pending <= self.config.model_bytes) {
+        } else if (stored_pending <= self.entries.items[index].model_bytes) {
             const raw = self.readRange(
                 result_allocator,
                 index,
@@ -603,8 +607,8 @@ pub const TaskRegistry = struct {
                 else => return err,
             };
             defer result_allocator.free(raw);
-            body_omitted = requiresShaping(raw, self.config.model_bytes);
-            body = try modelSlice(result_allocator, raw, self.config.model_bytes);
+            body_omitted = requiresShaping(raw, self.entries.items[index].model_bytes);
+            body = try modelSlice(result_allocator, raw, self.entries.items[index].model_bytes);
         } else {
             body = self.readCappedRange(
                 result_allocator,
@@ -618,7 +622,7 @@ pub const TaskRegistry = struct {
             };
             advertised_log = if (clean_path) |path|
                 "\n... [output truncated; full output: ".len + path.len + "] ...\n".len <
-                    self.config.model_bytes
+                    self.entries.items[index].model_bytes
             else
                 false;
         }
@@ -667,7 +671,7 @@ pub const TaskRegistry = struct {
         offset: usize,
         length: usize,
     ) Error![]u8 {
-        if (length > self.config.model_bytes) return error.InvalidJob;
+        if (length > self.entries.items[index].model_bytes) return error.InvalidJob;
         const result = try allocator.alloc(u8, length);
         errdefer allocator.free(result);
         var filled: usize = 0;
@@ -694,7 +698,7 @@ pub const TaskRegistry = struct {
         to: usize,
         clean_path: ?[]const u8,
     ) Error![]u8 {
-        const maximum = self.config.model_bytes;
+        const maximum = self.entries.items[index].model_bytes;
         var marker_buffer: [2304]u8 = undefined;
         const marker = if (clean_path) |path|
             std.fmt.bufPrint(
@@ -752,13 +756,13 @@ pub const TaskRegistry = struct {
             if (now >= deadline) {
                 if (options.kill_on_timeout and !kill_sent) {
                     kill_sent = true;
-                    if (self.config.termination_grace_ms == 0) {
+                    if (self.entries.items[index].termination_grace_ms == 0) {
                         try self.jobTerminate(index, .force);
                         force_deadline = std.math.maxInt(i64);
                         deadline = saturatingDeadline(now, 3000);
                     } else {
                         try self.jobTerminate(index, .graceful);
-                        force_deadline = saturatingDeadline(now, self.config.termination_grace_ms);
+                        force_deadline = saturatingDeadline(now, self.entries.items[index].termination_grace_ms);
                         deadline = saturatingDeadline(force_deadline, 3000);
                     }
                     try self.pollAll();
@@ -1362,8 +1366,14 @@ test "registry owns jobs, assigns positional ids, advances cursor, and resets on
     defer registry.deinit();
     var first = try scriptedJob(std.testing.allocator, "one", 2);
     try std.testing.expectEqualStrings("t1", try registry.adopt(&first, "printf one", null, 0));
+    registry.config.model_bytes = 777;
+    registry.config.termination_grace_ms = 99;
     var second = try scriptedJob(std.testing.allocator, "two", 1);
     try std.testing.expectEqualStrings("named", try registry.adopt(&second, "printf two", "named", 0));
+    try std.testing.expectEqual(OutputCap.default_output_bytes, registry.entries.items[0].model_bytes);
+    try std.testing.expectEqual(@as(u64, 2 * 1000), registry.entries.items[0].termination_grace_ms);
+    try std.testing.expectEqual(@as(usize, 777), registry.entries.items[1].model_bytes);
+    try std.testing.expectEqual(@as(u64, 99), registry.entries.items[1].termination_grace_ms);
     var report = (try registry.reportOutput(std.testing.allocator, "t1")).?;
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("one", report.body);

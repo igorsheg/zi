@@ -126,6 +126,25 @@ pub const PreparedRun = struct {
     }
 };
 
+/// Move-only prospective replacement of one run-tier setting.
+pub const PreparedOverride = struct {
+    document: Document,
+    options: Store.Options,
+
+    pub fn deinit(self: *PreparedOverride) void {
+        wipeDocument(&self.document);
+        self.document.deinit();
+        self.* = undefined;
+    }
+
+    /// Borrows this prepared value and Selection's stable collaborators.
+    pub fn store(self: *const PreparedOverride) Store {
+        var options = self.options;
+        options.run = &self.document;
+        return .init(options);
+    }
+};
+
 /// Move-only complete prospective preset overlay.
 pub const PreparedPreset = struct {
     allocator: std.mem.Allocator,
@@ -289,7 +308,6 @@ pub fn preparePreset(self: *const Selection, tier: Tier, plan: *const Preset.Pla
         .{ .key = "effort", .value = plan.effort.value orelse default_sentinel },
         .{ .key = "system_prompt", .value = plan.system_prompt.value },
         .{ .key = "system_prompt_append", .value = plan.system_prompt_append.value },
-        .{ .key = "tint", .value = null },
     };
     try validateChanges(&plan_changes);
 
@@ -485,6 +503,46 @@ pub fn setRun(self: *Selection, inputs: RunInputs) Error!void {
     appendBoolean(&changes, &count, "no_tasks", inputs.no_tasks);
     appendBoolean(&changes, &count, "no_session", inputs.no_session);
     if (count != 0) try self.replaceTier(.run, changes[0..count]);
+}
+
+/// Builds a complete prospective run document changing exactly one key.
+pub fn prepareRunOverride(
+    self: *const Selection,
+    key: []const u8,
+    value: ?[]const u8,
+) Error!PreparedOverride {
+    var document = try self.changedDocument(.run, &.{.{ .key = key, .value = value }});
+    errdefer {
+        wipeDocument(&document);
+        document.deinit();
+    }
+    var options = self.base;
+    options.conversation = if (self.conversation) |*current| current else self.base.conversation;
+    return .{ .document = document, .options = options };
+}
+
+/// Consumes a prepared override, installs it without allocation, and returns
+/// the displaced run document for cleanup after publication.
+pub fn publishRunOverrideRetired(
+    self: *Selection,
+    prepared: *PreparedOverride,
+) RetiredOverlay {
+    const retired: RetiredOverlay = .{
+        .allocator = self.allocator,
+        .run_document = self.run,
+        .conversation_document = null,
+        .run_tint = null,
+        .conversation_tint = null,
+    };
+    self.run = prepared.document;
+    prepared.document = undefined;
+    prepared.* = undefined;
+    return retired;
+}
+
+pub fn publishRunOverride(self: *Selection, prepared: *PreparedOverride) void {
+    var retired = self.publishRunOverrideRetired(prepared);
+    retired.deinit();
 }
 
 /// Builds a complete prospective run stance without changing Selection.
@@ -998,6 +1056,7 @@ test "new run preset cannot expose a resumed prompt or tint" {
     try std.testing.expect(selection.presetTint() == null);
     var below_preset = try selection.store().readBelowRun(std.testing.allocator, "preset");
     defer below_preset.deinit(std.testing.allocator);
+
     try std.testing.expect(below_preset.value == null);
 }
 
@@ -1458,8 +1517,63 @@ test "Document parser and repeated Selection mutations wipe every OOM path" {
             error.OutOfMemory => completed = false,
             else => return err,
         };
+        if (completed) {
+            var prepared = selection.prepareRunOverride(
+                "compact.threshold",
+                "wipe-marker-third",
+            ) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    completed = false;
+                    selection.deinit();
+                    try std.testing.expect(!observer.secret_seen);
+                    continue;
+                },
+                else => return err,
+            };
+            selection.publishRunOverride(&prepared);
+        }
         selection.deinit();
         try std.testing.expect(!observer.secret_seen);
         if (completed) break;
     }
+}
+
+test "preset replacement preserves an explicit runtime tint override" {
+    var selection = Selection.init(std.testing.allocator, testBase(null, null));
+    defer selection.deinit();
+    try selection.applyPreset(.run, &testPlan());
+    var tint_override = try selection.prepareRunOverride("tint", "sage");
+    selection.publishRunOverride(&tint_override);
+
+    const replacement = conversationPlan();
+    try selection.applyPreset(.run, &replacement);
+    try expectSelectionRead(&selection, "tint", "sage", .run);
+    try std.testing.expectEqualStrings("amber", selection.presetTint().?);
+}
+
+test "generic run override preserves preset tint and publishes without touching conversation" {
+    var selection = Selection.init(std.testing.allocator, testBase(null, null));
+    defer selection.deinit();
+    try selection.applyPreset(.run, &testPlan());
+    const tint_before = selection.presetTint();
+    try std.testing.expect(tint_before != null);
+
+    var prepared = try selection.prepareRunOverride("compact.threshold", "75");
+    var candidate = try prepared.store().read(std.testing.allocator, "compact.threshold");
+    defer candidate.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("75", candidate.value.?);
+    var retired = selection.publishRunOverrideRetired(&prepared);
+    retired.deinit();
+
+    try std.testing.expectEqualStrings(tint_before.?, selection.presetTint().?);
+    var current = try selection.store().read(std.testing.allocator, "compact.threshold");
+    defer current.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("75", current.value.?);
+    try std.testing.expectEqual(Store.Source.run, current.source);
+
+    var cleared = try selection.prepareRunOverride("compact.threshold", null);
+    selection.publishRunOverride(&cleared);
+    var lower = try selection.store().read(std.testing.allocator, "compact.threshold");
+    defer lower.deinit(std.testing.allocator);
+    try std.testing.expect(lower.value == null);
 }

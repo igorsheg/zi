@@ -116,6 +116,24 @@ pub const Owned = struct {
         return listResolvedModels(allocator, io, self.config, self.json_transport, tick);
     }
 
+    /// Replaces HTTP request policy while serialized with streaming and plan changes.
+    pub fn publishHttpPolicy(
+        self: *Owned,
+        io: std.Io,
+        policy: ProviderConfig.HttpPolicy,
+    ) void {
+        self.factory.lockPlan(io);
+        defer self.factory.unlockPlan(io);
+        self.config.publishHttpPolicy(policy);
+    }
+
+    /// Changes reasoning request visibility for adapters that encode it.
+    pub fn updateShowReasoning(self: *Owned, io: std.Io, visible: bool) void {
+        self.factory.lockPlan(io);
+        defer self.factory.unlockPlan(io);
+        self.config.updateShowReasoning(visible);
+    }
+
     pub fn setInputTokens(self: *Owned, io: std.Io, input_tokens: u64) void {
         self.factory.setInputTokens(io, input_tokens);
     }

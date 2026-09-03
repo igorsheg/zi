@@ -158,22 +158,31 @@ pub fn getRaw(self: *const Document, key: []const u8) ?*const std.json.Value {
     return self.lookup(key);
 }
 
+/// Returns a borrowed string or a scalar formatted into `buffer`.
+/// null, arrays, objects, and unrepresentable numbers return null.
+pub fn scalarText(value: *const std.json.Value, buffer: *[64]u8) ?[]const u8 {
+    return switch (value.*) {
+        .string => |text| text,
+        .integer => |number| std.fmt.bufPrint(buffer, "{d}", .{number}) catch unreachable,
+        .float => |number| if (std.math.isFinite(number))
+            formatGeneralBuffer(buffer[0..32], number)
+        else
+            null,
+        .bool => |boolean| if (boolean) "1" else "0",
+        else => null,
+    };
+}
+
 /// Converts a string, integer, finite real, or boolean to an owned string.
 /// null, arrays, objects, and unrepresentable numbers return null.
 pub fn scalarString(
     allocator: std.mem.Allocator,
     value: *const std.json.Value,
 ) !?[]u8 {
-    return switch (value.*) {
-        .string => |text| try allocator.dupe(u8, text),
-        .integer => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
-        .float => |number| if (std.math.isFinite(number))
-            try formatGeneral(allocator, number)
-        else
-            null,
-        .bool => |boolean| try allocator.dupe(u8, if (boolean) "1" else "0"),
-        else => null,
-    };
+    var buffer: [64]u8 = undefined;
+    const text = scalarText(value, &buffer) orelse return null;
+    const owned = try allocator.dupe(u8, text);
+    return owned;
 }
 
 /// Returns an owned scalar string, or null for missing/non-scalar values.
@@ -304,7 +313,7 @@ fn formatGeneral(allocator: std.mem.Allocator, number: f64) error{OutOfMemory}![
 /// Reproduces C `%g`'s default six significant digits under round-to-nearest,
 /// ties-to-even. f128 preserves the f64 input exactly and leaves 60 guard bits
 /// while scaling the six-digit result, including for subnormals.
-fn formatGeneralBuffer(buffer: *[32]u8, number: f64) []const u8 {
+fn formatGeneralBuffer(buffer: []u8, number: f64) []const u8 {
     var cursor: usize = 0;
     const negative = std.math.signbit(number);
     if (negative) {

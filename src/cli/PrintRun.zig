@@ -22,7 +22,9 @@ const PromptAssembly = @import("../PromptAssembly.zig");
 const GitProbe = @import("../GitProbe.zig");
 const Args = @import("Args.zig");
 const InteractiveCommands = @import("InteractiveCommands.zig");
+const ConfigCommand = @import("ConfigCommand.zig");
 const RunSelection = @import("RunSelection.zig");
+const RuntimeConfig = @import("RuntimeConfig.zig");
 const RunLogSeam = @import("RunLogSeam.zig");
 const SelectionPicker = @import("SelectionPicker.zig");
 const ProcessAdapters = @import("ProcessAdapters.zig");
@@ -415,22 +417,13 @@ pub fn run(
         });
     };
     var hints: CatalogHints = .{ .owner = catalog };
-    const http_max_retries: u16 = @intCast((try config.Settings.getInt(
-        startup.store(),
-        allocator,
-        "http.max_retries",
-    )).value);
-    const http_retry_base = (try config.Settings.getDurationMs(
-        startup.store(),
-        allocator,
-        "http.retry_base",
-    )).value;
-    const http_idle_timeout = (try config.Settings.getDurationMs(
-        startup.store(),
-        allocator,
-        "http.idle_timeout",
-    )).value;
-
+    var runtime_config = try RuntimeConfig.Owner.init(allocator, &startup, .{
+        .no_color = environment.get("NO_COLOR"),
+        .term = environment.get("TERM"),
+        .colorterm = environment.get("COLORTERM"),
+        .colorfgbg = environment.get("COLORFGBG"),
+    });
+    defer runtime_config.deinit();
     const provider_inputs: ProviderConfig.Inputs = .{
         .allocator = allocator,
         .store = startup.store(),
@@ -452,11 +445,7 @@ pub fn run(
             null,
         .session_cache_key = &session_cache_key,
         .hints_source = if (catalog != null) ProviderConfig.ModelHintsSource.from(&hints) else null,
-        .http_policy = .{
-            .max_retries = http_max_retries,
-            .retry_base_ms = http_retry_base,
-            .idle_timeout_ms = http_idle_timeout,
-        },
+        .http_policy = providerHttpPolicy(runtime_config.requestPolicy()),
     };
     var provider_runtime = try ProviderRuntime.initWithJson(
         provider_inputs,
@@ -570,21 +559,7 @@ pub fn run(
 
     const store = startup.store();
     const no_tasks = (try config.Settings.getBool(store, allocator, "no_tasks")).value;
-    const tool_output_cap = try usizeSetting(allocator, store, "tool_output_cap");
-    const bash_timeout = (try config.Settings.getDurationMs(store, allocator, "bash.timeout")).value;
-    const bash_timeout_max = (try config.Settings.getDurationMs(store, allocator, "bash.timeout_max")).value;
-    const bash_timeout_grace = (try config.Settings.getDurationMs(store, allocator, "bash.timeout_grace")).value;
-    const bash_background_yield = (try config.Settings.getDurationMs(
-        store,
-        allocator,
-        "bash.background_yield",
-    )).value;
-    const task_wait_timeout = (try config.Settings.getDurationMs(store, allocator, "task.wait_timeout")).value;
-    const task_max_running: usize = @intCast((try config.Settings.getInt(
-        store,
-        allocator,
-        "task.max_running",
-    )).value);
+    const tool_policy = runtime_config.toolPolicy();
     var bash_shell = try config.Settings.getString(store, allocator, "bash.shell");
     defer bash_shell.deinit(allocator);
     var tools = try ToolRuntime.init(.{
@@ -596,19 +571,22 @@ pub fn run(
         .clock = task_time.clock(),
         .poller = task_time.poller(),
         .task_config = .{
-            .max_running = task_max_running,
-            .wait_timeout_ms = task_wait_timeout,
-            .termination_grace_ms = bash_timeout_grace,
-            .model_bytes = tool_output_cap,
+            .max_running = tool_policy.task_maximum_running,
+            .wait_timeout_ms = tool_policy.task_wait_timeout_ms,
+            .termination_grace_ms = tool_policy.bash_termination_grace_ms,
+            .model_bytes = tool_policy.output_bytes,
         },
-        .read_config = .{ .output_bytes = tool_output_cap },
+        .read_config = .{ .output_bytes = tool_policy.output_bytes },
         .bash_config = .{
             .shell = bash_shell.value,
-            .timeout_ms = bash_timeout,
-            .maximum_timeout_ms = bash_timeout_max,
-            .termination_grace_ms = bash_timeout_grace,
-            .output = .{ .model_bytes = tool_output_cap },
-            .background_yield_ms = bash_background_yield,
+            .timeout_ms = tool_policy.bash_timeout_ms,
+            .maximum_timeout_ms = tool_policy.bash_maximum_timeout_ms,
+            .termination_grace_ms = tool_policy.bash_termination_grace_ms,
+            .output = .{
+                .model_bytes = tool_policy.output_bytes,
+                .result_bytes = tool.RuntimePolicy.bashResultBytes(tool_policy),
+            },
+            .background_yield_ms = tool_policy.bash_background_yield_ms,
         },
         .run_selection = .{
             .provider = provider_runtime.metadata.provider_id,
@@ -701,20 +679,12 @@ pub fn run(
 
     var usage = try agent.UsageStats.UsageStats.init(allocator, agent.UsageStats.maximum_retained_attempts);
     defer usage.deinit();
-    const context_override = (try config.Settings.getSize(store, allocator, "context_limit")).value;
-    const manual_context_limit: ?u64 = if (context_override != 0) context_override else null;
-    const context_limit: ?u64 = if (manual_context_limit) |value|
-        value
-    else if (provider_runtime.metadata.model.context_window != 0)
-        provider_runtime.metadata.model.context_window
-    else
-        null;
+    const context_limit = runtime_config.effectiveContextLimit(
+        provider_runtime.metadata.model.context_window,
+    );
     var stats: Stats.Renderer = .{ .context_limit = context_limit };
-    var image_input_setting = try config.Settings.getString(store, allocator, "image_input");
-    defer image_input_setting.deinit(allocator);
-    const image_policy = try parseImageInputPolicy(image_input_setting.value);
-    const image_input = image_policy.resolveFixed(provider_runtime.metadata.model.image_input);
-    const sort_models = try resolveSortModels(allocator, store, provider_runtime.keep_model_order);
+    const image_input = runtime_config.resolveImageInput(provider_runtime.metadata.model.image_input);
+    const sort_models = runtime_config.resolveSortModels(provider_runtime.keep_model_order);
     var live_builder: LiveBuilder = .{
         .allocator = allocator,
         .io = io,
@@ -727,8 +697,7 @@ pub fn run(
         .config_root = config_root,
         .home = path_inputs.home,
         .cwd = cwd,
-        .image_policy = image_policy,
-        .manual_context_limit = manual_context_limit,
+        .runtime_config = &runtime_config,
     };
     var live_provider_source: LiveProviderSource = .{
         .allocator = allocator,
@@ -754,6 +723,7 @@ pub fn run(
         .model_hints_source = provider_inputs.hints_source,
         .reported_metadata = if (provider_inputs.hints.reported) |value| value.* else null,
         .sort_models = sort_models,
+        .sort_source = RunSelection.SortSource.from(&runtime_config),
         .state_writer = startup.stateWriter(),
     };
     provider_runtime_owned = false;
@@ -768,20 +738,20 @@ pub fn run(
         .provider_id = live.runtime.metadata.catalog_id,
         .model_id = live.runtime.model,
     };
+    var context_limit_source: LiveContextLimit = .{
+        .runtime_config = &runtime_config,
+        .catalog_runtime = &catalog_runtime,
+    };
+    stats.context_limit_source = Stats.ContextLimitSource.from(&context_limit_source);
     var image_source: DynamicImageInput = .{
-        .policy = image_policy,
+        .runtime_config = &runtime_config,
         .catalog_runtime = &catalog_runtime,
     };
     var model_metadata_source: DynamicModelMetadata = .{
         .catalog_runtime = &catalog_runtime,
     };
-    const compact_enabled = (try config.Settings.getBool(store, allocator, "compact.auto")).value;
-    const configured_max_turns = (try config.Settings.getInt(store, allocator, "max_turns")).value;
-    const interactive_max_turns: usize = if (configured_max_turns <= 0)
-        agent.Loop.maximum_max_turns
-    else
-        @min(@as(usize, @intCast(configured_max_turns)), agent.Loop.maximum_max_turns);
-    const compact_threshold: u8 = @intCast((try config.Settings.getInt(store, allocator, "compact.threshold")).value);
+    const compact_enabled = runtime_config.snapshot.compact_enabled;
+    const compact_threshold = runtime_config.snapshot.compact_threshold;
     var compaction: AutoCompact = .{
         .allocator = allocator,
         .io = io,
@@ -796,7 +766,7 @@ pub fn run(
         .effort = live.runtime.effort,
         .usage = &usage,
         .catalog_runtime = &catalog_runtime,
-        .manual_context_limit = manual_context_limit,
+        .runtime_config = &runtime_config,
         .seam_hook = run_seam_hook,
         .marker = &compaction_marker,
         .context_limit = context_limit,
@@ -861,7 +831,7 @@ pub fn run(
         .catalog_runtime = &catalog_runtime,
         .stats = &stats,
         .compaction = &compaction,
-        .manual_context_limit = manual_context_limit,
+        .runtime_config = &runtime_config,
     };
     image_source.effects = &catalog_hook;
     model_metadata_source.effects = &catalog_hook;
@@ -878,7 +848,7 @@ pub fn run(
         configured_tint.value,
         startup.tint(),
     );
-    const theme = try resolveTheme(stderr, .{
+    _ = try resolveTheme(stderr, .{
         .configured_theme = configured_theme.value orelse "auto",
         .configured_tint = effective_tint,
         .no_color = environment.get("NO_COLOR"),
@@ -886,16 +856,15 @@ pub fn run(
         .colorterm = environment.get("COLORTERM"),
         .colorfgbg = environment.get("COLORFGBG"),
     });
-    var below_run_tint = try store.readBelowRun(allocator, "tint");
-    defer below_run_tint.deinit(allocator);
-    const base_theme = theme.withTint(below_run_tint.value orelse "teal") catch fallback: {
-        break :fallback theme.withTint("teal") catch unreachable;
-    };
+    const theme = runtime_config.theme();
+    const base_theme = runtime_config.snapshot.base_theme;
 
     var live_views: LiveViews = .{
         .catalog_runtime = &catalog_runtime,
         .stats = &stats,
         .compaction = &compaction,
+        .tools = &tools,
+        .runtime_config = &runtime_config,
         .base_theme = base_theme,
     };
     live.setViews(RunSelection.Views.from(&live_views));
@@ -942,6 +911,10 @@ pub fn run(
             var stdin_file = std.Io.File.Reader.initStreaming(stdin_terminal_file, io, &stdin_buffer);
             const interactive_terminal = ProcessAdapters.isTty(io, .stdin()) and
                 ProcessAdapters.isTty(io, .stdout());
+            var live_turn_source: LiveTurnSource = .{
+                .selection = &live,
+                .runtime_config = &runtime_config,
+            };
             const interactive_inputs: Interactive.Inputs = .{
                 .session = conversation.session(),
                 .provider = live.runtime.provider(),
@@ -951,7 +924,7 @@ pub fn run(
                 .system_prompt = live.snapshot().system_prompt,
                 .tools = live.tool_list,
                 .effort = live.runtime.effort,
-                .turn_source = Interactive.TurnSource.from(&live),
+                .turn_source = Interactive.TurnSource.from(&live_turn_source),
                 .image_input = live.image_input,
                 .image_input_source = live.image_input_source,
                 .reader = &stdin_file.interface,
@@ -962,17 +935,13 @@ pub fn run(
                 .pre_request_hook = pre_request_hook,
                 .continuation_hook = agent.Loop.ContinuationHook.from(&compaction),
                 .usage_observer = agent.Loop.UsageObserver.from(&usage),
-                .max_turns = interactive_max_turns,
+                .max_turns = runtime_config.snapshot.maximum_turns,
                 .before_first_send = if (catalog != null and live.runtime.metadata.catalog_id != null)
                     Interactive.BeforeFirstSend.from(&interactive_catalog)
                 else
                     null,
             };
-            var configured_display_width = try config.Settings.getString(store, allocator, "display_width");
-            defer configured_display_width.deinit(allocator);
-            const display_columns = try terminal_module.DisplayColumns.Policy.parse(
-                configured_display_width.value orelse "auto",
-            );
+            const display_columns = runtime_config.displayPolicy();
             if (!interactive_terminal) {
                 var commands = InteractiveCommands.Owner.init(
                     stdout,
@@ -983,6 +952,16 @@ pub fn run(
                 commands.setPresetBaseTheme(live_views.base_theme);
                 commands.setRunSelection(&live);
                 commands.setPresetSaveSource(preset_save_source);
+                var live_config_source: LiveConfigSource = .{
+                    .runtime_config = &runtime_config,
+                    .views = &live_views,
+                };
+                commands.setConfigSource(ConfigCommand.Source.from(&live_config_source));
+                const cooked_width: LiveMarkdownWidth = .{
+                    .runtime_config = &runtime_config,
+                    .stdout_fd = stdout_terminal_file.handle,
+                };
+                commands.setWidthSource(.from(&cooked_width));
                 commands.setRunLogSeam(run_log_seam);
                 commands.setNewConversation(new_conversation_runner);
                 commands.setResumeConversation(resume_conversation_runner);
@@ -1024,6 +1003,7 @@ pub fn run(
                 compact_conversation_runner,
                 &compact_conversation_service,
                 &live_views,
+                &runtime_config,
                 theme,
                 display_columns,
                 markdown_enabled,
@@ -1292,6 +1272,19 @@ const RawMarkdownWidth = struct {
     }
 };
 
+const LiveMarkdownWidth = struct {
+    runtime_config: *const RuntimeConfig.Owner,
+    stdout_fd: std.posix.fd_t,
+
+    pub fn resolve(self: *const LiveMarkdownWidth) usize {
+        const physical_columns = terminal_module.Size.presentationColumns(self.stdout_fd);
+        return @min(
+            self.runtime_config.displayPolicy().resolve(physical_columns),
+            physical_columns -| 1,
+        );
+    }
+};
+
 const RawSessionPicker = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1332,7 +1325,7 @@ const RawResumeReplay = struct {
     io: std.Io,
     writer: *std.Io.Writer,
     theme: render.Theme,
-    width: *const RawMarkdownWidth,
+    width: *const LiveMarkdownWidth,
     show_reasoning: bool,
     markdown_enabled: bool,
     markdown_renderer: *render.MarkdownStreamRenderer,
@@ -1462,6 +1455,7 @@ fn runRawInteractive(
     compact_conversation: CompactConversation.Runner,
     compact_service: *CompactConversation.Service,
     live_views: *LiveViews,
+    runtime_config: *RuntimeConfig.Owner,
     theme: render.Theme,
     display_columns: terminal_module.DisplayColumns.Policy,
     markdown_enabled: bool,
@@ -1569,8 +1563,8 @@ fn runRawInteractive(
         .catalog_hook = catalog_hook,
         .stdout_fd = stdout_file.handle,
     };
-    const markdown_width: RawMarkdownWidth = .{
-        .display_columns = display_columns,
+    const markdown_width: LiveMarkdownWidth = .{
+        .runtime_config = runtime_config,
         .stdout_fd = stdout_file.handle,
     };
     var commands = InteractiveCommands.Owner.init(
@@ -1584,6 +1578,11 @@ fn runRawInteractive(
     commands.setFrame(&frame);
     commands.setRunSelection(live);
     commands.setPresetSaveSource(preset_save_source);
+    var live_config_source: LiveConfigSource = .{
+        .runtime_config = runtime_config,
+        .views = live_views,
+    };
+    commands.setConfigSource(ConfigCommand.Source.from(&live_config_source));
     commands.setRunLogSeam(run_log_seam);
     commands.setNewConversation(new_conversation);
     commands.setResumeConversation(resume_conversation);
@@ -1596,12 +1595,7 @@ fn runRawInteractive(
         .stdout = stdout_file,
         .writer = inputs_value.stdout,
         .display_columns = display_columns,
-        .style = .{
-            .accent_open = theme.accent.open,
-            .accent_close = theme.accent.close,
-            .ok_open = theme.ok.open,
-            .ok_close = theme.ok.close,
-        },
+        .style = pickerStyle(theme),
     };
     const picker_runner = SelectionPicker.Runner.from(&selection_picker);
     commands.setSelectionPicker(io, picker_runner);
@@ -1639,9 +1633,24 @@ fn runRawInteractive(
     defer plain_renderer.deinit();
     live_views.commands = &commands;
     live_views.markdown = &markdown_renderer;
+    live_views.plain = &plain_renderer;
+    live_views.raw_input = &raw_input;
+    live_views.raw_presentation = &presentation;
+    live_views.selection_picker = &selection_picker;
+    live_views.turn_selection_picker = &turn_selection_picker;
+    live_views.prompt_buffer = &prompt_buffer;
     defer {
         live_views.commands = null;
         live_views.markdown = null;
+        live_views.plain = null;
+        live_views.raw_input = null;
+        live_views.raw_presentation = null;
+        live_views.selection_picker = null;
+        live_views.turn_selection_picker = null;
+        live_views.resume_picker = null;
+        live_views.resume_replay = null;
+        live_views.spinner = null;
+        live_views.prompt_buffer = null;
     }
     var resume_picker: RawSessionPicker = .{
         .allocator = allocator,
@@ -1654,6 +1663,7 @@ fn runRawInteractive(
         .theme = theme,
         .frame = &frame,
     };
+    live_views.resume_picker = &resume_picker;
     var resume_replay: RawResumeReplay = .{
         .allocator = allocator,
         .io = io,
@@ -1666,6 +1676,7 @@ fn runRawInteractive(
         .plain_renderer = &plain_renderer,
         .frame = &frame,
     };
+    live_views.resume_replay = &resume_replay;
     resume_service.picker = SessionPicker.Runner.from(&resume_picker);
     resume_service.replay_sink = ResumeConversation.ReplaySink.from(&resume_replay);
     undo_service.prompt_history = &history;
@@ -1705,7 +1716,11 @@ fn runRawInteractive(
         theme,
         .from(&spinner_width),
     );
+    spinner.setWidth(display_columns.resolve(
+        terminal_module.Size.presentationColumns(stdout_file.handle),
+    ));
     presentation.spinner = spinner;
+    live_views.spinner = spinner;
     markdown_renderer.setSpinner(spinner);
     plain_renderer.setSpinner(spinner);
     defer {
@@ -1731,6 +1746,12 @@ fn runRawInteractive(
     compact_service.activity = CompactConversation.Activity.from(&compact_activity);
     defer compact_service.activity = null;
 
+    var dynamic_renderer: DynamicTurnRenderer = .{
+        .runtime_config = runtime_config,
+        .markdown = &markdown_renderer,
+        .plain = &plain_renderer,
+    };
+
     var inputs = inputs_value;
     inputs.prompt_input = Interactive.PromptInput.from(&raw_input);
     inputs.prompt_recall = Interactive.PromptRecall.from(&raw_input);
@@ -1739,10 +1760,7 @@ fn runRawInteractive(
     inputs.generation = Interactive.Generation.from(&interrupt);
     inputs.checkpoint = agent.Loop.Checkpoint.from(&checkpoint);
     inputs.presentation = Interactive.Presentation.from(&presentation);
-    inputs.turn_renderer = if (markdown_enabled)
-        Interactive.TurnRenderer.from(&markdown_renderer)
-    else
-        Interactive.TurnRenderer.from(&plain_renderer);
+    inputs.turn_renderer = Interactive.TurnRenderer.from(&dynamic_renderer);
 
     const exit_code = runInteractiveWithFinish(allocator, io, inputs, terminal_owner) catch |run_error| {
         try cleanupRawTerminal(&interrupt);
@@ -1917,6 +1935,17 @@ const CatalogHints = struct {
     }
 };
 
+const LiveTurnSource = struct {
+    selection: *RunSelection.Owner,
+    runtime_config: *const RuntimeConfig.Owner,
+
+    pub fn snapshot(self: *LiveTurnSource) Interactive.TurnSnapshot {
+        var value = self.selection.snapshot();
+        value.max_turns = self.runtime_config.snapshot.maximum_turns;
+        return value;
+    }
+};
+
 const LiveProviderSource = struct {
     allocator: std.mem.Allocator,
     inputs: ProviderConfig.Inputs,
@@ -2024,8 +2053,7 @@ const LiveBuilder = struct {
     config_root: ?[]const u8,
     home: ?[]const u8,
     cwd: []const u8,
-    image_policy: ImageInputPolicy,
-    manual_context_limit: ?u64,
+    runtime_config: *RuntimeConfig.Owner,
 
     pub fn build(
         self: *LiveBuilder,
@@ -2034,6 +2062,7 @@ const LiveBuilder = struct {
     ) !RunSelection.Built {
         var provider_inputs = self.provider_inputs;
         provider_inputs.store = store;
+        provider_inputs.http_policy = providerHttpPolicy(self.runtime_config.requestPolicy());
         provider_inputs.hints.reported = if (reported_metadata) |*value| value else null;
         if (reported_metadata != null) provider_inputs.llama_reconciliation = null;
         var runtime = try ProviderRuntime.initWithJson(
@@ -2086,13 +2115,12 @@ const LiveBuilder = struct {
             self.preset_source.presetPlans(),
         );
         errdefer if (prompt) |*value| value.deinit(self.allocator);
-        const sort_models = try resolveSortModels(self.allocator, store, runtime.keep_model_order);
+        const sort_models = self.runtime_config.resolveSortModels(runtime.keep_model_order);
         return .{
             .runtime = runtime,
             .prompt = prompt,
-            .image_input = self.image_policy.resolveFixed(runtime.metadata.model.image_input),
-            .context_limit = effectiveContextLimit(
-                self.manual_context_limit,
+            .image_input = self.runtime_config.resolveImageInput(runtime.metadata.model.image_input),
+            .context_limit = self.runtime_config.effectiveContextLimit(
                 runtime.metadata.model.context_window,
             ),
             .sort_models = sort_models,
@@ -2112,13 +2140,41 @@ const LiveToolSelection = struct {
     }
 };
 
+fn providerHttpPolicy(policy: ai.RequestPolicy.Policy) ProviderConfig.HttpPolicy {
+    return .{
+        .max_retries = policy.additional_retries,
+        .retry_base_ms = policy.retry_base_ms,
+        .idle_timeout_ms = policy.idle_timeout_ms,
+    };
+}
+
+fn pickerStyle(theme: render.Theme) terminal_module.Picker.Style {
+    return .{
+        .accent_open = theme.accent.open,
+        .accent_close = theme.accent.close,
+        .ok_open = theme.ok.open,
+        .ok_close = theme.ok.close,
+    };
+}
+
 const LiveViews = struct {
     catalog_runtime: *CatalogRuntime,
     stats: *Stats.Renderer,
     compaction: *AutoCompact,
+    tools: *ToolRuntime.Owner,
+    runtime_config: *RuntimeConfig.Owner,
     base_theme: render.Theme,
     commands: ?*InteractiveCommands.Owner = null,
     markdown: ?*render.MarkdownStreamRenderer = null,
+    plain: ?*render.PlainInteractiveRenderer = null,
+    raw_input: ?*terminal_module.RawLineInput = null,
+    raw_presentation: ?*RawPresentation = null,
+    selection_picker: ?*SelectionPicker.TerminalRunner = null,
+    turn_selection_picker: ?*SelectionPicker.TerminalRunner = null,
+    resume_picker: ?*RawSessionPicker = null,
+    resume_replay: ?*RawResumeReplay = null,
+    spinner: ?*render.Spinner.Spinner = null,
+    prompt_buffer: ?*[128]u8 = null,
 
     pub fn publishSelectionViews(self: *LiveViews, derived: RunSelection.Derived) void {
         const runtime = derived.runtime;
@@ -2126,19 +2182,87 @@ const LiveViews = struct {
         self.catalog_runtime.provider_id = runtime.metadata.catalog_id;
         self.catalog_runtime.model_id = runtime.model;
         self.catalog_runtime.applied_replacement = false;
-        self.stats.context_limit = derived.context_limit;
+        self.stats.context_limit = self.runtime_config.effectiveContextLimit(
+            runtime.metadata.model.context_window,
+        );
         self.compaction.provider = runtime.provider();
         self.compaction.model = runtime.model;
         self.compaction.metadata = runtime.metadata.model;
         self.compaction.system_prompt = derived.system_prompt;
         self.compaction.effort = runtime.effort;
         self.compaction.context_limit = derived.context_limit;
-        const selected_theme = if (derived.preset_tint) |tint|
-            self.base_theme.withTint(tint) catch unreachable
-        else
-            self.base_theme;
+        const selected_theme = self.runtime_config.theme();
         if (self.commands) |commands| commands.setTheme(selected_theme);
         if (self.markdown) |markdown| markdown.setTheme(selected_theme);
+        if (self.plain) |plain| plain.setTheme(selected_theme);
+    }
+
+    pub fn publishRuntimeConfig(self: *LiveViews) void {
+        self.catalog_runtime.runtime.publishHttpPolicy(
+            self.catalog_runtime.io,
+            providerHttpPolicy(self.runtime_config.requestPolicy()),
+        );
+        self.catalog_runtime.runtime.updateShowReasoning(
+            self.catalog_runtime.io,
+            self.runtime_config.requestPolicy().show_reasoning,
+        );
+        self.tools.publishRuntimePolicy(self.runtime_config.toolPolicy());
+        self.base_theme = self.runtime_config.snapshot.base_theme;
+        const selected_theme = self.runtime_config.theme();
+        const display_columns = self.runtime_config.displayPolicy();
+        if (self.commands) |commands| {
+            commands.setPresetBaseTheme(self.base_theme);
+            commands.setTheme(selected_theme);
+        }
+        if (self.markdown) |markdown| markdown.setTheme(selected_theme);
+        if (self.plain) |plain| plain.setTheme(selected_theme);
+        if (self.raw_presentation) |presentation| {
+            presentation.theme = selected_theme;
+            presentation.display_columns = display_columns;
+        }
+        if (self.raw_input) |raw_input| if (self.prompt_buffer) |buffer| {
+            const prompt = std.fmt.bufPrint(
+                buffer,
+                "{s}\x1b[1m❯\x1b[22m{s} ",
+                .{ selected_theme.accent.open, selected_theme.accent.close },
+            ) catch "❯ ";
+            raw_input.setPresentation(prompt, .{
+                .accent_open = selected_theme.accent.open,
+                .accent_close = selected_theme.accent.close,
+                .dim_open = selected_theme.chrome_dim.open,
+                .dim_close = selected_theme.chrome_dim.close,
+            }, display_columns);
+        };
+        if (self.selection_picker) |picker| {
+            picker.display_columns = display_columns;
+            picker.style = pickerStyle(selected_theme);
+        }
+        if (self.turn_selection_picker) |picker| {
+            picker.display_columns = display_columns;
+            picker.style = pickerStyle(selected_theme);
+        }
+        if (self.resume_picker) |picker| {
+            picker.display_columns = display_columns;
+            picker.theme = selected_theme;
+        }
+        if (self.resume_replay) |replay| {
+            replay.theme = selected_theme;
+            replay.markdown_enabled = self.runtime_config.snapshot.markdown;
+            replay.show_reasoning = self.runtime_config.snapshot.show_reasoning;
+        }
+        if (self.markdown) |markdown| markdown.setShowReasoning(
+            self.runtime_config.snapshot.show_reasoning,
+        );
+        if (self.plain) |plain| plain.setShowReasoning(
+            self.runtime_config.snapshot.show_reasoning,
+        );
+        if (self.spinner) |spinner| {
+            spinner.setTheme(selected_theme);
+            if (self.raw_presentation) |presentation| {
+                const physical = terminal_module.Size.presentationColumns(presentation.stdout_fd);
+                spinner.setWidth(display_columns.resolve(physical));
+            }
+        }
     }
 };
 
@@ -2169,11 +2293,118 @@ const CatalogRuntime = struct {
     }
 };
 
+const DynamicTurnRenderer = struct {
+    runtime_config: *const RuntimeConfig.Owner,
+    markdown: *render.MarkdownStreamRenderer,
+    plain: *render.PlainInteractiveRenderer,
+    active: enum { none, markdown, plain } = .none,
+
+    pub fn begin(self: *DynamicTurnRenderer) !agent.Loop.Observer {
+        const show_reasoning = self.runtime_config.snapshot.show_reasoning;
+        if (self.runtime_config.snapshot.markdown) {
+            self.active = .markdown;
+            self.markdown.setShowReasoning(show_reasoning);
+            return self.markdown.begin() catch |err| {
+                self.active = .none;
+                return err;
+            };
+        }
+        self.active = .plain;
+        self.plain.setShowReasoning(show_reasoning);
+        return self.plain.begin() catch |err| {
+            self.active = .none;
+            return err;
+        };
+    }
+
+    pub fn close(self: *DynamicTurnRenderer, terminal: render.Terminal) !void {
+        return switch (self.active) {
+            .none => {},
+            .markdown => self.markdown.close(terminal),
+            .plain => self.plain.close(terminal),
+        };
+    }
+
+    pub fn check(self: *DynamicTurnRenderer) !void {
+        return switch (self.active) {
+            .none => {},
+            .markdown => self.markdown.check(),
+            .plain => self.plain.check(),
+        };
+    }
+
+    pub fn wroteAssistantText(self: *DynamicTurnRenderer) bool {
+        return switch (self.active) {
+            .none => false,
+            .markdown => self.markdown.wroteAssistantText(),
+            .plain => self.plain.wroteAssistantText(),
+        };
+    }
+
+    pub fn toolObserver(self: *DynamicTurnRenderer) ?agent.Loop.ToolObserver {
+        return switch (self.active) {
+            .none => null,
+            .markdown => self.markdown.toolObserver(),
+            .plain => self.plain.toolObserver(),
+        };
+    }
+};
+
+const LiveConfigSource = struct {
+    runtime_config: *RuntimeConfig.Owner,
+    views: *LiveViews,
+
+    pub fn inspect(
+        self: *LiveConfigSource,
+        allocator: std.mem.Allocator,
+        setting: *const config.Settings.Setting,
+        maximum_display_bytes: usize,
+    ) !config.Settings.Inspection {
+        return self.runtime_config.inspect(allocator, setting, maximum_display_bytes);
+    }
+
+    pub fn apply(
+        self: *LiveConfigSource,
+        allocator: std.mem.Allocator,
+        setting: *const config.Settings.Setting,
+        update: config.Settings.Update,
+        maximum_display_bytes: usize,
+    ) !ConfigCommand.ApplyResult {
+        return switch (try self.runtime_config.apply(
+            allocator,
+            setting,
+            update,
+            maximum_display_bytes,
+        )) {
+            .failed => .failed,
+            .changed => |inspection| changed: {
+                self.views.publishRuntimeConfig();
+                break :changed .{ .changed = inspection };
+            },
+        };
+    }
+
+    pub fn theme(self: *const LiveConfigSource) render.Theme {
+        return self.runtime_config.theme();
+    }
+};
+
+const LiveContextLimit = struct {
+    runtime_config: *const RuntimeConfig.Owner,
+    catalog_runtime: *const CatalogRuntime,
+
+    pub fn resolveContextLimit(self: *const LiveContextLimit) ?u64 {
+        return self.runtime_config.effectiveContextLimit(
+            self.catalog_runtime.runtime.metadata.model.context_window,
+        );
+    }
+};
+
 const CatalogHook = struct {
     catalog_runtime: *CatalogRuntime,
     stats: *Stats.Renderer,
     compaction: *AutoCompact,
-    manual_context_limit: ?u64,
+    runtime_config: *RuntimeConfig.Owner,
     warning_buffer: [160]u8 = undefined,
 
     pub fn prefetch(self: *CatalogHook) OneShot.CallbackError!OneShot.PrefetchOutcome {
@@ -2209,7 +2440,7 @@ const CatalogHook = struct {
     }
 
     fn applyViews(self: *CatalogHook, metadata: ai.ModelMeta.Metadata) void {
-        const context_limit = effectiveContextLimit(self.manual_context_limit, metadata.context_window);
+        const context_limit = self.runtime_config.effectiveContextLimit(metadata.context_window);
         self.stats.context_limit = context_limit;
         self.compaction.metadata = metadata;
         self.compaction.effort = self.catalog_runtime.runtime.effort;
@@ -2230,7 +2461,8 @@ const ImageInputPolicy = union(enum) {
 };
 
 const DynamicImageInput = struct {
-    policy: ImageInputPolicy,
+    runtime_config: ?*RuntimeConfig.Owner = null,
+    policy: ImageInputPolicy = .automatic,
     catalog_runtime: *CatalogRuntime,
     effects: ?*CatalogHook = null,
 
@@ -2239,6 +2471,16 @@ const DynamicImageInput = struct {
         _: std.Io,
         self: *DynamicImageInput,
     ) agent.ImageInputSource.CallbackError!ai.Provider.ImageInput {
+        if (self.runtime_config) |runtime_config| {
+            const refreshed = self.catalog_runtime.pollApply(0) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Failed,
+            };
+            if (refreshed) |metadata| if (self.effects) |effects| effects.applyViews(metadata);
+            return runtime_config.resolveImageInput(
+                self.catalog_runtime.runtime.metadata.model.image_input,
+            );
+        }
         return switch (self.policy) {
             .fixed => |value| value,
             .automatic => {
@@ -2410,7 +2652,8 @@ const AutoCompact = struct {
     usage: *agent.UsageStats.UsageStats,
     catalog_runtime: *CatalogRuntime,
     effects: ?*CatalogHook = null,
-    manual_context_limit: ?u64,
+    runtime_config: ?*RuntimeConfig.Owner = null,
+    manual_context_limit: ?u64 = null,
     seam_hook: ?agent.Loop.SeamHook,
     marker: *CompactionMarker,
     context_limit: ?u64,
@@ -2425,11 +2668,23 @@ const AutoCompact = struct {
         const conversation_session = self.conversation.session();
         if (session != conversation_session) return error.Failed;
         try self.refreshCatalog();
+        const context_limit = if (self.runtime_config) |runtime_config|
+            runtime_config.effectiveContextLimit(self.metadata.context_window)
+        else
+            self.context_limit;
+        const enabled = if (self.runtime_config) |runtime_config|
+            runtime_config.snapshot.compact_enabled
+        else
+            self.enabled;
+        const threshold = if (self.runtime_config) |runtime_config|
+            runtime_config.snapshot.compact_threshold
+        else
+            self.threshold;
         if (!agent.Compact.shouldAuto(
             self.usage.last_ordinary_context_tokens,
-            self.context_limit,
-            self.enabled,
-            self.threshold,
+            context_limit,
+            enabled,
+            threshold,
         )) return .unchanged;
         const effort_changed = try self.syncEffort(conversation_session);
         var result = agent.CompactRunner.runContinuation(self.allocator, self.io, .{
@@ -2504,10 +2759,10 @@ const AutoCompact = struct {
             return;
         }
         self.metadata = metadata;
-        self.context_limit = effectiveContextLimit(
-            self.manual_context_limit,
-            metadata.context_window,
-        );
+        self.context_limit = if (self.runtime_config) |runtime_config|
+            runtime_config.effectiveContextLimit(metadata.context_window)
+        else
+            effectiveContextLimit(self.manual_context_limit, metadata.context_window);
     }
 };
 

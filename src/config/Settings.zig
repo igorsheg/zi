@@ -16,7 +16,21 @@ pub const Setting = struct {
     min: ?i32,
     max: ?i32,
     description: []const u8,
+    choices: []const []const u8 = &.{},
+    example: ?[]const u8 = null,
+    editable: bool = false,
+    secret: bool = false,
 };
+
+const bool_choices = [_][]const u8{ "on", "off" };
+const tristate_choices = [_][]const u8{ "auto", "on", "off" };
+const display_width_choices = [_][]const u8{ "auto", "terminal" };
+const theme_choices = [_][]const u8{ "auto", "dark", "light", "ansi", "off" };
+const tint_choices = [_][]const u8{ "teal", "violet", "rose", "sage" };
+const api_choices = [_][]const u8{ "chat", "responses" };
+const reasoning_format_choices = [_][]const u8{ "flat", "nested" };
+const cache_ttl_choices = [_][]const u8{ "5m", "1h" };
+const thinking_mode_choices = [_][]const u8{ "adaptive", "budget", "off" };
 
 const registry = [_]Setting{
     .{
@@ -82,6 +96,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_env",
+        .choices = &bool_choices,
         .env = "ZI_NO_ENV",
         .default = null,
         .keep_empty = false,
@@ -92,6 +107,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_agents_md",
+        .choices = &bool_choices,
         .env = "ZI_NO_AGENTS_MD",
         .default = null,
         .keep_empty = false,
@@ -102,6 +118,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_skills",
+        .choices = &bool_choices,
         .env = "ZI_NO_SKILLS",
         .default = null,
         .keep_empty = false,
@@ -112,6 +129,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_subagents",
+        .choices = &bool_choices,
         .env = "ZI_NO_SUBAGENTS",
         .default = null,
         .keep_empty = false,
@@ -122,6 +140,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_tasks",
+        .choices = &bool_choices,
         .env = "ZI_NO_TASKS",
         .default = null,
         .keep_empty = false,
@@ -133,6 +152,8 @@ const registry = [_]Setting{
     },
     .{
         .key = "markdown",
+        .editable = true,
+        .choices = &bool_choices,
         .env = "ZI_MARKDOWN",
         .default = "1",
         .keep_empty = false,
@@ -143,6 +164,8 @@ const registry = [_]Setting{
     },
     .{
         .key = "show_reasoning",
+        .editable = true,
+        .choices = &bool_choices,
         .env = "ZI_SHOW_REASONING",
         .default = null,
         .keep_empty = false,
@@ -153,6 +176,8 @@ const registry = [_]Setting{
     },
     .{
         .key = "sort_models",
+        .choices = &tristate_choices,
+        .editable = true,
         .env = "ZI_SORT_MODELS",
         .default = "auto",
         .keep_empty = false,
@@ -163,6 +188,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "context_limit",
+        .editable = true,
         .env = "ZI_CONTEXT_LIMIT",
         .default = null,
         .keep_empty = false,
@@ -173,6 +199,9 @@ const registry = [_]Setting{
     },
     .{
         .key = "display_width",
+        .editable = true,
+        .choices = &display_width_choices,
+        .example = "100",
         .env = "ZI_DISPLAY_WIDTH",
         .default = "auto",
         .keep_empty = false,
@@ -184,6 +213,8 @@ const registry = [_]Setting{
     },
     .{
         .key = "theme",
+        .editable = true,
+        .choices = &theme_choices,
         .env = "ZI_THEME",
         .default = "auto",
         .keep_empty = false,
@@ -194,6 +225,8 @@ const registry = [_]Setting{
     },
     .{
         .key = "tint",
+        .editable = true,
+        .choices = &tint_choices,
         .env = "ZI_TINT",
         .default = "teal",
         .keep_empty = false,
@@ -205,6 +238,8 @@ const registry = [_]Setting{
     },
     .{
         .key = "compact.auto",
+        .choices = &bool_choices,
+        .editable = true,
         .env = "ZI_COMPACT_AUTO",
         .default = "1",
         .keep_empty = false,
@@ -215,6 +250,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "compact.threshold",
+        .editable = true,
         .env = "ZI_COMPACT_THRESHOLD",
         .default = "85",
         .keep_empty = false,
@@ -225,6 +261,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "max_turns",
+        .editable = true,
         .env = "ZI_MAX_TURNS",
         .default = null,
         .keep_empty = false,
@@ -255,6 +292,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "no_session",
+        .choices = &tristate_choices,
         .env = "ZI_NO_SESSION",
         .default = "auto",
         .keep_empty = false,
@@ -285,6 +323,8 @@ const registry = [_]Setting{
     },
     .{
         .key = "image_input",
+        .choices = &tristate_choices,
+        .editable = true,
         .env = "ZI_IMAGE_INPUT",
         .default = "auto",
         .keep_empty = false,
@@ -295,6 +335,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "tool_output_cap",
+        .editable = true,
         .env = "ZI_TOOL_OUTPUT_CAP",
         .default = "50k",
         .keep_empty = false,
@@ -305,6 +346,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "bash.timeout",
+        .editable = true,
         .env = "ZI_BASH_TIMEOUT",
         .default = "2m",
         .keep_empty = false,
@@ -316,6 +358,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "bash.timeout_max",
+        .editable = true,
         .env = "ZI_BASH_TIMEOUT_MAX",
         .default = "30m",
         .keep_empty = false,
@@ -326,6 +369,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "bash.timeout_grace",
+        .editable = true,
         .env = "ZI_BASH_TIMEOUT_GRACE",
         .default = "2s",
         .keep_empty = false,
@@ -336,6 +380,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "bash.background_yield",
+        .editable = true,
         .env = "ZI_BASH_BACKGROUND_YIELD",
         .default = "5s",
         .keep_empty = false,
@@ -357,6 +402,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "task.wait_timeout",
+        .editable = true,
         .env = "ZI_TASK_WAIT_TIMEOUT",
         .default = "10m",
         .keep_empty = false,
@@ -367,6 +413,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "task.max_running",
+        .editable = true,
         .env = "ZI_TASK_MAX_RUNNING",
         .default = "32",
         .keep_empty = false,
@@ -377,6 +424,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "http.max_retries",
+        .editable = true,
         .env = "ZI_HTTP_MAX_RETRIES",
         .default = "4",
         .keep_empty = false,
@@ -387,6 +435,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "http.retry_base",
+        .editable = true,
         .env = "ZI_HTTP_RETRY_BASE",
         .default = "1s",
         .keep_empty = false,
@@ -397,6 +446,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "http.idle_timeout",
+        .editable = true,
         .env = "ZI_HTTP_IDLE_TIMEOUT",
         .default = "10m",
         .keep_empty = false,
@@ -417,6 +467,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.api_key",
+        .secret = true,
         .env = "ZI_OPENAI_API_KEY",
         .default = null,
         .keep_empty = false,
@@ -437,6 +488,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.api",
+        .choices = &api_choices,
         .env = "ZI_OPENAI_API",
         .default = null,
         .keep_empty = false,
@@ -447,6 +499,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.reasoning_format",
+        .choices = &reasoning_format_choices,
         .env = "ZI_OPENAI_REASONING_FORMAT",
         .default = null,
         .keep_empty = false,
@@ -467,6 +520,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.send_cache_key",
+        .choices = &tristate_choices,
         .env = "ZI_OPENAI_SEND_CACHE_KEY",
         .default = null,
         .keep_empty = false,
@@ -477,6 +531,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.request_cost",
+        .choices = &tristate_choices,
         .env = "ZI_OPENAI_REQUEST_COST",
         .default = null,
         .keep_empty = false,
@@ -488,6 +543,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.cache",
+        .choices = &tristate_choices,
         .env = "ZI_OPENAI_CACHE",
         .default = null,
         .keep_empty = false,
@@ -499,6 +555,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.openai-compatible.cache_ttl",
+        .choices = &cache_ttl_choices,
         .env = "ZI_OPENAI_CACHE_TTL",
         .default = null,
         .keep_empty = false,
@@ -519,6 +576,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.api_key",
+        .secret = true,
         .env = "ZI_ANTHROPIC_API_KEY",
         .default = null,
         .keep_empty = false,
@@ -549,6 +607,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.thinking_mode",
+        .choices = &thinking_mode_choices,
         .env = "ZI_ANTHROPIC_THINKING_MODE",
         .default = null,
         .keep_empty = false,
@@ -569,6 +628,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.cache",
+        .choices = &tristate_choices,
         .env = "ZI_ANTHROPIC_CACHE",
         .default = null,
         .keep_empty = false,
@@ -579,6 +639,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.anthropic-compatible.cache_ttl",
+        .choices = &cache_ttl_choices,
         .env = "ZI_ANTHROPIC_CACHE_TTL",
         .default = null,
         .keep_empty = false,
@@ -609,6 +670,7 @@ const registry = [_]Setting{
     },
     .{
         .key = "providers.llamacpp.api_key",
+        .secret = true,
         .env = "ZI_LLAMACPP_API_KEY",
         .default = null,
         .keep_empty = false,
@@ -650,6 +712,171 @@ pub fn find(key: []const u8) ?*const Setting {
         if (std.mem.eql(u8, setting.key, key)) return setting;
     }
     return null;
+}
+
+pub const Update = union(enum) {
+    clear,
+    set: []const u8,
+};
+
+pub const ValidationError = error{ ReadOnly, InvalidValue };
+
+pub const Inspection = struct {
+    display: []u8,
+    source: Store.Source,
+    invalid: bool,
+    clipped: bool,
+
+    pub fn deinit(self: *Inspection, allocator: std.mem.Allocator) void {
+        @memset(self.display, 0);
+        allocator.free(self.display);
+        self.* = undefined;
+    }
+};
+
+pub fn validateUpdate(setting: *const Setting, value: []const u8) ValidationError!Update {
+    if (!setting.editable) return error.ReadOnly;
+    if (std.mem.eql(u8, value, "default")) return .clear;
+    if (choice(setting, value)) |canonical| return .{ .set = canonical };
+    if (setting.kind == .bool) {
+        if (parseBool(value) == null) return error.InvalidValue;
+        return .{ .set = value };
+    }
+    if (hasBooleanChoices(setting)) {
+        if (parseBool(value) == null) return error.InvalidValue;
+        return .{ .set = value };
+    }
+    if (!validTypedValue(setting, value)) return error.InvalidValue;
+    return .{ .set = value };
+}
+
+pub fn expectedHint(setting: *const Setting, buffer: []u8) []const u8 {
+    if (std.mem.eql(u8, setting.key, "display_width"))
+        return "auto|terminal, or a whole number from 20 to 4096; e.g. 100";
+    if (setting.choices.len != 0 and setting.kind == .string) {
+        var writer: std.Io.Writer = .fixed(buffer);
+        for (setting.choices, 0..) |value, index| {
+            if (index != 0) writer.writeByte('|') catch return "one of the listed choices";
+            writer.writeAll(value) catch return "one of the listed choices";
+        }
+        return writer.buffered();
+    }
+    return switch (setting.kind) {
+        .bool => "on|off",
+        .int => if (setting.min != null or setting.max != null)
+            formatIntegerHint(setting, buffer)
+        else
+            "a nonnegative whole number",
+        .size => "a size like 64k or 1M",
+        .duration => "a duration like 2s or 500ms",
+        .string => "a valid value",
+    };
+}
+
+fn formatIntegerHint(setting: *const Setting, buffer: []u8) []const u8 {
+    if (setting.min) |minimum| {
+        if (setting.max) |maximum| {
+            return std.fmt.bufPrint(buffer, "a whole number from {d} to {d}", .{ minimum, maximum }) catch
+                "a whole number in range";
+        }
+        return std.fmt.bufPrint(buffer, "a whole number of at least {d}", .{minimum}) catch
+            "a whole number in range";
+    }
+    if (setting.max) |maximum| {
+        return std.fmt.bufPrint(buffer, "a whole number from 0 to {d}", .{maximum}) catch
+            "a whole number in range";
+    }
+    return "a nonnegative whole number";
+}
+
+pub fn inspect(
+    store: Store,
+    allocator: std.mem.Allocator,
+    setting: *const Setting,
+    maximum_display_bytes: usize,
+) error{OutOfMemory}!Inspection {
+    const bounded = try store.inspectBounded(
+        allocator,
+        setting.key,
+        maximum_display_bytes,
+        .{
+            .context = setting,
+            .classify_fn = classifyForStore,
+            .secret = setting.secret,
+        },
+    );
+    return .{
+        .display = bounded.value,
+        .source = bounded.source,
+        .invalid = bounded.invalid,
+        .clipped = bounded.clipped,
+    };
+}
+
+fn classifyForStore(context: *const anyopaque, value: ?[]const u8) Store.Classification {
+    const setting: *const Setting = @ptrCast(@alignCast(context));
+    const text = value orelse return .{ .display = "unset" };
+    if (text.len == 0) return .{ .display = "(empty)" };
+    if (setting.kind == .bool) {
+        const boolean = parseBool(text) orelse return .{ .display = text, .invalid = true };
+        return .{ .display = if (boolean) "on" else "off" };
+    }
+    if (hasBooleanChoices(setting)) {
+        if (choice(setting, text)) |canonical| {
+            if (std.mem.eql(u8, canonical, "auto")) return .{ .display = "auto" };
+        }
+        const boolean = parseBool(text) orelse return .{ .display = text, .invalid = true };
+        return .{ .display = if (boolean) "on" else "off" };
+    }
+    if (setting.kind == .string and setting.choices.len != 0)
+        return .{ .display = text, .invalid = choice(setting, text) == null };
+    if (choice(setting, text) != null) return .{ .display = text };
+    return .{ .display = text, .invalid = !validTypedValue(setting, text) };
+}
+
+fn choice(setting: *const Setting, value: []const u8) ?[]const u8 {
+    for (setting.choices) |canonical| {
+        if (std.ascii.eqlIgnoreCase(value, canonical)) return canonical;
+    }
+    return null;
+}
+
+fn hasBooleanChoices(setting: *const Setting) bool {
+    var on = false;
+    var off = false;
+    for (setting.choices) |value| {
+        on = on or std.mem.eql(u8, value, "on");
+        off = off or std.mem.eql(u8, value, "off");
+    }
+    return on and off;
+}
+
+fn validTypedValue(setting: *const Setting, value: []const u8) bool {
+    if (setting.kind == .string and setting.choices.len == 0) return true;
+    if (value.len == 0 or containsGrammarWhitespace(value)) return false;
+    return switch (setting.kind) {
+        .string => false,
+        .bool => parseBool(value) != null,
+        .int => blk: {
+            for (value) |byte| if (!std.ascii.isDigit(byte)) break :blk false;
+            const number = std.fmt.parseInt(i32, value, 10) catch break :blk false;
+            break :blk inBounds(setting, number);
+        },
+        .size => if (strictUnsigned(value)) inUnsignedBounds(setting, parseSize(value) orelse return false) else false,
+        .duration => if (strictUnsigned(value))
+            inUnsignedBounds(setting, parseDurationMs(value) orelse return false)
+        else
+            false,
+    };
+}
+
+fn strictUnsigned(value: []const u8) bool {
+    return value.len != 0 and value[0] != '+' and value[0] != '-';
+}
+
+fn containsGrammarWhitespace(value: []const u8) bool {
+    for (value) |byte| if (isCWhitespace(byte)) return true;
+    return false;
 }
 
 const registry_context: u8 = 0;
@@ -1169,4 +1396,122 @@ test "typed getter allocation failures are explicit" {
             _ = try getDurationMs(value, allocator, "bash.timeout");
         }
     }.exercise, .{store});
+}
+
+test "config command metadata pins slice two editability and secrets" {
+    const editable = [_][]const u8{
+        "markdown",
+        "show_reasoning",
+        "sort_models",
+        "context_limit",
+        "display_width",
+        "theme",
+        "tint",
+        "compact.auto",
+        "compact.threshold",
+        "max_turns",
+        "image_input",
+        "tool_output_cap",
+        "bash.timeout",
+        "bash.timeout_max",
+        "bash.timeout_grace",
+        "bash.background_yield",
+        "task.wait_timeout",
+        "task.max_running",
+        "http.max_retries",
+        "http.retry_base",
+        "http.idle_timeout",
+    };
+    var editable_count: usize = 0;
+    var secret_count: usize = 0;
+    for (list()) |setting| {
+        if (setting.editable) {
+            try std.testing.expect(editable_count < editable.len);
+            try std.testing.expectEqualStrings(editable[editable_count], setting.key);
+            editable_count += 1;
+        }
+        secret_count += @intFromBool(setting.secret);
+    }
+    try std.testing.expectEqual(editable.len, editable_count);
+    try std.testing.expectEqual(@as(usize, 3), secret_count);
+    try std.testing.expectEqualStrings("100", find("display_width").?.example.?);
+    try std.testing.expectEqualStrings("auto", find("image_input").?.choices[0]);
+}
+
+test "inspection preserves enum spelling and accepts free-form whitespace" {
+    var theme_environment: MapEnvironment = .{ .name = "ZI_THEME", .value = "LIGHT" };
+    var theme = try inspect(
+        testStore(&theme_environment),
+        std.testing.allocator,
+        find("theme").?,
+        4096,
+    );
+    defer theme.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("LIGHT", theme.display);
+    try std.testing.expect(!theme.invalid);
+
+    var prompt_environment: MapEnvironment = .{ .name = "ZI_SYSTEM_PROMPT", .value = "hello world" };
+    var prompt = try inspect(
+        testStore(&prompt_environment),
+        std.testing.allocator,
+        find("system_prompt").?,
+        4096,
+    );
+    defer prompt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("hello world", prompt.display);
+    try std.testing.expect(!prompt.invalid);
+}
+
+test "runtime update validation is complete strict and canonical" {
+    const sort = find("sort_models").?;
+    try std.testing.expectEqualStrings("auto", (try validateUpdate(sort, "AUTO")).set);
+    try std.testing.expectEqualStrings("YES", (try validateUpdate(sort, "YES")).set);
+    try std.testing.expect((try validateUpdate(sort, "default")) == .clear);
+    try std.testing.expectError(error.InvalidValue, validateUpdate(sort, "auto "));
+
+    const threshold = find("compact.threshold").?;
+    try std.testing.expectEqualStrings("75", (try validateUpdate(threshold, "75")).set);
+    try std.testing.expectError(error.InvalidValue, validateUpdate(threshold, "0"));
+    try std.testing.expectError(error.InvalidValue, validateUpdate(threshold, "101"));
+    try std.testing.expectError(error.InvalidValue, validateUpdate(threshold, " 75"));
+    try std.testing.expectError(error.InvalidValue, validateUpdate(threshold, "75 "));
+    try std.testing.expectError(error.InvalidValue, validateUpdate(threshold, "7_5"));
+
+    const width = find("display_width").?;
+    try std.testing.expectEqualStrings("120", (try validateUpdate(width, "120")).set);
+    try std.testing.expectError(error.ReadOnly, validateUpdate(find("provider").?, "mock"));
+}
+
+test "inspection normalizes aliases marks invalid values and redacts secrets" {
+    var boolean_environment: MapEnvironment = .{ .name = "ZI_SORT_MODELS", .value = "YES" };
+    var normalized = try inspect(
+        testStore(&boolean_environment),
+        std.testing.allocator,
+        find("sort_models").?,
+        4096,
+    );
+    defer normalized.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("on", normalized.display);
+    try std.testing.expect(!normalized.invalid);
+
+    var invalid_environment: MapEnvironment = .{ .name = "ZI_COMPACT_THRESHOLD", .value = "banana" };
+    var invalid = try inspect(
+        testStore(&invalid_environment),
+        std.testing.allocator,
+        find("compact.threshold").?,
+        4096,
+    );
+    defer invalid.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("banana", invalid.display);
+    try std.testing.expect(invalid.invalid);
+
+    var secret_environment: MapEnvironment = .{ .name = "ZI_OPENAI_API_KEY", .value = "hidden" };
+    var secret = try inspect(
+        testStore(&secret_environment),
+        std.testing.allocator,
+        find("providers.openai-compatible.api_key").?,
+        4096,
+    );
+    defer secret.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("set", secret.display);
 }

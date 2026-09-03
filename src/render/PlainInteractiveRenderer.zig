@@ -23,6 +23,7 @@ tools: ToolPresentation,
 show_reasoning: bool = false,
 spinner: ?*Spinner = null,
 spinner_allocation_failed: bool = false,
+turn_active: bool = false,
 reasoning_active: bool = false,
 reasoning_stream_wrote_text: bool = false,
 reasoning_wrote_text: bool = false,
@@ -51,6 +52,13 @@ pub fn deinit(self: *PlainInteractiveRenderer) void {
     self.* = undefined;
 }
 
+/// Replaces value-only styling between provider turns.
+pub fn setTheme(self: *PlainInteractiveRenderer, theme: Theme) void {
+    std.debug.assert(!self.turn_active);
+    self.theme = theme;
+    self.tools.setTheme(theme);
+}
+
 pub fn setSpinner(self: *PlainInteractiveRenderer, spinner: ?*Spinner) void {
     self.spinner = spinner;
     self.tools.setSpinner(spinner);
@@ -68,6 +76,9 @@ pub fn setWidthSource(
 }
 
 pub fn begin(self: *PlainInteractiveRenderer) !agent.Loop.Observer {
+    std.debug.assert(!self.turn_active);
+    self.turn_active = true;
+    errdefer self.turn_active = false;
     self.width = self.resolveWidth();
     self.stream = .init(self.writer);
     self.tools.resetTurn(self.width);
@@ -87,6 +98,7 @@ pub fn begin(self: *PlainInteractiveRenderer) !agent.Loop.Observer {
 }
 
 pub fn close(self: *PlainInteractiveRenderer, terminal: Stream.Terminal) !void {
+    defer self.turn_active = false;
     self.closeReasoning();
     self.stream.close(terminal);
     self.tools.close();

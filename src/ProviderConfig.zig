@@ -384,6 +384,29 @@ pub const Owned = struct {
     catalog_contribution: ai.ModelCatalog.Contribution,
     catalog_authoritative: bool,
 
+    /// Replaces request policy in the retained adapter between provider calls.
+    /// Validation completes before the adapter or retained rebuild policy changes.
+    pub fn updateHttpPolicy(self: *Owned, policy: HttpPolicy) error{InvalidSetting}!void {
+        try validateHttpPolicy(policy);
+        self.publishHttpPolicy(policy);
+    }
+
+    pub fn publishHttpPolicy(self: *Owned, policy: HttpPolicy) void {
+        std.debug.assert(policy.max_retries <= 100);
+        applyHttpPolicy(&self.resolved.adapter, policy);
+        self.http_policy = policy;
+    }
+
+    /// Updates only adapters whose request schema has an explicit reasoning
+    /// visibility field. Other adapters must not gain an unrelated body field.
+    pub fn updateShowReasoning(self: *Owned, visible: bool) void {
+        self.overrides.show_reasoning = visible;
+        switch (self.resolved.adapter) {
+            .anthropic_messages => |*plan| plan.body.show_reasoning = visible,
+            else => {},
+        }
+    }
+
     /// True only before an authoritative lookup when an unknown catalog wire can
     /// change the effective routing decision for this model.
     pub fn catalogWirePending(self: *const Owned) bool {
@@ -589,7 +612,7 @@ pub fn resolve(inputs: Inputs) ResolveError!*Owned {
     return owned;
 }
 
-fn validateHttpPolicy(policy: HttpPolicy) ResolveError!void {
+fn validateHttpPolicy(policy: HttpPolicy) error{InvalidSetting}!void {
     if (policy.max_retries > 100) return error.InvalidSetting;
 }
 
@@ -1736,8 +1759,18 @@ test "all four adapter plans accept large HTTP durations" {
         defer result.deinit();
         try std.testing.expectEqualStrings(case.provider, result.resolved.metadata.provider_id);
         try expectHttpPolicy(result.resolved.adapter, 101, maximum_duration_ms, maximum_duration_ms);
+        try result.updateHttpPolicy(.{
+            .max_retries = 2,
+            .retry_base_ms = 17,
+            .idle_timeout_ms = 23,
+        });
+        try expectHttpPolicy(result.resolved.adapter, 3, 17, 23);
         if (std.mem.eql(u8, case.provider, "anthropic")) {
             try std.testing.expect(result.resolved.adapter.anthropic_messages.body.show_reasoning);
+            result.updateShowReasoning(false);
+            try std.testing.expect(!result.resolved.adapter.anthropic_messages.body.show_reasoning);
+            try result.applyAuthoritativeCatalog(.{});
+            try std.testing.expect(!result.resolved.adapter.anthropic_messages.body.show_reasoning);
         }
         try std.testing.expect(!result.provider_autoselected);
     }
